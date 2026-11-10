@@ -7,6 +7,11 @@
 *.sqlite
 *.sqlite3
 *.db
+*-wal
+*-shm
+*-journal
+*.log
+*.log.*
 .env
 .env.*
 credentials/
