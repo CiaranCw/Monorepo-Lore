@@ -1,0 +1,65 @@
+Fixtures are copied from P3-A delivery
+LORE-MONOREPO-P3A-AUDIT-P3A-20261109T090611Z/evidence/experiment_results.
+No tokens, passwords, or certificates are included.
+
+e5_m2_status.jsonl
+  E5-manager-mechanics.json step M-2, rc 0
+  desc: --json status --revision-only (bare)
+  Verbatim stdout. Two JSON lines.
+
+e5_m3_links.jsonl
+  E5-manager-mechanics.json step M-3, rc 0
+  desc: --json link list (bare)
+  Verbatim. The last line is the non-JSON trailer from the same capture:
+  "No links found in this repository".
+
+e5_m4_history.jsonl
+  E5-manager-mechanics.json step M-4, rc 0
+  desc: --json history (bare)
+  Verbatim saved output. The first line is a truncated fragment in the
+  delivery file (the capture starts mid-value). The same blob contains
+  complete status 0 and, later, complete status 9. The experiment rc is 0.
+
+e5_m13_not_found.jsonl
+  E5-manager-mechanics.json step M-13, rc 79
+  desc: --json failure example: usera clone beta
+  Verbatim. log plus complete status 79, message "Not found".
+
+human_not_authorized.txt
+  E1-tier2-steps.json / E1-attempt2-aborted.json steps such as B3-6a, rc 17
+  Primary line "[Error] Not authorized to access repository".
+  Trace lines from the same steps, including "Repository not found".
+
+human_not_authenticated.txt
+  E4-attempt1-keyring-decrypt-failure.json step V-1, rc 16
+  and E4b-token-store-persistence.json step P-2, rc 16
+  "[Error] Not authenticated" plus the captured decrypt warning and connect trace.
+
+human_auth_header.txt
+  E3-native-exchange-steps.json steps N-5a and N-5b, rc 255
+  The captured [Error] line about authentication credentials.
+
+human_connection_unauthorized.txt
+  E3-native-exchange-steps.json step N-9d, rc 0
+  Connection warning and "not authorized or unavailable" while the experiment rc is 0.
+
+human_diverged.txt
+  E1-tier2-steps.json step D-3d, rc 255
+  "[Error] Branch has diverged, sync to merge remote changes".
+  The rc 0 lines "performing merge" and "synchronize to merge" are a different
+  outcome and are not failure fixtures.
+
+human_nothing_staged.txt
+  E5-manager-mechanics.json step M-6, rc 40
+  Human commit output. This command was not captured with --json.
+
+human_address_not_found.txt
+  E2-authurl-steps.json step E2-3b, rc 80
+  Primary line "[Error] Address not found: ...". The hash is omitted.
+  Trace context "state data address not found" is from E1-tier2-steps.json
+  step D-2e, rc 79, line "at lore-revision/src/state.rs:713 - state data address not found",
+  grouped under that step's "Failed to update link" line.
+
+human_state_address.txt
+  E1-tier2-steps.json step D-2e, rc 79
+  "Failed to update link" and the state.rs:713 trace line from that step.

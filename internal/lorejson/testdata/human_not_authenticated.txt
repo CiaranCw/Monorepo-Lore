@@ -1,0 +1,4 @@
+[Warn] Failed to decrypt user token: ring::error::Unspecified
+[Error] Not authenticated
+at lore-transport/src/connection.rs:372:28
+at lore-revision/src/repository.rs:3731 - Failed to connect to remote repository grpcs://127.0.0.1:52937

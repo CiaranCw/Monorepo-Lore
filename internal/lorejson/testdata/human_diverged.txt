@@ -1,0 +1,2 @@
+[Error] Branch has diverged, sync to merge remote changes
+at lore-revision/src/branch/push.rs:938:20

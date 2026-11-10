@@ -1,0 +1,15 @@
+# Generates Go types from the verbatim Lore 0.10.1 protos in proto/ (see proto/SOURCE_SHA256.txt).
+version: v1
+managed:
+  enabled: true
+  go_package_prefix:
+    default: lore-monorepo/gen
+plugins:
+  - plugin: go
+    path: /data/lore-lab/monorepo-p3b/P3B-20261109T112856Z/gopath/bin/protoc-gen-go
+    out: gen
+    opt: paths=source_relative
+  - plugin: go-grpc
+    path: /data/lore-lab/monorepo-p3b/P3B-20261109T112856Z/gopath/bin/protoc-gen-go-grpc
+    out: gen
+    opt: paths=source_relative

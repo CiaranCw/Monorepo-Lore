@@ -1,0 +1,34 @@
+# Paths below are relative to this file's directory.
+# Do not put JWTs, passwords, or private keys in this file.
+# Leave auth_store unset unless this host needs LORE_AUTH_STORE=fallback.
+
+[manager]
+listen = "127.0.0.1:52000"
+shutdown_timeout = "15s"
+
+[database]
+path = "data/manager.db"
+
+[lore]
+binary = "lore"
+command_timeout = "120s"
+# auth_store = "fallback"
+# auth_path = "data/lore-auth"
+
+[logging]
+level = "info"
+format = "json"
+
+# iss identifies the signer. It is not an HTTP login endpoint.
+# audience must be a host the Lore client will accept for this server.
+# grpc_listen is reserved for AuthBridge and is not opened in this version.
+# The three paths are files. Do not paste key bytes here.
+[auth]
+issuer = "http://127.0.0.1:52010"
+audience = ["lore-host.internal"]
+grpc_listen = "127.0.0.1:52010"
+identity_ttl = "12h"
+access_ttl = "5m"
+private_key = "data/keys/identity-active.pem"
+public_key = "data/keys/identity-active.pub.pem"
+jwks = "data/keys/jwks.json"

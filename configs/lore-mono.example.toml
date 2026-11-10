@@ -1,0 +1,10 @@
+# Non-secret client settings.
+# Do not put a password, identity token, or private key in this file.
+# Leave auth_store unset unless this machine has no OS credential store.
+# Plain http is accepted only when manager_url is a loopback address.
+
+manager_url = "http://127.0.0.1:52000"
+lore_binary = "lore"
+auth_url = "http://127.0.0.1:52010"
+# auth_store = "fallback"
+# auth_path = "data/lore-auth"

@@ -1,0 +1,19 @@
+17815026}}}
+{"tagName":"metadata","data":{"key":"message","value":{"tagName":"string","data":"snapshot R2"}}}
+{"tagName":"metadata","data":{"key":"created-by","value":{"tagName":"string","data":"svc-manager"}}}
+{"tagName":"metadata","data":{"key":"committed-by","value":{"tagName":"string","data":"svc-manager"}}}
+{"tagName":"revisionHistoryEntry","data":{"revision":"0160761ab835ff2f5d0b2846626a2c1e26a53352e1a7c71b9984ac3462b35368","revisionNumber":2,"parent":["a6e8e10c255b9c04d3719892c59e137abac40f81b1423fbb2eca154cdea6e60e","0000000000000000000000000000000000000000000000000000000000000000"]}}
+{"tagName":"metadata","data":{"key":"branch","value":{"tagName":"context","data":"e726318bbc3fd75ac8733a7e030cc35b"}}}
+{"tagName":"metadata","data":{"key":"timestamp","value":{"tagName":"numeric","data":1794217800016}}}
+{"tagName":"metadata","data":{"key":"message","value":{"tagName":"string","data":"snapshot R1"}}}
+{"tagName":"metadata","data":{"key":"created-by","value":{"tagName":"string","data":"svc-manager"}}}
+{"tagName":"metadata","data":{"key":"committed-by","value":{"tagName":"string","data":"svc-manager"}}}
+{"tagName":"revisionHistoryEntry","data":{"revision":"a6e8e10c255b9c04d3719892c59e137abac40f81b1423fbb2eca154cdea6e60e","revisionNumber":1,"parent":["0000000000000000000000000000000000000000000000000000000000000000","0000000000000000000000000000000000000000000000000000000000000000"]}}
+{"tagName":"metadata","data":{"key":"branch","value":{"tagName":"context","data":"e726318bbc3fd75ac8733a7e030cc35b"}}}
+{"tagName":"metadata","data":{"key":"timestamp","value":{"tagName":"numeric","data":1794217696559}}}
+{"tagName":"metadata","data":{"key":"message","value":{"tagName":"string","data":"root initial"}}}
+{"tagName":"metadata","data":{"key":"created-by","value":{"tagName":"string","data":"svc-manager"}}}
+{"tagName":"metadata","data":{"key":"committed-by","value":{"tagName":"string","data":"svc-manager"}}}
+{"tagName":"complete","data":{"status":0,"error":{"errorCode":0,"message":"","traceLocations":[]}}}
+{"tagName":"log","data":{"level":"error","category":0,"timestamp":1794221253831,"location":"lore_revision::relay","message":"Operation not supported: authentication requires a configured auth endpoint\n  at lore/src/auth.rs:720:6"}}
+{"tagName":"complete","data":{"status":9,"error":{"errorCode":9,"message":"Operation not supported: authentication requires a configured auth endpoint","traceLocations":[{"file":"lore/src/auth.rs","line":720,"column":6,"context":""}]}}}

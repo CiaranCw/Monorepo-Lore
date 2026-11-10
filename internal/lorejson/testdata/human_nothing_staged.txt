@@ -1,0 +1,3 @@
+[Error] Nothing staged for commit
+at lore-revision/src/commit.rs:656:42
+Commit failed

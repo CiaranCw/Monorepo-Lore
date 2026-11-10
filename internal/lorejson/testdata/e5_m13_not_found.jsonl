@@ -1,0 +1,2 @@
+{"tagName":"log","data":{"level":"error","category":0,"timestamp":1794221254056,"location":"lore_revision::relay","message":"Not found\n  at lore-revision/src/repository.rs:3748:28\n  at lore-revision/src/repository/clone.rs:875 - Failed to resolve repository"}}
+{"tagName":"complete","data":{"status":79,"error":{"errorCode":79,"message":"Not found","traceLocations":[{"file":"lore-revision/src/repository.rs","line":3748,"column":28,"context":""},{"file":"lore-revision/src/repository/clone.rs","line":875,"column":10,"context":"Failed to resolve repository"}]}}}

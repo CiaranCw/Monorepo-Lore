@@ -1,0 +1,3 @@
+[Error] Not authorized to access repository
+at lore-transport/src/error.rs:27:46
+at lore-revision/src/repository.rs:3755 - Repository not found

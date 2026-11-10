@@ -1,0 +1,83 @@
+# Monorepo-Lore
+
+This project is an internal-oriented logical monorepo management system built on top of Lore.
+
+It does not replace Lore. Lore remains the system of record for repositories, revisions, links, clone, commit, push, and sync. Monorepo-Lore adds a Manager that records projects and modules, decides who may see each module, and publishes an immutable snapshot of module revisions into a parent repository.
+
+A license has not been chosen yet. This repository does not grant one.
+
+## Why Monorepo-Lore
+
+A game or product tree is often several Lore repositories that must move together: engine, client, and documents. People should see only the modules they are allowed to use. A snapshot should record the exact revisions that were current at one moment, and later pushes must not rewrite that record.
+
+## Architecture
+
+```
+lore-mono  -->  Manager HTTP API
+                    |
+                    +--> SQLite (users, projects, modules, grants, snapshots)
+                    +--> AuthBridge (identity and access tokens for Lore)
+                    |
+Lore CLI   -->  TLS gateway  -->  Lore Server
+                    |
+                    +--> AuthBridge
+```
+
+The gateway forwards HTTP/2. It does not decide repository access. AuthBridge does.
+
+## Core features
+
+- Username and password login, then a Lore identity token stored by the Lore CLI.
+- Projects, modules, membership, and per-module read or write grants.
+- `lore-mono` commands for login, project selection, module list, clone, status, sync, commit, push, and publish.
+- Batch commands run one Lore process per authorized module and print a per-module result plus a summary.
+- A client `ca_file` is passed to Lore child processes as `SSL_CERT_FILE`. It is not written into the parent process environment.
+
+Lore 0.10.1 cannot enforce read and write separately. A read grant still becomes Lore access, and that token can push. Read is not a safe read-only Lore permission.
+
+Access tokens last five minutes. Revoking a grant changes the next token. It does not make an already issued token expire early.
+
+## Repository isolation
+
+A user sees only modules with an explicit grant. The same module name in two projects is two repository ids. Knowing another repository id returns the same not-found response as an unknown id. Project administrators do not receive the parent repository. The publisher service account is a separate identity and its credential is not returned by the user API.
+
+## Snapshot publishing
+
+A snapshot is the set of module revisions captured at one moment. Later module commits do not change that set. One project publishes at a time. If Lore already contains that publish, recovery records success instead of pushing again. A publish that cannot be matched to a remote commit is left for a person to review.
+
+The Manager process mounts this publisher only when `[publish]` is configured with a workspace and a service-account credential path.
+
+## TLS gateway
+
+Clients use TLS to the gateway. The gateway uses TLS to the Lore server. Plaintext gRPC is not the remote entry. Certificate generation is `scripts/gen-certs.py`. The gateway program is `gateway/gateway.js`.
+
+An independent second Linux machine has not been tested. That item is **NOT_RUN**.
+
+## Technology stack
+
+- Go 1.20
+- SQLite
+- Lore 0.10.1 CLI and server
+- A small Node.js HTTP/2 TLS proxy
+
+## Development environment
+
+Use Go 1.20.4. Module mode is on. Do not run `go mod tidy` or upgrade dependencies as part of routine work.
+
+```
+go test -mod=readonly -count=1 ./...
+go vet -mod=readonly ./...
+go build -mod=readonly ./...
+```
+
+Tests that talk to a live Lore server are skipped unless their environment variables are set. A skipped live test is not a pass of that live scenario.
+
+## Current status
+
+The B2.6.6 baseline includes Manager, AuthBridge, the Lore adapter, snapshot publishing, batch module commands, and the TLS gateway. Windows has been exercised against an isolated lab. An independent Linux client machine remains **NOT_RUN**.
+
+## Roadmap
+
+- Repeat the client workflow on a separate Linux machine.
+- Choose a license.
+- Keep snapshot recovery and permission checks aligned with later Lore versions.

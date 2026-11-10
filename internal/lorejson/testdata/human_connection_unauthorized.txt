@@ -1,0 +1,3 @@
+[Warn] Connection to grpcs://127.0.0.1:52937 failed
+Remote reachable but could not read remote revision (not authorized or unavailable), synchronizing against local history only
+Already on branch main latest revision 2
