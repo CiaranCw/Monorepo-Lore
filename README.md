@@ -64,13 +64,29 @@ An independent second Linux machine has not been tested. That item is **NOT_RUN*
 
 Use Go 1.20.4. Module mode is on. Do not run `go mod tidy` or upgrade dependencies as part of routine work.
 
-```
+```sh
 go test -mod=readonly -count=1 ./...
 go vet -mod=readonly ./...
 go build -mod=readonly ./...
 ```
 
 Tests that talk to a live Lore server are skipped unless their environment variables are set. A skipped live test is not a pass of that live scenario.
+
+### Protobuf generation
+
+The generated Go files are committed under `gen/`. To regenerate them, install the Buf CLI and the exact plugin versions used by this repository, and make sure the Go binary directory is on `PATH`:
+
+```sh
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.31.0
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+buf generate
+```
+
+Run `buf generate` from the repository root. `buf.gen.yaml` resolves both plugins by executable name through `PATH`; it does not depend on a machine-specific absolute path.
+
+### Development-only test seeder
+
+`cmd/b26seed` is a development/test fixture utility. It creates the fixed test identities `carol`, `alice`, `bob`, `dave`, and `publisher`, using the password supplied through `B26_PASSWORD`. Use it only with a fresh, disposable, isolated test database. **Never run it against a production or shared database.** Do not put the password in source control, TOML configuration, or logs.
 
 ## Current status
 

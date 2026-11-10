@@ -1,3 +1,5 @@
+// b26seed is a development/test fixture utility. Only run it against a fresh,
+// disposable, isolated test database; never point it at production or shared data.
 package main
 
 import (
