@@ -112,6 +112,10 @@ func New(cfg config.Config, log *logging.Logger) (*App, error) {
 		Timeout: cfg.CommandTimeout,
 		Env:     envOrNil,
 	}}
+	if err := gitimport.RecoverInterruptedJobs(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover import jobs: %w", err)
+	}
 	loreClient := &loreadapter.Client{Exec: exec, Env: envOrNil}
 	importWorkspace := cfg.Import.Workspace
 	if importWorkspace == "" {
@@ -131,11 +135,15 @@ func New(cfg config.Config, log *logging.Logger) (*App, error) {
 		Lore:     loreClient,
 		Tokens:   tokens,
 		Importer: &gitimport.Importer{
-			DB:            db,
-			Lore:          loreClient,
-			GitBinary:     gitBin,
-			WorkspaceRoot: importWorkspace,
-			RemoteBaseURL: cfg.Import.RemoteBaseURL,
+			DB:                   db,
+			Lore:                 loreClient,
+			GitBinary:            gitBin,
+			WorkspaceRoot:        importWorkspace,
+			RemoteBaseURL:        cfg.Import.RemoteBaseURL,
+			RestrictLocalSources: true,
+			AllowedLocalDirs:     append([]string(nil), cfg.Import.AllowedLocalDirs...),
+			RestrictSSHKeyPaths:  true,
+			AllowedSSHKeyDirs:    append([]string(nil), cfg.Import.AllowedSSHDirs...),
 		},
 	}
 	app.Bridge = authbridge.New(

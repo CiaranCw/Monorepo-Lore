@@ -24,9 +24,11 @@ const (
 	LFSModePointer = "pointer"
 )
 
-// RepoSpec describes one external Git repository to import as a Monorepo-Lore module.
+// RepoSpec describes one external Git repository (or one subdirectory of an
+// external Git Monorepo) to import as an independent Monorepo-Lore module.
 type RepoSpec struct {
 	SourceURL      string     `json:"source_url" toml:"source_url"`
+	SourceSubdir   string     `json:"source_subdir,omitempty" toml:"source_subdir"`
 	ModuleName     string     `json:"module_name" toml:"module_name"`
 	MountPath      string     `json:"mount_path" toml:"mount_path"`
 	Platform       string     `json:"platform,omitempty" toml:"platform"`
@@ -77,7 +79,8 @@ func LoadManifest(path string) (Manifest, error) {
 }
 
 // NormalizeAndValidateManifest normalizes defaults and validates module names,
-// mount paths (including intra-manifest overlap), and URLs.
+// mount paths, source_subdir paths (preventing overlapping subdirs of the same
+// source monorepo), and URLs.
 func NormalizeAndValidateManifest(m *Manifest) error {
 	if m == nil {
 		return errors.New("gitimport: manifest is nil")
@@ -103,6 +106,8 @@ func NormalizeAndValidateManifest(m *Manifest) error {
 
 	seenNames := map[string]bool{}
 	var seenMounts []string
+	sourceSubdirsByURL := map[string][]string{}
+
 	for i := range m.Repositories {
 		r := &m.Repositories[i]
 		cleanURL, plat, err := ValidateAndDetect(r.SourceURL, r.Platform)
@@ -111,6 +116,13 @@ func NormalizeAndValidateManifest(m *Manifest) error {
 		}
 		r.SourceURL = cleanURL
 		r.Platform = plat
+
+		cleanSubdir, err := NormalizeSourceSubdir(r.SourceSubdir)
+		if err != nil {
+			return fmt.Errorf("repository[%d] source_subdir: %w", i, err)
+		}
+		r.SourceSubdir = cleanSubdir
+
 		r.ModuleName = strings.TrimSpace(r.ModuleName)
 		if r.MountPath == "" {
 			r.MountPath = r.ModuleName
@@ -145,6 +157,15 @@ func NormalizeAndValidateManifest(m *Manifest) error {
 			}
 		}
 		seenMounts = append(seenMounts, r.MountPath)
+
+		// Prevent overlapping source_subdir definitions for the same source_url
+		// (e.g., importing both "" whole-repo AND "Chess", or "games" AND "games/Chess" into two modules).
+		for _, prevSub := range sourceSubdirsByURL[r.SourceURL] {
+			if prevSub == "" || r.SourceSubdir == "" || mountsOverlap(prevSub, r.SourceSubdir) {
+				return fmt.Errorf("repository[%d]: source_subdir %q overlaps with %q for the same source_url", i, r.SourceSubdir, prevSub)
+			}
+		}
+		sourceSubdirsByURL[r.SourceURL] = append(sourceSubdirsByURL[r.SourceURL], r.SourceSubdir)
 	}
 	return nil
 }
@@ -161,6 +182,7 @@ func mountsOverlap(a, b string) bool {
 func HashManifest(m Manifest) string {
 	type cleanItem struct {
 		SourceURL      string `json:"source_url"`
+		SourceSubdir   string `json:"source_subdir,omitempty"`
 		ModuleName     string `json:"module_name"`
 		MountPath      string `json:"mount_path"`
 		Platform       string `json:"platform"`
@@ -170,7 +192,8 @@ func HashManifest(m Manifest) string {
 	items := make([]cleanItem, len(m.Repositories))
 	for i, r := range m.Repositories {
 		items[i] = cleanItem{
-			SourceURL: r.SourceURL, ModuleName: r.ModuleName, MountPath: r.MountPath,
+			SourceURL: r.SourceURL, SourceSubdir: r.SourceSubdir,
+			ModuleName: r.ModuleName, MountPath: r.MountPath,
 			Platform: r.Platform, ConflictPolicy: r.ConflictPolicy, LFSMode: r.LFSMode,
 		}
 	}

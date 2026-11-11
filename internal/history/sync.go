@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lore-monorepo/internal/database"
@@ -18,6 +20,15 @@ const (
 	historyChunkSize = 200
 )
 
+var moduleSyncLocks sync.Map // map[int64]*sync.Mutex
+
+func lockModuleSync(moduleID int64) func() {
+	actual, _ := moduleSyncLocks.LoadOrStore(moduleID, &sync.Mutex{})
+	mu := actual.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // CommitInput is used by both the Git importer and the Lore DAG crawler to
 // persist a commit and its ordered parents idempotently.
 type CommitInput struct {
@@ -25,6 +36,7 @@ type CommitInput struct {
 	LoreRevision        string
 	LoreRevisionNumber  int
 	SourceCommitID      string
+	SourceSubdir        string
 	OriginKind          string
 	IsSynthetic         bool
 	AuthorName          string
@@ -99,15 +111,16 @@ func UpsertCommit(ctx context.Context, tx *sql.Tx, in CommitInput) error {
 
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO module_commits (
-			module_id, lore_revision, lore_revision_number, source_commit_id, canonical_id,
+			module_id, lore_revision, lore_revision_number, source_commit_id, source_subdir, canonical_id,
 			origin_kind, is_synthetic, is_merge, parent_count,
 			author_name, author_email, authored_at, authored_unix_ms,
 			committer_name, committer_email, committed_at, committed_unix_ms, lore_committed_unix_ms,
 			subject, message, git_tree_id, lore_branch_id, extra_metadata_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(module_id, lore_revision) DO UPDATE SET
-			lore_revision_number   = excluded.lore_revision_number,
+			lore_revision_number   = CASE WHEN excluded.lore_revision_number > 0 THEN excluded.lore_revision_number ELSE module_commits.lore_revision_number END,
 			source_commit_id       = COALESCE(excluded.source_commit_id, module_commits.source_commit_id),
+			source_subdir          = CASE WHEN excluded.source_subdir <> '' THEN excluded.source_subdir ELSE module_commits.source_subdir END,
 			canonical_id           = CASE WHEN excluded.source_commit_id IS NOT NULL THEN excluded.source_commit_id ELSE module_commits.canonical_id END,
 			origin_kind            = CASE WHEN module_commits.origin_kind = 'git_import' THEN 'git_import' ELSE excluded.origin_kind END,
 			is_synthetic           = MAX(module_commits.is_synthetic, excluded.is_synthetic),
@@ -128,7 +141,7 @@ func UpsertCommit(ctx context.Context, tx *sql.Tx, in CommitInput) error {
 			lore_branch_id         = COALESCE(excluded.lore_branch_id, module_commits.lore_branch_id),
 			extra_metadata_json    = CASE WHEN excluded.extra_metadata_json <> '{}' THEN excluded.extra_metadata_json ELSE module_commits.extra_metadata_json END
 	`,
-		in.ModuleID, in.LoreRevision, in.LoreRevisionNumber, srcCommit, canonical,
+		in.ModuleID, in.LoreRevision, in.LoreRevisionNumber, srcCommit, in.SourceSubdir, canonical,
 		in.OriginKind, synth, isMerge, parentCount,
 		in.AuthorName, in.AuthorEmail, in.AuthoredAt, in.AuthoredUnixMS,
 		in.CommitterName, in.CommitterEmail, in.CommittedAt, in.CommittedUnixMS, in.LoreCommittedUnixMS,
@@ -222,16 +235,36 @@ func UpsertSpecialObject(ctx context.Context, tx *sql.Tx, moduleID int64, obj Sp
 	return err
 }
 
+func isNoRemoteConfiguredErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "No remote configured") || strings.Contains(msg, "errorCode\":111") || strings.Contains(msg, "status\":111")
+}
+
 // SyncModuleFromLore walks the entire reachable Lore revision DAG across all branches
-// (including both parents of merge commits, without any 100-revision truncation)
-// and indexes every unindexed revision and branch pointer into SQLite.
+// (including both parents of merge commits, without truncation), fails explicitly when
+// a trustworthy branch list cannot be obtained, preserves non-`main` default branches,
+// and prunes deleted/archived branches without touching tags.
 func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Client, moduleID int64, repoDir string) (SyncStats, error) {
 	var stats SyncStats
 	if client == nil {
 		return stats, fmt.Errorf("history: lore client is nil")
 	}
 
+	unlock := lockModuleSync(moduleID)
+	defer unlock()
+
 	known, gitToLore, err := loadExistingMaps(ctx, db, moduleID)
+	if err != nil {
+		return stats, err
+	}
+	existingBranchNames, existingDefaultBranch, bootstrapMainRev, err := loadExistingBranchState(ctx, db, moduleID)
+	if err != nil {
+		return stats, err
+	}
+	danglingParents, err := loadDanglingParentRevisions(ctx, db, moduleID)
 	if err != nil {
 		return stats, err
 	}
@@ -240,40 +273,98 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 		return stats, err
 	}
 
-	// Collect both local and remote branches (ignoring offline failure on --remote).
+	// 1. Discover local and remote branches explicitly. Never swallow branch discovery failures!
+	localBranches, localErr := client.ListBranchesAt(ctx, repoDir, false)
+	if localErr != nil {
+		return stats, fmt.Errorf("%w: local branch list failed: %v", ErrBranchDiscovery, localErr)
+	}
+	remoteBranches, remoteErr := client.ListBranchesAt(ctx, repoDir, true)
+	if remoteErr == nil {
+		stats.BranchSource = "local_and_remote"
+	} else if isNoRemoteConfiguredErr(remoteErr) {
+		stats.BranchSource = "local_only"
+	} else {
+		return stats, fmt.Errorf("%w: remote branch list failed (partial state refused): %v", ErrBranchDiscovery, remoteErr)
+	}
+
 	branchMap := map[string]loreadapter.Branch{}
-	if localBranches, err := client.ListBranchesAt(ctx, repoDir, false); err == nil {
-		for _, b := range localBranches {
-			if isInternalHelperBranch(b.Name) || b.Archived {
+	archivedRemote := map[string]bool{}
+	if remoteErr == nil {
+		for _, b := range remoteBranches {
+			if isInternalHelperBranch(b.Name) {
 				continue
 			}
-			branchMap[b.Name] = b
-		}
-	}
-	if remoteBranches, err := client.ListBranchesAt(ctx, repoDir, true); err == nil {
-		for _, b := range remoteBranches {
-			if isInternalHelperBranch(b.Name) || b.Archived {
+			if b.Archived {
+				archivedRemote[b.Name] = true
 				continue
 			}
 			if b.Latest != "" && b.Latest != zeroHash64 {
 				branchMap[b.Name] = b
-			} else if _, exists := branchMap[b.Name]; !exists {
-				branchMap[b.Name] = b
+			}
+		}
+	}
+	for _, b := range localBranches {
+		if isInternalHelperBranch(b.Name) || b.Archived || archivedRemote[b.Name] {
+			continue
+		}
+		if b.Latest == "" || b.Latest == zeroHash64 {
+			continue
+		}
+		if _, fromRemote := branchMap[b.Name]; !fromRemote {
+			branchMap[b.Name] = b
+		} else if b.IsCurrent {
+			// Preserve IsCurrent flag while keeping authoritative latest if remote was not ahead.
+			branchMap[b.Name] = b
+		}
+	}
+
+	// If `"main"` was purely Lore's un-deletable bootstrap branch for a non-`"main"` Git import
+	// (e.g. `"master"`-only repository) and nobody ever committed new work onto `"main"`, omit it!
+	if bootstrapMainRev != "" && len(branchMap) > 1 && !existingBranchNames["main"] {
+		if mb, hasMain := branchMap["main"]; hasMain && mb.Latest == bootstrapMainRev {
+			delete(branchMap, "main")
+		}
+	}
+
+	// 2. Resolve true default branch without hardcoding `"main"`.
+	defaultBranch := ""
+	if existingDefaultBranch != "" {
+		if _, active := branchMap[existingDefaultBranch]; active {
+			defaultBranch = existingDefaultBranch
+		}
+	}
+	if defaultBranch == "" {
+		if metaDef, mErr := client.DefaultBranchName(ctx, repoDir); mErr == nil && metaDef != "" {
+			if _, active := branchMap[metaDef]; active {
+				defaultBranch = metaDef
+			}
+		}
+	}
+	if defaultBranch == "" {
+		if st, sErr := client.Status(ctx, repoDir); sErr == nil && st.BranchName != "" {
+			if _, active := branchMap[st.BranchName]; active {
+				defaultBranch = st.BranchName
+			}
+		}
+	}
+	if defaultBranch == "" {
+		if _, hasMain := branchMap["main"]; hasMain {
+			defaultBranch = "main"
+		} else if _, hasMaster := branchMap["master"]; hasMaster {
+			defaultBranch = "master"
+		} else {
+			names := make([]string, 0, len(branchMap))
+			for name := range branchMap {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			if len(names) > 0 {
+				defaultBranch = names[0]
 			}
 		}
 	}
 
-	defaultBranch := "main"
-	if st, err := client.Status(ctx, repoDir); err == nil {
-		if st.BranchName != "" && !isInternalHelperBranch(st.BranchName) {
-			if _, ok := branchMap[st.BranchName]; !ok && st.Revision != "" && st.Revision != zeroHash64 {
-				branchMap[st.BranchName] = loreadapter.Branch{
-					ID: st.BranchID, Name: st.BranchName, Latest: st.Revision, IsCurrent: true,
-				}
-			}
-		}
-	}
-
+	// 3. Breadth-first DAG scan across all active branch heads AND any unindexed parent edges.
 	var queue []string
 	queued := map[string]bool{}
 	enqueue := func(rev string) {
@@ -284,9 +375,28 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 		queue = append(queue, rev)
 	}
 
-	for _, b := range branchMap {
-		if b.Latest != "" && b.Latest != zeroHash64 {
-			enqueue(b.Latest)
+	sortedBranchNames := make([]string, 0, len(branchMap))
+	for name := range branchMap {
+		sortedBranchNames = append(sortedBranchNames, name)
+	}
+	sort.Strings(sortedBranchNames)
+	for _, name := range sortedBranchNames {
+		enqueue(branchMap[name].Latest)
+	}
+	for _, dp := range danglingParents {
+		enqueue(dp)
+	}
+
+	// Even when a branch tip is ALREADY in `known`, verify its direct Lore parents aren't unindexed side-branches!
+	for _, name := range sortedBranchNames {
+		tip := branchMap[name].Latest
+		if known[tip] {
+			missing, mErr := findMissingParentsOfKnownCommit(ctx, db, moduleID, tip)
+			if mErr == nil {
+				for _, mp := range missing {
+					enqueue(mp)
+				}
+			}
 		}
 	}
 
@@ -312,8 +422,15 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 			if e.Revision == "" || e.Revision == zeroHash64 {
 				continue
 			}
+			// Always check BOTH parents BEFORE breaking on a known boundary commit
+			// so an already-indexed merge commit never hides an unindexed side branch!
+			if len(e.Parent) > 1 && e.Parent[1] != "" && e.Parent[1] != zeroHash64 && !known[e.Parent[1]] {
+				enqueue(e.Parent[1])
+			}
 			if known[e.Revision] {
-				// First-parent chain from here is already indexed; still check any merge parent above!
+				if len(e.Parent) > 0 && e.Parent[0] != "" && e.Parent[0] != zeroHash64 && !known[e.Parent[0]] {
+					enqueue(e.Parent[0])
+				}
 				break
 			}
 			if _, dup := discovered[e.Revision]; !dup {
@@ -323,18 +440,14 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 					gitToLore[gc] = e.Revision
 				}
 			}
-			// Always enqueue second parent (parent[1]) of merges!
-			if len(e.Parent) > 1 && e.Parent[1] != "" && e.Parent[1] != zeroHash64 {
-				enqueue(e.Parent[1])
-			}
-			// At the end of the chunk, enqueue parent[0] to continue walking arbitrarily deep histories!
 			if idx == len(entries)-1 && len(e.Parent) > 0 && e.Parent[0] != "" && e.Parent[0] != zeroHash64 {
 				enqueue(e.Parent[0])
 			}
 		}
 	}
 
-	// Persist in reverse discovery order (ancestors first) inside one transaction.
+	// 4. Persist commits (ancestors first), update active branch refs, and prune deleted/archived branches
+	//    while strictly preserving all `ref_type='tag'` rows!
 	err = database.Tx(ctx, db, func(tx *sql.Tx) error {
 		for i := len(order) - 1; i >= 0; i-- {
 			e := discovered[order[i]]
@@ -345,11 +458,40 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 			stats.CommitsUpserted++
 		}
 
-		// Sync active branch pointers (removing stale branch refs no longer in Lore, while preserving tags).
-		for _, b := range branchMap {
-			if b.Latest == "" || b.Latest == zeroHash64 {
-				continue
+		// Prune stale branches (deleted or archived in Lore), NEVER touching `ref_type='tag'`.
+		if len(sortedBranchNames) == 0 {
+			res, dErr := tx.ExecContext(ctx, `DELETE FROM module_refs WHERE module_id=? AND ref_type='branch'`, moduleID)
+			if dErr != nil {
+				return dErr
 			}
+			n, _ := res.RowsAffected()
+			stats.BranchesPruned = int(n)
+		} else {
+			placeholders := make([]string, len(sortedBranchNames))
+			delArgs := make([]any, 0, len(sortedBranchNames)+1)
+			delArgs = append(delArgs, moduleID)
+			for i, bName := range sortedBranchNames {
+				placeholders[i] = "?"
+				delArgs = append(delArgs, bName)
+			}
+			res, dErr := tx.ExecContext(ctx, fmt.Sprintf(
+				`DELETE FROM module_refs WHERE module_id=? AND ref_type='branch' AND ref_name NOT IN (%s)`,
+				strings.Join(placeholders, ",")), delArgs...)
+			if dErr != nil {
+				return dErr
+			}
+			n, _ := res.RowsAffected()
+			stats.BranchesPruned = int(n)
+		}
+
+		// Reset `is_default=0` on branches if default branch changed, then upsert active branches.
+		if _, err := tx.ExecContext(ctx, `UPDATE module_refs SET is_default=0 WHERE module_id=? AND ref_type='branch' AND ref_name<>?`,
+			moduleID, defaultBranch); err != nil {
+			return err
+		}
+
+		for _, bName := range sortedBranchNames {
+			b := branchMap[bName]
 			var srcCommit string
 			if e, ok := discovered[b.Latest]; ok {
 				srcCommit = e.Metadata["git.commit"]
@@ -375,6 +517,82 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 	return stats, err
 }
 
+func loadExistingBranchState(ctx context.Context, db *sql.DB, moduleID int64) (names map[string]bool, defaultBranch, bootstrapMainRev string, err error) {
+	names = map[string]bool{}
+	rows, err := db.QueryContext(ctx, `SELECT ref_name, is_default FROM module_refs WHERE module_id=? AND ref_type='branch'`, moduleID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var isDef int
+		if err := rows.Scan(&name, &isDef); err != nil {
+			return nil, "", "", err
+		}
+		names[name] = true
+		if isDef == 1 && defaultBranch == "" {
+			defaultBranch = name
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", "", err
+	}
+	_ = db.QueryRowContext(ctx, `
+		SELECT COALESCE(bootstrap_main_rev,'')
+		FROM import_job_items
+		WHERE module_id=? AND bootstrap_main_rev <> ''
+		ORDER BY item_id DESC LIMIT 1
+	`, moduleID).Scan(&bootstrapMainRev)
+	return names, defaultBranch, bootstrapMainRev, nil
+}
+
+func loadDanglingParentRevisions(ctx context.Context, db *sql.DB, moduleID int64) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT DISTINCT p.parent_lore_revision
+		FROM module_commit_parents p
+		LEFT JOIN module_commits c
+		  ON c.module_id = p.module_id AND c.lore_revision = p.parent_lore_revision
+		WHERE p.module_id = ? AND p.parent_lore_revision <> '' AND c.lore_revision IS NULL
+	`, moduleID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var rev string
+		if err := rows.Scan(&rev); err != nil {
+			return nil, err
+		}
+		out = append(out, rev)
+	}
+	return out, rows.Err()
+}
+
+func findMissingParentsOfKnownCommit(ctx context.Context, db *sql.DB, moduleID int64, rev string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT p.parent_lore_revision
+		FROM module_commit_parents p
+		LEFT JOIN module_commits c
+		  ON c.module_id = p.module_id AND c.lore_revision = p.parent_lore_revision
+		WHERE p.module_id = ? AND p.lore_revision = ? AND p.parent_lore_revision <> '' AND c.lore_revision IS NULL
+	`, moduleID, rev)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var pr string
+		if err := rows.Scan(&pr); err != nil {
+			return nil, err
+		}
+		out = append(out, pr)
+	}
+	return out, rows.Err()
+}
+
 func buildCommitInputFromLore(moduleID int64, e loreadapter.HistoryEntry, gitToLore map[string]string, usersByID map[string]string) CommitInput {
 	meta := e.Metadata
 	if meta == nil {
@@ -393,7 +611,7 @@ func buildCommitInputFromLore(moduleID int64, e loreadapter.HistoryEntry, gitToL
 	for k, v := range meta {
 		switch k {
 		case "message", "timestamp", "branch", "created-by", "committed-by",
-			"git.commit", "git.tree", "git.parents", "git.synthetic",
+			"git.commit", "git.subdir", "git.tree", "git.parents", "git.synthetic",
 			"git.author.name", "git.author.email", "git.author.time", "git.author.unix_ms",
 			"git.committer.name", "git.committer.email", "git.committer.time", "git.committer.unix_ms":
 		default:
@@ -404,6 +622,7 @@ func buildCommitInputFromLore(moduleID int64, e loreadapter.HistoryEntry, gitToL
 	if gc := meta["git.commit"]; gc != "" || meta["git.synthetic"] == "1" {
 		in.OriginKind = OriginGitImport
 		in.SourceCommitID = gc
+		in.SourceSubdir = meta["git.subdir"]
 		in.GitTreeID = meta["git.tree"]
 		in.IsSynthetic = meta["git.synthetic"] == "1"
 		in.AuthorName = meta["git.author.name"]

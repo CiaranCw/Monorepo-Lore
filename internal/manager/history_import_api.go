@@ -3,6 +3,7 @@ package manager
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -31,13 +32,35 @@ func (a *App) projectHistory(w http.ResponseWriter, r *http.Request, actor *user
 		return
 	}
 	if syncNow {
-		if mods, lErr := a.perms().ListAccessibleModules(r.Context(), actor.ID); lErr == nil {
-			for _, m := range mods {
-				if m.ProjectID == p.ID {
-					if modRow, gErr := project.GetModuleByID(r.Context(), a.DB, m.ModuleID); gErr == nil {
-						_, _ = a.syncModuleHistoryOnServer(r.Context(), modRow, "")
-					}
+		mods, lErr := a.perms().ListAccessibleModules(r.Context(), actor.ID)
+		if lErr != nil {
+			writeHistoryError(w, lErr)
+			return
+		}
+		wantNames := map[string]bool{}
+		for _, raw := range filter.Modules {
+			for _, part := range strings.Split(raw, ",") {
+				part = strings.TrimSpace(part)
+				if part != "" {
+					wantNames[part] = true
 				}
+			}
+		}
+		for _, m := range mods {
+			if m.ProjectID != p.ID {
+				continue
+			}
+			if len(wantNames) > 0 && !wantNames[m.Name] && !wantNames[m.MountPath] {
+				continue
+			}
+			modRow, gErr := project.GetModuleByID(r.Context(), a.DB, m.ModuleID)
+			if gErr != nil {
+				writeError(w, http.StatusBadGateway, fmt.Sprintf("history sync failed for module %s", m.Name))
+				return
+			}
+			if _, sErr := a.syncModuleHistoryOnServer(r.Context(), modRow, ""); sErr != nil {
+				writeError(w, http.StatusBadGateway, fmt.Sprintf("history sync failed for module %s", m.Name))
+				return
 			}
 		}
 	}
@@ -65,7 +88,10 @@ func (a *App) moduleHistoryRoutes(w http.ResponseWriter, r *http.Request, actor 
 			return
 		}
 		if syncNow {
-			_, _ = a.syncModuleHistoryOnServer(r.Context(), m, "")
+			if _, sErr := a.syncModuleHistoryOnServer(r.Context(), m, ""); sErr != nil {
+				writeError(w, http.StatusBadGateway, "module history sync failed")
+				return
+			}
 		}
 		page, err := a.historySvc().ModuleHistory(r.Context(), actor.ID, m.ID, filter)
 		if err != nil {
@@ -95,15 +121,24 @@ func (a *App) moduleHistoryRoutes(w http.ResponseWriter, r *http.Request, actor 
 				return
 			}
 		}
-		if body.RepoDir != "" {
+		if strings.TrimSpace(body.RepoDir) != "" {
 			if err := a.perms().CanManageProject(r.Context(), actor.ID, m.ProjectID); err != nil {
 				writeAPIError(w, err)
 				return
 			}
+			// Enforce AllowedLocalDirs on explicit repo_dir as well so project_admin cannot point Lore at arbitrary server paths!
+			if a.Importer != nil && a.Importer.RestrictLocalSources {
+				cleanDir, lErr := gitimport.ValidateLocalSourceAccess(body.RepoDir, true, a.Importer.AllowedLocalDirs)
+				if lErr != nil {
+					writeError(w, http.StatusForbidden, lErr.Error())
+					return
+				}
+				body.RepoDir = cleanDir
+			}
 		}
 		stats, err := a.syncModuleHistoryOnServer(r.Context(), m, body.RepoDir)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "history sync failed")
+			writeError(w, http.StatusBadGateway, "history sync failed")
 			return
 		}
 		writeJSON(w, http.StatusOK, stats)
@@ -152,8 +187,8 @@ type importAPIRequest struct {
 	ConflictPolicy string               `json:"conflict_policy,omitempty"`
 	Concurrency    int                  `json:"concurrency,omitempty"`
 	Repositories   []gitimport.RepoSpec `json:"repositories"`
-	// RuntimeTokens supplies in-memory HTTPS tokens keyed by module_name so secrets
-	// never need to be stored in manifest files or server environment variables.
+	// RuntimeTokens supplies in-memory HTTPS tokens keyed by module_name from the client.
+	// Manager NEVER evaluates client-supplied TokenEnv or SSHKeyEnv names against server os.Getenv!
 	RuntimeTokens map[string]string `json:"runtime_tokens,omitempty"`
 }
 
@@ -189,25 +224,42 @@ func (a *App) projectImports(w http.ResponseWriter, r *http.Request, actor *user
 				Concurrency:    req.Concurrency,
 				Repositories:   req.Repositories,
 			}
-			for i := range manifest.Repositories {
-				if tok := req.RuntimeTokens[manifest.Repositories[i].ModuleName]; tok != "" {
-					manifest.Repositories[i].Auth.Token = tok
+			defer func() {
+				for i := range manifest.Repositories {
+					manifest.Repositories[i].Auth.Token = ""
 				}
-			}
-			// Clear req.RuntimeTokens map entries after transferring.
-			for k := range req.RuntimeTokens {
-				delete(req.RuntimeTokens, k)
-			}
-			res, err := a.Importer.Run(r.Context(), actor.Username, manifest)
+				for k := range req.RuntimeTokens {
+					delete(req.RuntimeTokens, k)
+				}
+			}()
+
+			// Reject SSHKeyEnv over the API unconditionally, and reject TokenEnv unless the client
+			// actually resolved and transmitted the token in RuntimeTokens[ModuleName], then strip TokenEnv!
 			for i := range manifest.Repositories {
-				manifest.Repositories[i].Auth.Token = ""
-			}
-			if err != nil {
-				if errors.Is(err, gitimport.ErrConflict) {
-					writeError(w, http.StatusConflict, err.Error())
+				repo := &manifest.Repositories[i]
+				if strings.TrimSpace(repo.Auth.SSHKeyEnv) != "" {
+					writeError(w, http.StatusBadRequest, gitimport.ErrServerEnvAccessDenied.Error())
 					return
 				}
-				writeError(w, http.StatusBadRequest, err.Error())
+				if tok, hasRuntime := req.RuntimeTokens[repo.ModuleName]; hasRuntime && tok != "" {
+					repo.Auth.Token = tok
+					repo.Auth.TokenEnv = ""
+				} else if strings.TrimSpace(repo.Auth.TokenEnv) != "" {
+					writeError(w, http.StatusBadRequest, gitimport.ErrServerEnvAccessDenied.Error())
+					return
+				}
+			}
+
+			res, err := a.Importer.Run(r.Context(), actor.Username, manifest)
+			if err != nil {
+				switch {
+				case errors.Is(err, gitimport.ErrConflict), errors.Is(err, gitimport.ErrJobBusy):
+					writeError(w, http.StatusConflict, err.Error())
+				case errors.Is(err, gitimport.ErrLocalSourceNotAllowed), errors.Is(err, gitimport.ErrSSHPathNotAllowed):
+					writeError(w, http.StatusForbidden, err.Error())
+				default:
+					writeError(w, http.StatusBadRequest, err.Error())
+				}
 				return
 			}
 			writeJSON(w, http.StatusOK, res)

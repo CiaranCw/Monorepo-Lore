@@ -232,7 +232,7 @@ Usage:
   lore-mono refs <module> [--type branch|tag] [--config file]
   lore-mono show <module> <commit-or-revision> [--config file]
   lore-mono import --manifest file [--dry-run] [--on-conflict policy] [--config file]
-  lore-mono import --source url --module name [--mount path] [--token-env VAR] [--ssh-key file] [--dry-run]
+  lore-mono import --source url --module name [--subdir path] [--mount path] [--token-env VAR] [--ssh-key file] [--dry-run]
   lore-mono publish [--config file] --parent dir [--module name=dir]
   lore-mono help
 

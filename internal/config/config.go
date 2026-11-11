@@ -49,11 +49,14 @@ type Config struct {
 	Import          Import
 }
 
-// Import configures external Git repository batch importing.
+// Import configures external Git repository batch importing and server-side
+// filesystem allowlists for local Git repositories and SSH key files.
 type Import struct {
-	Workspace     string
-	GitBinary     string
-	RemoteBaseURL string
+	Workspace        string
+	GitBinary        string
+	RemoteBaseURL    string
+	AllowedLocalDirs []string
+	AllowedSSHDirs   []string
 }
 
 // Publish is the server-side snapshot publisher. Empty Workspace leaves it unmounted.
@@ -115,9 +118,11 @@ type fileConfig struct {
 		CAFile    string `toml:"ca_file"`
 	} `toml:"publish"`
 	Import struct {
-		Workspace     string `toml:"workspace"`
-		GitBinary     string `toml:"git_binary"`
-		RemoteBaseURL string `toml:"remote_base_url"`
+		Workspace        string   `toml:"workspace"`
+		GitBinary        string   `toml:"git_binary"`
+		RemoteBaseURL    string   `toml:"remote_base_url"`
+		AllowedLocalDirs []string `toml:"allowed_local_dirs"`
+		AllowedSSHDirs   []string `toml:"allowed_ssh_dirs"`
 	} `toml:"import"`
 }
 
@@ -164,9 +169,11 @@ func Load(path string) (Config, error) {
 			CAFile:    strings.TrimSpace(raw.Publish.CAFile),
 		},
 		Import: Import{
-			Workspace:     strings.TrimSpace(raw.Import.Workspace),
-			GitBinary:     strings.TrimSpace(raw.Import.GitBinary),
-			RemoteBaseURL: strings.TrimSpace(raw.Import.RemoteBaseURL),
+			Workspace:        strings.TrimSpace(raw.Import.Workspace),
+			GitBinary:        strings.TrimSpace(raw.Import.GitBinary),
+			RemoteBaseURL:    strings.TrimSpace(raw.Import.RemoteBaseURL),
+			AllowedLocalDirs: append([]string(nil), raw.Import.AllowedLocalDirs...),
+			AllowedSSHDirs:   append([]string(nil), raw.Import.AllowedSSHDirs...),
 		},
 	}
 	if cfg.Listen == "" {
@@ -226,6 +233,12 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Import.Workspace != "" {
 		cfg.Import.Workspace = resolve(base, cfg.Import.Workspace)
+	}
+	for i, d := range cfg.Import.AllowedLocalDirs {
+		cfg.Import.AllowedLocalDirs[i] = resolve(base, strings.TrimSpace(d))
+	}
+	for i, d := range cfg.Import.AllowedSSHDirs {
+		cfg.Import.AllowedSSHDirs[i] = resolve(base, strings.TrimSpace(d))
 	}
 	cfg.Auth.PrivateKey = resolve(base, cfg.Auth.PrivateKey)
 	cfg.Auth.PublicKey = resolve(base, cfg.Auth.PublicKey)

@@ -137,7 +137,7 @@ func TestHistoryAndImportAPIWithPermissionIsolation(t *testing.T) {
 		t.Fatalf("refs %d %v", st, refsBody)
 	}
 
-	// 6. Ordinary member Alice cannot trigger project import (403 Forbidden), whereas admin Carol can run dry-run & live import!
+	// 6. Ordinary member Alice cannot trigger or read project import jobs (403 Forbidden)!
 	st, _ = apiJSON(t, http.MethodPost, srv+"/api/v1/projects/Alpha/imports", aliceTok, map[string]any{
 		"dry_run":      true,
 		"repositories": []map[string]any{{"source_url": "https://github.com/org/tools.git", "module_name": "Tools", "mount_path": "Tools"}},
@@ -145,8 +145,58 @@ func TestHistoryAndImportAPIWithPermissionIsolation(t *testing.T) {
 	if st != http.StatusForbidden {
 		t.Fatalf("member import expected 403, got %d", st)
 	}
+	if st, _ = apiJSON(t, http.MethodGet, srv+"/api/v1/projects/Alpha/imports", aliceTok, nil); st != http.StatusForbidden {
+		t.Fatalf("member list import jobs expected 403, got %d", st)
+	}
 
-	// If git & real lore exist, run an actual HTTP POST /api/v1/projects/Alpha/imports live import through Manager API!
+	// 7. History sync=1 MUST fail closed (HTTP 502) and NEVER return stale cached commits as fresh when Lore sync fails!
+	//    Here `Engine` points to unreachable `grpc://127.0.0.1:53547/engine` and `fakeLore` fails clone/sync!
+	st, staleModBody := apiJSON(t, http.MethodGet, srv+"/api/v1/modules/"+itoa(engID)+"/history?sync=1", aliceTok, nil)
+	if st == http.StatusOK {
+		t.Fatalf("module history?sync=1 MUST fail when sync fails, but returned 200 stale data: %v", staleModBody)
+	}
+	st, staleProjBody := apiJSON(t, http.MethodGet, srv+"/api/v1/projects/Alpha/history?sync=1", aliceTok, nil)
+	if st == http.StatusOK {
+		t.Fatalf("project history?sync=1 MUST fail when sync fails, but returned 200 stale data: %v", staleProjBody)
+	}
+
+	// 8. Security check on API: Carol (project_admin) CANNOT read arbitrary Manager server environment variables
+	//    by posting `token_env` without `runtime_tokens` or posting `ssh_key_env`!
+	t.Setenv("MANAGER_HOST_PRIVATE_SECRET", "do-not-read-from-server")
+	st, envStealBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects/Alpha/imports", carolTok, map[string]any{
+		"dry_run": true,
+		"repositories": []map[string]any{{
+			"source_url":  "https://github.com/org/tools.git",
+			"module_name": "StealEnv",
+			"mount_path":  "StealEnv",
+			"auth": map[string]any{
+				"auth_method": "https_token",
+				"token_env":   "MANAGER_HOST_PRIVATE_SECRET",
+			},
+		}},
+	})
+	if st != http.StatusBadRequest {
+		t.Fatalf("server-side token_env probing MUST return 400, got %d %v", st, envStealBody)
+	}
+	st, sshStealBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects/Alpha/imports", carolTok, map[string]any{
+		"dry_run": true,
+		"repositories": []map[string]any{{
+			"source_url":  "ssh://git@github.com/org/tools.git",
+			"module_name": "StealSSH",
+			"mount_path":  "StealSSH",
+			"auth": map[string]any{
+				"auth_method": "ssh_key",
+				"ssh_key_env": "MANAGER_HOST_PRIVATE_SECRET",
+			},
+		}},
+	})
+	if st != http.StatusBadRequest {
+		t.Fatalf("server-side ssh_key_env probing MUST return 400, got %d %v", st, sshStealBody)
+	}
+
+	// If git & real lore exist, verify:
+	//  (a) local path outside AllowedLocalDirs fails closed under RestrictLocalSources=true, and
+	//  (b) local path inside AllowedLocalDirs succeeds!
 	if gitPath, gErr := exec.LookPath("git"); gErr == nil {
 		loreCand := `C:\Program Files\lore\lore.exe`
 		if _, sErr := os.Stat(loreCand); sErr != nil {
@@ -157,31 +207,52 @@ func TestHistoryAndImportAPIWithPermissionIsolation(t *testing.T) {
 			app.Importer.Lore = &loreadapter.Client{Exec: realExec}
 			app.Importer.GitBinary = gitPath
 
-			srcGit := filepath.Join(t.TempDir(), "tools-git")
-			_ = os.MkdirAll(srcGit, 0o755)
-			runCmd := func(args ...string) {
-				c := exec.Command(gitPath, args...)
-				c.Dir = srcGit
-				c.Env = append(os.Environ(),
-					"GIT_AUTHOR_NAME=Carol", "GIT_AUTHOR_EMAIL=carol@example.com",
-					"GIT_COMMITTER_NAME=Carol", "GIT_COMMITTER_EMAIL=carol@example.com",
-				)
-				if out, err := c.CombinedOutput(); err != nil {
-					t.Fatalf("git %v: %v %s", args, err, out)
-				}
-			}
-			runCmd("init", "-b", "main")
-			_ = os.WriteFile(filepath.Join(srcGit, "tool.go"), []byte("package tool\n"), 0o644)
-			runCmd("add", "tool.go")
-			runCmd("commit", "-m", "init tools")
+			baseDir := t.TempDir()
+			allowedDir := filepath.Join(baseDir, "allowed")
+			forbiddenDir := filepath.Join(baseDir, "forbidden")
+			_ = os.MkdirAll(allowedDir, 0o755)
+			_ = os.MkdirAll(forbiddenDir, 0o755)
+			app.Importer.AllowedLocalDirs = []string{allowedDir}
 
+			initGit := func(dir string) {
+				_ = os.MkdirAll(dir, 0o755)
+				runCmd := func(args ...string) {
+					c := exec.Command(gitPath, args...)
+					c.Dir = dir
+					c.Env = append(os.Environ(),
+						"GIT_AUTHOR_NAME=Carol", "GIT_AUTHOR_EMAIL=carol@example.com",
+						"GIT_COMMITTER_NAME=Carol", "GIT_COMMITTER_EMAIL=carol@example.com",
+					)
+					if out, err := c.CombinedOutput(); err != nil {
+						t.Fatalf("git %v: %v %s", args, err, out)
+					}
+				}
+				runCmd("init", "-b", "main")
+				_ = os.WriteFile(filepath.Join(dir, "tool.go"), []byte("package tool\n"), 0o644)
+				runCmd("add", "tool.go")
+				runCmd("commit", "-m", "init tools")
+			}
+
+			outsideRepo := filepath.Join(forbiddenDir, "secret-git")
+			initGit(outsideRepo)
+			st, denyBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects/Alpha/imports", carolTok, map[string]any{
+				"repositories": []map[string]any{
+					{"source_url": outsideRepo, "module_name": "ForbiddenTools", "mount_path": "ForbiddenTools"},
+				},
+			})
+			if st != http.StatusOK || denyBody["status"] != "failed" {
+				t.Fatalf("local path outside AllowedLocalDirs MUST fail item, got %d %v", st, denyBody)
+			}
+
+			srcGit := filepath.Join(allowedDir, "tools-git")
+			initGit(srcGit)
 			st, impBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects/Alpha/imports", carolTok, map[string]any{
 				"repositories": []map[string]any{
 					{"source_url": srcGit, "module_name": "Tools", "mount_path": "Tools"},
 				},
 			})
 			if st != http.StatusOK || impBody["status"] != "succeeded" {
-				t.Fatalf("HTTP live import failed: %d %v", st, impBody)
+				t.Fatalf("HTTP live import inside AllowedLocalDirs failed: %d %v", st, impBody)
 			}
 		}
 	}

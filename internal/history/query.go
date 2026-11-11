@@ -317,7 +317,7 @@ func (s Service) resolveStartRevision(ctx context.Context, moduleID int64, branc
 
 const commitSelectSQL = `
 	SELECT pr.project_id, pr.name, m.module_id, m.name, m.mount_path, m.repository_id,
-	       mc.canonical_id, mc.lore_revision, mc.lore_revision_number, COALESCE(mc.source_commit_id,''),
+	       mc.canonical_id, mc.lore_revision, mc.lore_revision_number, COALESCE(mc.source_commit_id,''), mc.source_subdir,
 	       mc.origin_kind, mc.is_merge, mc.parent_count,
 	       mc.author_name, mc.author_email, mc.authored_at, mc.authored_unix_ms,
 	       mc.committer_name, mc.committer_email, mc.committed_at, mc.committed_unix_ms, mc.lore_committed_unix_ms,
@@ -474,7 +474,7 @@ func scanCommits(rows *sql.Rows) ([]Commit, error) {
 		var extraRaw string
 		if err := rows.Scan(
 			&c.ProjectID, &c.ProjectName, &c.ModuleID, &c.ModuleName, &c.MountPath, &c.RepositoryID,
-			&c.CanonicalID, &c.LoreRevision, &c.LoreRevisionNumber, &c.SourceCommitID,
+			&c.CanonicalID, &c.LoreRevision, &c.LoreRevisionNumber, &c.SourceCommitID, &c.SourceSubdir,
 			&c.OriginKind, &isMerge, &c.ParentCount,
 			&c.AuthorName, &c.AuthorEmail, &c.AuthoredAt, &c.AuthoredUnixMS,
 			&c.CommitterName, &c.CommitterEmail, &c.CommittedAt, &c.CommittedUnixMS, &c.LoreCommittedUnixMS,

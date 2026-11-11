@@ -99,13 +99,16 @@ func (a *App) syncModuleHistoryOnServer(ctx context.Context, m *project.Module, 
 	}
 
 	if localDir, ok := a.managedLocalRepoDir(ctx, m.ID); ok {
-		// If backed by a remote Lore URL, refresh branches/revisions first when reachable.
+		// If backed by a remote Lore URL, refresh branches/revisions first and fail explicitly if remote sync fails!
 		if !strings.HasPrefix(m.RepositoryURL, "lore://local/") {
-			_, _ = loreClient.Exec.Run(ctx, loreexec.Request{
+			res, err := loreClient.Exec.Run(ctx, loreexec.Request{
 				Argv: []string{"--non-interactive", "sync", "--repository", localDir},
 				Dir:  localDir,
 				Env:  loreClient.Env,
 			})
+			if err != nil || res.ExitCode != 0 {
+				return history.SyncStats{}, fmt.Errorf("remote lore sync failed for module %s", m.Name)
+			}
 		}
 		return history.SyncModuleFromLore(ctx, a.DB, loreClient, m.ID, localDir)
 	}

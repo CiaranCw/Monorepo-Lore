@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lore-monorepo/internal/history"
@@ -69,26 +70,92 @@ type MirrorGraph struct {
 	Branches              map[string]string // branch name -> commit SHA
 	Tags                  []GitTag
 	RootCommitCount       int
+	IsShallow             bool
 	ShallowMissingParents []string
 	LFSFetchAttempted     bool
 	LFSFetchSucceeded     bool
+}
+
+var (
+	safeEnvKeys = []string{
+		"PATH", "PATHEXT", "SystemRoot", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+		"PROGRAMFILES", "COMMONPROGRAMFILES",
+		"TEMP", "TMP", "TMPDIR",
+		"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+		"USER", "LOGNAME", "LANG", "LC_ALL",
+		"SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_EXEC_PATH",
+	}
+
+	noHooksOnce sync.Once
+	noHooksDir  string
+)
+
+func emptyHooksDir() string {
+	noHooksOnce.Do(func() {
+		d := filepath.Join(os.TempDir(), "lore-monorepo-git-empty-hooks")
+		if err := os.MkdirAll(d, 0o755); err == nil {
+			noHooksDir = d
+		}
+	})
+	return noHooksDir
+}
+
+// minimalGitEnv builds an isolated environment for `git` child processes so
+// Manager server secrets (tokens, passwords, cloud credentials) never leak to Git.
+func minimalGitEnv(extraEnv []string) []string {
+	env := make([]string, 0, len(safeEnvKeys)+len(extraEnv)+4)
+	for _, k := range safeEnvKeys {
+		if v, ok := os.LookupEnv(k); ok {
+			env = append(env, k+"="+v)
+		}
+	}
+	env = append(env,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"SSH_ASKPASS=",
+	)
+	env = append(env, extraEnv...)
+	return env
+}
+
+func isNetworkGitURL(sourceURL string) bool {
+	s := strings.TrimSpace(sourceURL)
+	if strings.Contains(s, "://") {
+		return !strings.HasPrefix(strings.ToLower(s), "file://")
+	}
+	return scpLikeRe.MatchString(s) && !filepath.IsAbs(s)
 }
 
 func runGit(ctx context.Context, gitBin, dir string, extraEnv, secrets []string, args ...string) (string, error) {
 	if gitBin == "" {
 		gitBin = "git"
 	}
-	cmd := exec.CommandContext(ctx, gitBin, args...)
+	fullArgs := make([]string, 0, len(args)+2)
+	if hd := emptyHooksDir(); hd != "" {
+		fullArgs = append(fullArgs, "-c", "core.hooksPath="+hd)
+	}
+	fullArgs = append(fullArgs, args...)
+
+	cmd := exec.CommandContext(ctx, gitBin, fullArgs...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
-	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Env = minimalGitEnv(extraEnv)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		msg := RedactOutput(stderr.String()+"\n"+stdout.String(), secrets)
+		allSecrets := append([]string{}, secrets...)
+		for _, kv := range extraEnv {
+			if idx := strings.IndexByte(kv, '='); idx >= 0 {
+				key, val := kv[:idx], kv[idx+1:]
+				if strings.HasPrefix(key, "GIT_CONFIG_VALUE_") || strings.HasPrefix(key, "LORE_GIT_SSH_") {
+					allSecrets = append(allSecrets, val)
+				}
+			}
+		}
+		msg := RedactOutput(stderr.String()+"\n"+stdout.String(), allSecrets)
 		return "", fmt.Errorf("git %s: %w (%s)", firstArg(args), err, msg)
 	}
 	return stdout.String(), nil
@@ -108,7 +175,12 @@ func firstArg(args []string) string {
 
 // InspectRemoteRefs runs `git ls-remote --symref` against sourceURL.
 func InspectRemoteRefs(ctx context.Context, gitBin, sourceURL string, extraEnv, secrets []string) (RemoteRefSummary, error) {
-	out, err := runGit(ctx, gitBin, "", extraEnv, secrets, "ls-remote", "--symref", sourceURL)
+	var args []string
+	if isNetworkGitURL(sourceURL) {
+		args = append(args, "-c", "protocol.file.allow=never")
+	}
+	args = append(args, "ls-remote", "--symref", "--", sourceURL)
+	out, err := runGit(ctx, gitBin, "", extraEnv, secrets, args...)
 	if err != nil {
 		return RemoteRefSummary{}, err
 	}
@@ -188,6 +260,14 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 		return false, false, err
 	}
 
+	var fetchArgs []string
+	if isNetworkGitURL(sourceURL) {
+		fetchArgs = append(fetchArgs, "-c", "protocol.file.allow=never")
+	}
+	fetchArgs = append(fetchArgs,
+		"fetch", "--prune", "--force", "--no-tags", "origin",
+		"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
+
 	var fetchErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -197,9 +277,7 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 			case <-time.After(time.Duration(attempt*300) * time.Millisecond):
 			}
 		}
-		_, fetchErr = runGit(ctx, gitBin, mirrorDir, extraEnv, secrets,
-			"fetch", "--prune", "--force", "--no-tags", "origin",
-			"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*")
+		_, fetchErr = runGit(ctx, gitBin, mirrorDir, extraEnv, secrets, fetchArgs...)
 		if fetchErr == nil {
 			break
 		}
@@ -208,14 +286,19 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 		return false, false, fetchErr
 	}
 
+	// If source was shallow, mirror or source may carry a shallow boundary file.
+	copySourceShallowMarkerIfPresent(sourceURL, mirrorDir)
+
 	if lfsMode == LFSModeAuto {
-		// If sourceURL is a local Git working or bare repository carrying LFS objects,
-		// copy any available LFS blobs directly before/alongside `git lfs fetch` so
-		// local imports without an HTTP LFS endpoint still hydrate cleanly.
 		copyLocalLFSObjects(sourceURL, mirrorDir)
 		if _, verErr := runGit(ctx, gitBin, "", nil, nil, "lfs", "version"); verErr == nil {
 			lfsAttempted = true
-			if _, lfsErr := runGit(ctx, gitBin, mirrorDir, extraEnv, secrets, "lfs", "fetch", "--all", "origin"); lfsErr == nil {
+			var lfsArgs []string
+			if isNetworkGitURL(sourceURL) {
+				lfsArgs = append(lfsArgs, "-c", "protocol.file.allow=never")
+			}
+			lfsArgs = append(lfsArgs, "lfs", "fetch", "--all", "origin")
+			if _, lfsErr := runGit(ctx, gitBin, mirrorDir, extraEnv, secrets, lfsArgs...); lfsErr == nil {
 				lfsOK = true
 			} else if hasAnyLocalLFSObjects(mirrorDir) {
 				lfsOK = true
@@ -225,8 +308,24 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 	return lfsAttempted, lfsOK, nil
 }
 
+func copySourceShallowMarkerIfPresent(sourceURL, mirrorDir string) {
+	if isNetworkGitURL(sourceURL) {
+		return
+	}
+	src := strings.TrimPrefix(sourceURL, "file://")
+	for _, cand := range []string{
+		filepath.Join(src, ".git", "shallow"),
+		filepath.Join(src, "shallow"),
+	} {
+		if data, err := os.ReadFile(cand); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			_ = os.WriteFile(filepath.Join(mirrorDir, "shallow"), data, 0o644)
+			return
+		}
+	}
+}
+
 func copyLocalLFSObjects(sourceURL, mirrorDir string) {
-	if strings.Contains(sourceURL, "://") && !strings.HasPrefix(strings.ToLower(sourceURL), "file://") {
+	if isNetworkGitURL(sourceURL) {
 		return
 	}
 	src := strings.TrimPrefix(sourceURL, "file://")
@@ -272,6 +371,7 @@ func hasAnyLocalLFSObjects(mirrorDir string) bool {
 
 // ReadMirrorGraph extracts all branches, tags, and reachable commits from mirrorDir
 // and sorts commits in strict topological order (all parents before any child).
+// Shallow grafts or missing parent objects are explicitly detected and recorded.
 func ReadMirrorGraph(ctx context.Context, gitBin, mirrorDir, defaultBranchHint string) (MirrorGraph, error) {
 	g := MirrorGraph{
 		DefaultBranch: defaultBranchHint,
@@ -279,7 +379,13 @@ func ReadMirrorGraph(ctx context.Context, gitBin, mirrorDir, defaultBranchHint s
 		Branches:      map[string]string{},
 	}
 
-	// 1. Branches (`git for-each-ref` uses `%00` for NUL, not `%x00`).
+	if shallowData, sErr := os.ReadFile(filepath.Join(mirrorDir, "shallow")); sErr == nil && strings.TrimSpace(string(shallowData)) != "" {
+		g.IsShallow = true
+	} else if shOut, rErr := runGit(ctx, gitBin, mirrorDir, nil, nil, "rev-parse", "--is-shallow-repository"); rErr == nil && strings.TrimSpace(shOut) == "true" {
+		g.IsShallow = true
+	}
+
+	// 1. Branches (`git for-each-ref` uses `%00` for NUL).
 	bOut, err := runGit(ctx, gitBin, mirrorDir, nil, nil, "for-each-ref", "--format=%(refname:short)%00%(objectname)", "refs/heads")
 	if err != nil {
 		return g, err
@@ -335,14 +441,13 @@ func ReadMirrorGraph(ctx context.Context, gitBin, mirrorDir, defaultBranchHint s
 			tag.TagObjectID = fields[2]
 			tag.TargetSHA = fields[3]
 			if tag.TargetSHA == "" {
-				// Nested tag-to-tag peel fallback.
 				if peeled, pErr := runGit(ctx, gitBin, mirrorDir, nil, nil, "rev-parse", fields[0]+"^{commit}"); pErr == nil {
 					tag.TargetSHA = strings.TrimSpace(peeled)
 				}
 			}
 		} else if fields[1] == "commit" {
 			tag.TargetSHA = fields[2]
-			tag.Message = "" // lightweight tag has no tag object message
+			tag.Message = ""
 		} else {
 			continue
 		}
@@ -356,8 +461,11 @@ func ReadMirrorGraph(ctx context.Context, gitBin, mirrorDir, defaultBranchHint s
 		return g, nil
 	}
 
-	// 3. All commits reachable from branches and tags.
-	cOut, err := runGit(ctx, gitBin, mirrorDir, nil, nil, "log", "--branches", "--tags", "--topo-order", "--reverse",
+	// 3. Read raw commit objects WITHOUT shallow parent grafting (`--no-grafts` / `cat-file`)!
+	// Note: `git log` hides shallow-grafted parent SHAs by pretending a shallow boundary commit has 0 parents!
+	// Therefore, we ALSO inspect raw commit headers for any shallow-grafted commit (or read raw `%P` with `--no-replace-objects`)
+	// AND verify raw `parent <sha>` lines via `cat-file commit` on root-appearing commits when `g.IsShallow` or shallow file exists!
+	cOut, err := runGit(ctx, gitBin, mirrorDir, nil, nil, "--no-replace-objects", "log", "--branches", "--tags", "--topo-order", "--reverse",
 		"-z", "--format=%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%at%x1f%cn%x1f%ce%x1f%cI%x1f%ct%x1f%e%x1f%G?%x1f%B")
 	if err != nil {
 		return g, err
@@ -397,7 +505,19 @@ func ReadMirrorGraph(ctx context.Context, gitBin, mirrorDir, defaultBranchHint s
 		g.CommitsBySHA[c.SHA] = c
 	}
 
-	// 4. Deterministic Kahn topological sort guaranteeing every parent precedes its children.
+	// Inspect raw commit objects for any commit with `len(c.Parents) == 0` (or shallow boundary commits)
+	// using `git cat-file commit <sha>`, because `git log %P` masks parents listed in `.git/shallow`!
+	for sha, c := range g.CommitsBySHA {
+		if len(c.Parents) == 0 || g.IsShallow {
+			rawParents, rErr := readRawCommitParents(ctx, gitBin, mirrorDir, sha)
+			if rErr == nil && len(rawParents) > len(c.Parents) {
+				c.Parents = rawParents
+				g.CommitsBySHA[sha] = c
+			}
+		}
+	}
+
+	// 4. Deterministic Kahn topological sort + missing parent detection.
 	inDegree := make(map[string]int, len(g.CommitsBySHA))
 	children := make(map[string][]string, len(g.CommitsBySHA))
 	missingSet := map[string]bool{}
@@ -464,12 +584,33 @@ func ReadMirrorGraph(ctx context.Context, gitBin, mirrorDir, defaultBranchHint s
 	return g, nil
 }
 
+func readRawCommitParents(ctx context.Context, gitBin, mirrorDir, commitSHA string) ([]string, error) {
+	raw, err := runGit(ctx, gitBin, mirrorDir, nil, nil, "cat-file", "commit", commitSHA)
+	if err != nil {
+		return nil, err
+	}
+	var parents []string
+	for _, ln := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		if ln == "" {
+			break // end of commit object headers
+		}
+		if strings.HasPrefix(ln, "parent ") {
+			p := strings.TrimSpace(strings.TrimPrefix(ln, "parent "))
+			if p != "" {
+				parents = append(parents, p)
+			}
+		}
+	}
+	return parents, nil
+}
+
 // BatchBlobReader keeps a persistent `git cat-file --batch` subprocess open
 // so reading thousands of blobs during DAG replay incurs zero process-spawn overhead.
 type BatchBlobReader struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
+	closed bool
 }
 
 func NewBatchBlobReader(ctx context.Context, gitBin, mirrorDir string) (*BatchBlobReader, error) {
@@ -477,6 +618,7 @@ func NewBatchBlobReader(ctx context.Context, gitBin, mirrorDir string) (*BatchBl
 		gitBin = "git"
 	}
 	cmd := exec.CommandContext(ctx, gitBin, "--git-dir="+mirrorDir, "cat-file", "--batch")
+	cmd.Env = minimalGitEnv(nil)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -516,7 +658,6 @@ func (b *BatchBlobReader) ReadBlob(oid string) ([]byte, error) {
 	if _, err := io.ReadFull(b.stdout, buf); err != nil {
 		return nil, err
 	}
-	// Consume trailing LF emitted by git cat-file --batch.
 	if _, err := b.stdout.ReadByte(); err != nil {
 		return nil, err
 	}
@@ -524,11 +665,24 @@ func (b *BatchBlobReader) ReadBlob(oid string) ([]byte, error) {
 }
 
 func (b *BatchBlobReader) Close() {
-	if b == nil {
+	if b == nil || b.closed {
 		return
 	}
+	b.closed = true
 	_ = b.stdin.Close()
-	_ = b.cmd.Wait()
+	done := make(chan struct{})
+	go func() {
+		_ = b.cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		if b.cmd.Process != nil {
+			_ = b.cmd.Process.Kill()
+		}
+		<-done
+	}
 }
 
 type treeEntry struct {
@@ -557,7 +711,6 @@ func readGitTreeEntries(ctx context.Context, gitBin, mirrorDir, treeSHA string) 
 		if len(meta) < 3 || relPath == "" {
 			continue
 		}
-		// Never allow `.lore` collision from a source repo.
 		if relPath == ".lore" || strings.HasPrefix(relPath, ".lore/") {
 			continue
 		}
@@ -568,6 +721,60 @@ func readGitTreeEntries(ctx context.Context, gitBin, mirrorDir, treeSHA string) 
 	return entries, nil
 }
 
+// filterEntriesForSubdir projects root Git tree entries down to a specific module subdirectory
+// (or keeps the whole tree when sourceSubdir == ""), stripping `sourceSubdir + "/"` from paths
+// and scoping `.gitmodules` metadata strictly to submodules inside `sourceSubdir`.
+func filterEntriesForSubdir(allEntries []treeEntry, sourceSubdir string, reader *BatchBlobReader) ([]treeEntry, map[string]map[string]string) {
+	rawSubmodules := map[string]map[string]string{}
+	if reader != nil {
+		for _, e := range allEntries {
+			if sourceSubdir == "" && e.Path == ".gitmodules" && e.Type == "blob" {
+				if raw, bErr := reader.ReadBlob(e.OID); bErr == nil {
+					rawSubmodules = parseGitmodules(string(raw))
+				}
+				break
+			}
+			if sourceSubdir != "" && (e.Path == ".gitmodules" || e.Path == sourceSubdir+"/.gitmodules") && e.Type == "blob" {
+				if raw, bErr := reader.ReadBlob(e.OID); bErr == nil {
+					for k, v := range parseGitmodules(string(raw)) {
+						rawSubmodules[k] = v
+					}
+				}
+			}
+		}
+	}
+
+	if sourceSubdir == "" {
+		return allEntries, rawSubmodules
+	}
+
+	prefix := sourceSubdir + "/"
+	var scoped []treeEntry
+	for _, e := range allEntries {
+		if !strings.HasPrefix(e.Path, prefix) {
+			continue
+		}
+		rel := strings.TrimPrefix(e.Path, prefix)
+		if rel == "" || rel == ".lore" || strings.HasPrefix(rel, ".lore/") {
+			continue
+		}
+		scoped = append(scoped, treeEntry{
+			Mode: e.Mode, Type: e.Type, OID: e.OID, Path: rel,
+		})
+	}
+
+	scopedSubs := map[string]map[string]string{}
+	for subPath, meta := range rawSubmodules {
+		if strings.HasPrefix(subPath, prefix) {
+			scopedSubs[strings.TrimPrefix(subPath, prefix)] = meta
+		} else if _, direct := scopedSubs[subPath]; !direct {
+			// Support a module-local .gitmodules inside sourceSubdir as well.
+			scopedSubs[subPath] = meta
+		}
+	}
+	return scoped, scopedSubs
+}
+
 // TreeMaterializeResult reports special objects and file count after materializing a Git tree.
 type TreeMaterializeResult struct {
 	RegularFiles int
@@ -576,28 +783,28 @@ type TreeMaterializeResult struct {
 }
 
 // MaterializeGitTree reconciles loreWorkDir (excluding `.lore`) so its on-disk files
-// match treeSHA byte-for-byte, handling LFS objects/pointers, submodule gitlinks, and symlinks.
+// match treeSHA (or `treeSHA:sourceSubdir` when sourceSubdir != "") byte-for-byte,
+// handling LFS objects/pointers, submodule gitlinks, and symlinks.
 func MaterializeGitTree(
 	ctx context.Context,
-	gitBin, mirrorDir, loreWorkDir, treeSHA, lfsMode string,
+	gitBin, mirrorDir, loreWorkDir, treeSHA, sourceSubdir, lfsMode string,
 	reader *BatchBlobReader,
 	cachedBlobs map[string]string,
 ) (TreeMaterializeResult, error) {
-	entries, err := readGitTreeEntries(ctx, gitBin, mirrorDir, treeSHA)
+	allEntries, err := readGitTreeEntries(ctx, gitBin, mirrorDir, treeSHA)
 	if err != nil {
 		return TreeMaterializeResult{}, err
 	}
+	return materializeScopedEntries(mirrorDir, loreWorkDir, sourceSubdir, lfsMode, allEntries, reader, cachedBlobs)
+}
 
-	// Pre-parse .gitmodules if present so submodule gitlinks record URL/branch metadata.
-	submodulesMeta := map[string]map[string]string{}
-	for _, e := range entries {
-		if e.Path == ".gitmodules" && e.Type == "blob" {
-			if raw, bErr := reader.ReadBlob(e.OID); bErr == nil {
-				submodulesMeta = parseGitmodules(string(raw))
-			}
-			break
-		}
-	}
+func materializeScopedEntries(
+	mirrorDir, loreWorkDir, sourceSubdir, lfsMode string,
+	allEntries []treeEntry,
+	reader *BatchBlobReader,
+	cachedBlobs map[string]string,
+) (TreeMaterializeResult, error) {
+	entries, submodulesMeta := filterEntriesForSubdir(allEntries, sourceSubdir, reader)
 
 	wantPaths := make(map[string]treeEntry, len(entries))
 	wantDirs := map[string]bool{}
@@ -627,12 +834,10 @@ func MaterializeGitTree(
 		}
 	}
 
-	// 1. Remove any existing files or file/dir type collisions in loreWorkDir outside `.lore`.
 	if err := cleanObsoletePaths(loreWorkDir, wantPaths, wantDirs, cachedBlobs); err != nil {
 		return TreeMaterializeResult{}, err
 	}
 
-	// 2. Write or update wanted files and compute canonical content digest.
 	hasher := sha256.New()
 	sortedPaths := make([]string, 0, len(wantPaths))
 	for p := range wantPaths {
@@ -708,7 +913,6 @@ func MaterializeGitTree(
 		if e.Mode == "100755" {
 			perm = 0o755
 		}
-		// Ensure writable on Windows before overwriting read-only files.
 		_ = os.Chmod(fullPath, 0o666)
 		if err := os.WriteFile(fullPath, writeBytes, perm); err != nil {
 			return TreeMaterializeResult{}, err
@@ -718,11 +922,100 @@ func MaterializeGitTree(
 		}
 	}
 
+	sort.Slice(specials, func(i, j int) bool {
+		if specials[i].Path != specials[j].Path {
+			return specials[i].Path < specials[j].Path
+		}
+		return specials[i].Kind < specials[j].Kind
+	})
+
 	return TreeMaterializeResult{
 		RegularFiles: len(sortedPaths),
 		TreeDigest:   hex.EncodeToString(hasher.Sum(nil)),
 		Specials:     specials,
 	}, nil
+}
+
+// InspectExpectedSpecialObjects returns the exact SpecialObject list expected for
+// `(treeSHA, sourceSubdir, lfsMode)` directly from the bare Git mirror so verification
+// can check count, kind, path, OID, size, and metadata JSON across every commit!
+func InspectExpectedSpecialObjects(
+	mirrorDir, sourceSubdir, lfsMode string,
+	allEntries []treeEntry,
+	reader *BatchBlobReader,
+) ([]history.SpecialObject, error) {
+	entries, submodulesMeta := filterEntriesForSubdir(allEntries, sourceSubdir, reader)
+	var specials []history.SpecialObject
+	for _, e := range entries {
+		if e.Mode == "160000" || e.Type == "commit" {
+			detail := "{}"
+			if m, ok := submodulesMeta[e.Path]; ok && len(m) > 0 {
+				if b, jErr := json.Marshal(m); jErr == nil {
+					detail = string(b)
+				}
+			}
+			specials = append(specials, history.SpecialObject{
+				Kind:       "submodule_gitlink",
+				Path:       e.Path,
+				OID:        e.OID,
+				DetailJSON: detail,
+			})
+			continue
+		}
+		if e.Mode == "120000" {
+			raw, err := reader.ReadBlob(e.OID)
+			if err != nil {
+				return nil, err
+			}
+			detailB, _ := json.Marshal(map[string]string{"target": string(raw)})
+			specials = append(specials, history.SpecialObject{
+				Kind:       "symlink",
+				Path:       e.Path,
+				OID:        e.OID,
+				SizeBytes:  int64(len(raw)),
+				DetailJSON: string(detailB),
+			})
+			continue
+		}
+		raw, err := reader.ReadBlob(e.OID)
+		if err != nil {
+			return nil, err
+		}
+		if lfsOID, lfsSize, isLFS := parseLFSPointer(raw); isLFS {
+			lfsObjPath := filepath.Join(mirrorDir, "lfs", "objects", lfsOID[:2], lfsOID[2:4], lfsOID)
+			hydrated := false
+			if lfsMode == LFSModeAuto {
+				if st, sErr := os.Stat(lfsObjPath); sErr == nil && !st.IsDir() && st.Size() == lfsSize {
+					hydrated = true
+				}
+			}
+			if hydrated {
+				specials = append(specials, history.SpecialObject{
+					Kind:       "lfs_hydrated",
+					Path:       e.Path,
+					OID:        lfsOID,
+					SizeBytes:  lfsSize,
+					DetailJSON: "{}",
+				})
+			} else {
+				detailB, _ := json.Marshal(map[string]string{"status": "pointer_preserved"})
+				specials = append(specials, history.SpecialObject{
+					Kind:       "lfs_pointer",
+					Path:       e.Path,
+					OID:        lfsOID,
+					SizeBytes:  lfsSize,
+					DetailJSON: string(detailB),
+				})
+			}
+		}
+	}
+	sort.Slice(specials, func(i, j int) bool {
+		if specials[i].Path != specials[j].Path {
+			return specials[i].Path < specials[j].Path
+		}
+		return specials[i].Kind < specials[j].Kind
+	})
+	return specials, nil
 }
 
 func cleanObsoletePaths(loreWorkDir string, wantPaths map[string]treeEntry, wantDirs map[string]bool, cachedBlobs map[string]string) error {
@@ -749,7 +1042,6 @@ func cleanObsoletePaths(loreWorkDir string, wantPaths map[string]treeEntry, want
 			return nil
 		}
 		if info.IsDir() {
-			// If a file now needs to exist at this directory path, remove the whole subtree!
 			if _, isNowFile := wantPaths[relSlash]; isNowFile {
 				if cachedBlobs != nil {
 					for k := range cachedBlobs {
@@ -766,7 +1058,6 @@ func cleanObsoletePaths(loreWorkDir string, wantPaths map[string]treeEntry, want
 			dirsToCheck = append(dirsToCheck, path)
 			return nil
 		}
-		// Regular file or symlink: remove if no longer in wantPaths OR if a directory now sits at relSlash!
 		if _, wanted := wantPaths[relSlash]; !wanted || wantDirs[relSlash] {
 			_ = os.Chmod(path, 0o666)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -781,7 +1072,6 @@ func cleanObsoletePaths(loreWorkDir string, wantPaths map[string]treeEntry, want
 	if err != nil {
 		return err
 	}
-	// Prune empty directories bottom-up.
 	for i := len(dirsToCheck) - 1; i >= 0; i-- {
 		d := dirsToCheck[i]
 		rel, rErr := filepath.Rel(loreWorkDir, d)
@@ -796,8 +1086,7 @@ func cleanObsoletePaths(loreWorkDir string, wantPaths map[string]treeEntry, want
 }
 
 // ComputeWorkdirDigest computes the exact SHA-256 content manifest of regular files
-// inside loreWorkDir (excluding `.lore`) so post-import verification can compare it
-// against the source Git HEAD tree digest.
+// inside loreWorkDir (excluding `.lore`).
 func ComputeWorkdirDigest(loreWorkDir string) (int, string, error) {
 	type fileDigest struct {
 		rel string
@@ -845,12 +1134,13 @@ func ComputeWorkdirDigest(loreWorkDir string) (int, string, error) {
 }
 
 // ComputeGitTreeContentDigest computes the mode-agnostic file content digest of treeSHA
-// (matching ComputeWorkdirDigest on Windows where NTFS does not track POSIX 0755 bits).
-func ComputeGitTreeContentDigest(ctx context.Context, gitBin, mirrorDir, treeSHA, lfsMode string, reader *BatchBlobReader) (int, string, error) {
-	entries, err := readGitTreeEntries(ctx, gitBin, mirrorDir, treeSHA)
+// (scoped to sourceSubdir when non-empty) matching ComputeWorkdirDigest.
+func ComputeGitTreeContentDigest(ctx context.Context, gitBin, mirrorDir, treeSHA, sourceSubdir, lfsMode string, reader *BatchBlobReader) (int, string, error) {
+	allEntries, err := readGitTreeEntries(ctx, gitBin, mirrorDir, treeSHA)
 	if err != nil {
 		return 0, "", err
 	}
+	entries, _ := filterEntriesForSubdir(allEntries, sourceSubdir, nil)
 	type fileDigest struct {
 		rel string
 		sum string
