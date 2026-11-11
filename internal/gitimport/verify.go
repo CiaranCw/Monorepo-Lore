@@ -601,7 +601,7 @@ func (im *Importer) verifyImportedModule(
 		if tErr != nil {
 			return rep, tErr
 		}
-		wantSpecs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader)
+		wantSpecs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, spec.EffectiveMappings())
 		if sErr != nil {
 			rep.Mismatches = append(rep.Mismatches, sErr.Error())
 			continue
@@ -719,9 +719,13 @@ func (im *Importer) verifyImportedModule(
 			if tErr != nil {
 				return rep, tErr
 			}
-			scopedEntries, _ := filterEntriesForSubdir(allEntries, spec.SourceSubdir, nil)
+			scopedMapped, _, mapErr := ApplyPathMappings(allEntries, spec.EffectiveMappings())
+			if mapErr != nil {
+				rep.Mismatches = append(rep.Mismatches, mapErr.Error())
+				continue
+			}
 			validAddedOrKept := map[string]bool{}
-			for _, se := range scopedEntries {
+			for _, se := range scopedMapped {
 				if se.Mode == "160000" || se.Type == "commit" {
 					continue // Submodule gitlink paths MUST NOT exist as files inside parent module!
 				}

@@ -373,7 +373,7 @@ func TestSkipIfImportedFourStatesShallowAndTamperedDAGVerification(t *testing.T)
 	refs, _ := InspectRemoteRefs(ctx, gitBin, octoSrc, nil, nil)
 	rawG, _ := ReadMirrorGraph(ctx, gitBin, mirrorDir, refs.DefaultBranch)
 	tc := NewTreeCache()
-	projG, _ := ProjectMirrorGraph(ctx, gitBin, mirrorDir, rawG, "", nil, nil, tc)
+	projG, _ := ProjectMirrorGraph(ctx, gitBin, mirrorDir, rawG, "", nil, nil, tc, nil, nil)
 	_, gitMap, _ := loadExistingGitCommits(ctx, db, octoModID)
 
 	tamperedVer, err := imp.verifyImportedModule(ctx, proj.ID, octoModID, mirrorDir, loreDir, RepoSpec{

@@ -6,6 +6,10 @@ Monorepo-Lore keeps three distinct history concepts strictly separate:
 2. **Monorepo aggregated history (`GET /api/v1/projects/{ref}/history`)**: A permission-filtered, chronological union across the caller's currently authorized modules in a project. It never fabricates a cross-repository Git commit chain.
 3. **Parent snapshot history (`snapshots`)**: Published immutable module-pin manifests on the parent repository. Snapshot publishing never rewrites or truncates child module commit history.
 
+## Multiple historical paths
+
+A module can claim more than one source path. `source_subdir` remains the current directory. Optional `path_mappings` add earlier directories (`kind = "tree"`) or one exact file (`kind = "file"`). A file mapping outranks a tree mapping in the same module. Two mapped sources that land on the same module path are kept when the mode and object id match, and rejected when they differ. Paths claimed by another module are not unmapped. Paths matched by an `excluded` rule stay out of every game module. Game-internal files are kept by mapping the game directory itself, not by a global filename rule.
+
 ## Lore 0.10.1 Native Model vs. Git Commit DAG
 
 | Capability | Lore 0.10.1 Native Storage | Monorepo-Lore Compatibility & Index Layer |

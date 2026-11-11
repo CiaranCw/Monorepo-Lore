@@ -43,6 +43,7 @@ func (im *Importer) runImportItem(
 	st storedItem,
 	spec RepoSpec,
 	siblingSubdirs []string,
+	foreignMappings []PathMapping,
 	pathRules []PathRule,
 	manifestModNames map[string]bool,
 	getMirror func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error),
@@ -206,7 +207,7 @@ func (im *Importer) runImportItem(
 	}
 
 	// Step 2: Project MirrorGraph onto this module's independent DAG (`source_subdir` or whole repo).
-	projGraph, pErr := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache)
+	projGraph, pErr := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache, spec.EffectiveMappings(), foreignMappings)
 	if pErr != nil {
 		out.Status = "failed"
 		out.Error = pErr.Error()
@@ -675,7 +676,7 @@ func (im *Importer) replayGraphIntoLore(
 			if tErr != nil {
 				return tErr
 			}
-			specs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader)
+			specs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, spec.EffectiveMappings())
 			if sErr != nil {
 				return sErr
 			}
@@ -684,6 +685,9 @@ func (im *Importer) replayGraphIntoLore(
 				extraMeta = map[string]string{"lore.orphan_anchor": firstRootLoreRev}
 			}
 			if err := im.indexProjectedCommitInDB(ctx, cp.ModuleID, existingRev, spec.SourceSubdir, c, specs, cp.CommitMap, extraMeta); err != nil {
+				return err
+			}
+			if err := im.recordPathProjection(ctx, cp.ModuleID, existingRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
 				return err
 			}
 			continue
@@ -787,7 +791,7 @@ func (im *Importer) replayGraphIntoLore(
 
 				if !isFinalStep {
 					if hasConflicts {
-						if _, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, nil); err != nil {
+						if _, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, nil); err != nil {
 							return err
 						}
 						if err := im.Lore.MergeResolve(ctx, loreWorkDir, true); err != nil {
@@ -834,7 +838,7 @@ func (im *Importer) replayGraphIntoLore(
 						return err
 					}
 				} else {
-					mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, cachedBlobs)
+					mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, cachedBlobs)
 					if err != nil {
 						return err
 					}
@@ -847,17 +851,23 @@ func (im *Importer) replayGraphIntoLore(
 					if err != nil {
 						return err
 					}
+					if err := im.recordPathProjection(ctx, cp.ModuleID, loreRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
+						return err
+					}
 					existingBranches[lane] = loreRev
 					cp.CommitMap[c.SHA] = loreRev
 				}
 			}
 		} else {
-			mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, cachedBlobs)
+			mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, cachedBlobs)
 			if err != nil {
 				return err
 			}
 			loreRev, err := im.commitAndIndexGitCommit(ctx, loreWorkDir, cp.ModuleID, spec.SourceSubdir, c, mat, cp.CommitMap, extraMeta)
 			if err != nil {
+				return err
+			}
+			if err := im.recordPathProjection(ctx, cp.ModuleID, loreRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
 				return err
 			}
 			existingBranches[lane] = loreRev
@@ -1037,6 +1047,30 @@ func (im *Importer) indexProjectedCommitInDB(
 			sp.LoreRevision = loreRev
 			sp.SourceCommitID = c.SHA
 			if err := history.UpsertSpecialObject(ctx, tx, moduleID, sp); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (im *Importer) recordPathProjection(ctx context.Context, moduleID int64, loreRev, sourceSHA string, entries []treeEntry, mappings []PathMapping) error {
+	mapped, _, err := ApplyPathMappings(entries, mappings)
+	if err != nil {
+		return err
+	}
+	return database.Tx(ctx, im.DB, func(tx *sql.Tx) error {
+		for _, e := range mapped {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO module_path_projections(
+					module_id, source_commit_id, lore_revision, source_path, mapped_path, path_rule_id, projection_type
+				) VALUES (?,?,?,?,?,?,?)
+				ON CONFLICT(module_id, source_commit_id, source_path) DO UPDATE SET
+					lore_revision=excluded.lore_revision,
+					mapped_path=excluded.mapped_path,
+					path_rule_id=excluded.path_rule_id,
+					projection_type=excluded.projection_type
+			`, moduleID, sourceSHA, loreRev, e.SourcePath, e.Path, e.RuleID, e.ProjectionType); err != nil {
 				return err
 			}
 		}

@@ -766,23 +766,17 @@ func filterEntriesForSubdir(allEntries []treeEntry, sourceSubdir string, reader 
 	if sourceSubdir == "" {
 		return allEntries, rawSubmodules
 	}
-
-	prefix := sourceSubdir + "/"
-	var scoped []treeEntry
-	for _, e := range allEntries {
-		if !strings.HasPrefix(e.Path, prefix) {
-			continue
-		}
-		rel := strings.TrimPrefix(e.Path, prefix)
-		if rel == "" || rel == ".lore" || strings.HasPrefix(rel, ".lore/") {
-			continue
-		}
-		scoped = append(scoped, treeEntry{
-			Mode: e.Mode, Type: e.Type, OID: e.OID, Path: rel,
-		})
+	mapped, _, err := ApplyPathMappings(allEntries, MappingsForSubdir(sourceSubdir))
+	if err != nil {
+		return nil, rawSubmodules
+	}
+	scoped := make([]treeEntry, 0, len(mapped))
+	for _, e := range mapped {
+		scoped = append(scoped, e.treeEntry)
 	}
 
 	scopedSubs := map[string]map[string]string{}
+	prefix := sourceSubdir + "/"
 	for subPath, meta := range rawSubmodules {
 		if strings.HasPrefix(subPath, prefix) {
 			scopedSubs[strings.TrimPrefix(subPath, prefix)] = meta
@@ -814,16 +808,29 @@ func MaterializeGitTree(
 	if err != nil {
 		return TreeMaterializeResult{}, err
 	}
-	return materializeScopedEntries(mirrorDir, loreWorkDir, sourceSubdir, lfsMode, allEntries, reader, cachedBlobs)
+	return materializeScopedEntries(mirrorDir, loreWorkDir, sourceSubdir, MappingsForSubdir(sourceSubdir), lfsMode, allEntries, reader, cachedBlobs)
 }
 
 func materializeScopedEntries(
-	mirrorDir, loreWorkDir, sourceSubdir, lfsMode string,
+	mirrorDir, loreWorkDir, sourceSubdir string,
+	mappings []PathMapping,
+	lfsMode string,
 	allEntries []treeEntry,
 	reader *BatchBlobReader,
 	cachedBlobs map[string]string,
 ) (TreeMaterializeResult, error) {
-	entries, submodulesMeta := filterEntriesForSubdir(allEntries, sourceSubdir, reader)
+	if len(mappings) == 0 {
+		mappings = MappingsForSubdir(sourceSubdir)
+	}
+	mapped, _, mapErr := ApplyPathMappings(allEntries, mappings)
+	if mapErr != nil {
+		return TreeMaterializeResult{}, mapErr
+	}
+	entries := make([]treeEntry, 0, len(mapped))
+	for _, e := range mapped {
+		entries = append(entries, e.treeEntry)
+	}
+	_, submodulesMeta := filterEntriesForSubdir(allEntries, sourceSubdir, reader)
 
 	wantPaths := make(map[string]treeEntry, len(entries))
 	wantDirs := map[string]bool{}
@@ -957,8 +964,20 @@ func InspectExpectedSpecialObjects(
 	mirrorDir, sourceSubdir, lfsMode string,
 	allEntries []treeEntry,
 	reader *BatchBlobReader,
+	mappings []PathMapping,
 ) ([]history.SpecialObject, error) {
-	entries, submodulesMeta := filterEntriesForSubdir(allEntries, sourceSubdir, reader)
+	if len(mappings) == 0 {
+		mappings = MappingsForSubdir(sourceSubdir)
+	}
+	mapped, _, mapErr := ApplyPathMappings(allEntries, mappings)
+	if mapErr != nil {
+		return nil, mapErr
+	}
+	entries := make([]treeEntry, 0, len(mapped))
+	for _, e := range mapped {
+		entries = append(entries, e.treeEntry)
+	}
+	_, submodulesMeta := filterEntriesForSubdir(allEntries, sourceSubdir, reader)
 	var specials []history.SpecialObject
 	for _, e := range entries {
 		if e.Mode == "160000" || e.Type == "commit" {

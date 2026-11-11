@@ -97,7 +97,7 @@ func TestBackupVerifyRestoreAndTamperDetection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if man.UserVersion != 5 || man.TableCounts["modules"] != 2 || len(man.Files) < 6 {
+	if man.UserVersion != 6 || man.TableCounts["modules"] != 2 || man.TableCounts["module_path_projections"] != 0 || len(man.Files) < 6 {
 		t.Fatalf("unexpected backup manifest: %+v", man)
 	}
 	if err := VerifyBackup(ctx, bundle); err != nil {

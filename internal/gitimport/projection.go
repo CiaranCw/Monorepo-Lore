@@ -73,6 +73,7 @@ type ProjectedGraph struct {
 	UndecidedPaths           []string         // unclassified paths that block strict migration completeness
 	CoverageComplete         bool
 	AliasedCommitsCount      int
+	IdenticalPathMerges      int
 }
 
 func ProjectMirrorGraph(
@@ -83,9 +84,22 @@ func ProjectMirrorGraph(
 	siblingSubdirs []string,
 	pathRules []PathRule,
 	cache *TreeCache,
+	localMappings []PathMapping,
+	foreignMappings []PathMapping,
 ) (ProjectedGraph, error) {
 	sourceSubdir = strings.Trim(strings.TrimSpace(sourceSubdir), "/")
-	if sourceSubdir == "" {
+	if len(localMappings) == 0 {
+		localMappings = MappingsForSubdir(sourceSubdir)
+	}
+	if len(foreignMappings) == 0 {
+		for _, sib := range siblingSubdirs {
+			sib = strings.Trim(strings.TrimSpace(sib), "/")
+			if sib != "" && sib != sourceSubdir {
+				foreignMappings = append(foreignMappings, PathMapping{SourcePrefix: sib, Kind: MappingTree})
+			}
+		}
+	}
+	if sourceSubdir == "" && len(localMappings) == 0 {
 		eff := make(map[string]string, len(g.Commits))
 		bySHA := make(map[string]GitCommit, len(g.Commits))
 		rawParents := make(map[string][]string, len(g.Commits))
@@ -135,53 +149,33 @@ func ProjectMirrorGraph(
 		OriginalBranches:  map[string]string{},
 	}
 
-	allDeclaredPrefixes := []string{sourceSubdir + "/"}
-	for _, sib := range siblingSubdirs {
-		sib = strings.Trim(strings.TrimSpace(sib), "/")
-		if sib != "" && sib != sourceSubdir {
-			allDeclaredPrefixes = append(allDeclaredPrefixes, sib+"/")
-		}
-	}
-
 	unmappedSet := map[string]bool{}
 	projSubtree := map[string]string{}
 	ancestors := map[string]map[string]bool{}
-
-	modulePrefix := sourceSubdir + "/"
 
 	computeSubtree := func(treeSHA string) (string, error) {
 		entries, err := cache.Entries(ctx, gitBin, mirrorDir, treeSHA)
 		if err != nil {
 			return "", err
 		}
-		var scoped []treeEntry
 		var rootGitmodulesOID string
 		for _, e := range entries {
 			if e.Path == ".gitmodules" && e.Type == "blob" {
 				rootGitmodulesOID = e.OID
 			}
-			if strings.HasPrefix(e.Path, modulePrefix) {
-				rel := strings.TrimPrefix(e.Path, modulePrefix)
-				if rel != "" && rel != ".lore" && !strings.HasPrefix(rel, ".lore/") {
-					scoped = append(scoped, treeEntry{Mode: e.Mode, Type: e.Type, OID: e.OID, Path: rel})
-				}
+			if claimedBy(e.Path, localMappings) || claimedBy(e.Path, foreignMappings) {
 				continue
 			}
-			inSibling := false
-			for _, pfx := range allDeclaredPrefixes {
-				if strings.HasPrefix(e.Path, pfx) {
-					inSibling = true
-					break
-				}
-			}
-			if !inSibling {
-				unmappedSet[e.Path] = true
-			}
+			unmappedSet[e.Path] = true
 		}
+		scoped, deduped, mapErr := ApplyPathMappings(entries, localMappings)
+		if mapErr != nil {
+			return "", mapErr
+		}
+		out.IdenticalPathMerges += deduped
 		if len(scoped) == 0 {
 			return "", nil
 		}
-		sort.Slice(scoped, func(i, j int) bool { return scoped[i].Path < scoped[j].Path })
 		h := sha256.New()
 		hasGitlink := false
 		for _, e := range scoped {

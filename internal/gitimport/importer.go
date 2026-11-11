@@ -295,6 +295,15 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 			siblingSubdirsByURL[r.SourceURL] = append(siblingSubdirsByURL[r.SourceURL], r.SourceSubdir)
 		}
 	}
+	foreignByModule := map[string][]PathMapping{}
+	for _, r := range m.Repositories {
+		for _, other := range m.Repositories {
+			if other.ModuleName == r.ModuleName || other.SourceURL != r.SourceURL {
+				continue
+			}
+			foreignByModule[r.ModuleName] = append(foreignByModule[r.ModuleName], other.EffectiveMappings()...)
+		}
+	}
 
 	mirrorStates := map[string]*sharedMirrorState{}
 	pinnedByURL := map[string]*RemoteRefSummary{}
@@ -331,9 +340,9 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 				})
 			}
 			if m.DryRun {
-				results[idx] = im.runDryRunItem(ctx, proj, items[idx], spec, siblings, m.PathRules, manifestModNames, manifestModulesByURL, getMirror)
+				results[idx] = im.runDryRunItem(ctx, proj, items[idx], spec, siblings, foreignByModule[spec.ModuleName], m.PathRules, manifestModNames, manifestModulesByURL, getMirror)
 			} else {
-				results[idx] = im.runImportItem(ctx, actor, proj, items[idx], spec, siblings, m.PathRules, manifestModNames, getMirror)
+				results[idx] = im.runImportItem(ctx, actor, proj, items[idx], spec, siblings, foreignByModule[spec.ModuleName], m.PathRules, manifestModNames, getMirror)
 			}
 		}()
 	}
@@ -693,6 +702,7 @@ func (im *Importer) runDryRunItem(
 	st storedItem,
 	spec RepoSpec,
 	siblingSubdirs []string,
+	foreignMappings []PathMapping,
 	pathRules []PathRule,
 	manifestModNames map[string]bool,
 	manifestModulesByURL map[string]string,
@@ -780,7 +790,7 @@ func (im *Importer) runDryRunItem(
 		return out
 	}
 
-	projGraph, err := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache)
+	projGraph, err := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache, spec.EffectiveMappings(), foreignMappings)
 	if err != nil {
 		out.Status = "failed"
 		out.Error = err.Error()
@@ -843,7 +853,7 @@ func (im *Importer) runDryRunItem(
 			report.Mismatches = append(report.Mismatches, treeErr.Error())
 			continue
 		}
-		specials, specialErr := InspectExpectedSpecialObjects(st.GitMirrorPath, spec.SourceSubdir, spec.LFSMode, entries, reader)
+		specials, specialErr := InspectExpectedSpecialObjects(st.GitMirrorPath, spec.SourceSubdir, spec.LFSMode, entries, reader, spec.EffectiveMappings())
 		if specialErr != nil {
 			report.Mismatches = append(report.Mismatches, specialErr.Error())
 			continue
