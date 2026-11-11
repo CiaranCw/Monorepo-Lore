@@ -335,7 +335,7 @@ func TestEndToEndBatchGitImportResumePostCommitAndSnapshotPublish(t *testing.T) 
 		Project: "Alpha",
 		DryRun:  true,
 		Repositories: []RepoSpec{
-			{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine"},
+			{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine", LFSMode: LFSModePointer},
 			{SourceURL: docsGitDir, ModuleName: "Docs", MountPath: "Docs"},
 			{SourceURL: filepath.Join(tmp, "does-not-exist-git"), ModuleName: "Broken", MountPath: "Broken"},
 		},
@@ -371,7 +371,7 @@ func TestEndToEndBatchGitImportResumePostCommitAndSnapshotPublish(t *testing.T) 
 		JobKey:  "batch-alpha-001",
 		Project: "Alpha",
 		Repositories: []RepoSpec{
-			{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine"},
+			{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine", LFSMode: LFSModePointer},
 			{SourceURL: docsGitDir, ModuleName: "Docs", MountPath: "Docs"},
 		},
 	}
@@ -406,6 +406,18 @@ func TestEndToEndBatchGitImportResumePostCommitAndSnapshotPublish(t *testing.T) 
 	if engVer.HeadGitDigest == "" || engVer.HeadGitDigest != engVer.HeadLoreDigest {
 		t.Fatalf("Engine HEAD tree digest mismatch: git=%s lore=%s", engVer.HeadGitDigest, engVer.HeadLoreDigest)
 	}
+	if engVer.FullContentMigrated || engVer.LFSHydrationStatus != "pointer_only_unhydrated" || engVer.LFSUnhydratedCount == 0 {
+		t.Fatalf("pointer-preserving LFS import must be marked unhydrated, never full migration: %+v", engVer)
+	}
+	sawUnmigratedSubmodule := false
+	for _, dep := range engVer.SubmoduleDependencies {
+		if dep.Path == "vendor/sub" && dep.MigrationStatus == "unmigrated_independent_repo" && dep.LatestCommitSHA != "" {
+			sawUnmigratedSubmodule = true
+		}
+	}
+	if !sawUnmigratedSubmodule {
+		t.Fatalf("submodule dependency was not explicitly reported as independently unmigrated: %+v", engVer.SubmoduleDependencies)
+	}
 
 	// =========================================================================
 	// PHASE D: Idempotency & Conflict Policy Checks
@@ -419,7 +431,7 @@ func TestEndToEndBatchGitImportResumePostCommitAndSnapshotPublish(t *testing.T) 
 	// Running a NEW job targeting already-existing `Engine` with default ConflictFail MUST reject without overwriting!
 	conflictRun, err := imp.Run(ctx, "carol", Manifest{
 		Project:      "Alpha",
-		Repositories: []RepoSpec{{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine"}},
+		Repositories: []RepoSpec{{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine", LFSMode: LFSModePointer}},
 	})
 	if err != nil || conflictRun.FailedItems != 1 || conflictRun.Items[0].Status != "conflict" {
 		t.Fatalf("conflict policy fail must reject existing module: %+v err=%v", conflictRun, err)
@@ -429,7 +441,7 @@ func TestEndToEndBatchGitImportResumePostCommitAndSnapshotPublish(t *testing.T) 
 	skipRun, err := imp.Run(ctx, "carol", Manifest{
 		Project:        "Alpha",
 		ConflictPolicy: ConflictSkipIfImported,
-		Repositories:   []RepoSpec{{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine"}},
+		Repositories:   []RepoSpec{{SourceURL: engineGitDir, ModuleName: "Engine", MountPath: "Engine", LFSMode: LFSModePointer}},
 	})
 	if err != nil || skipRun.SkippedItems != 1 || skipRun.Items[0].Status != "skipped" {
 		t.Fatalf("skip_if_imported failed: %+v err=%v", skipRun, err)

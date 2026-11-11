@@ -1,0 +1,77 @@
+# Parseable external Git Monorepo split manifest.
+# Source subdirectories under the same source_url must not overlap.
+# Strict mode blocks the import until every root/global source path matches a
+# reviewed path_rules classification below.
+
+project = "ExampleGamesProject"
+conflict_policy = "fail"
+concurrency = 2
+global_files_policy = "strict"
+
+[[path_rules]]
+pattern = "README.md"
+category = "excluded"
+reason = "Source-host landing page retained in the Git mirror and migration evidence"
+
+[[path_rules]]
+pattern = ".github/**"
+category = "excluded"
+reason = "Source-host CI configuration is not runtime game-module content"
+
+[[path_rules]]
+pattern = "shared/**"
+category = "separate_module"
+target_module = "Shared"
+reason = "Shared runtime content must migrate into its own independently authorized module"
+
+[[repositories]]
+source_url = "https://github.com/example-org/games-monorepo.git"
+source_subdir = "Chess"
+module_name = "Chess"
+mount_path = "Chess"
+lfs_mode = "hydrate"
+submodule_policy = "record_gitlink"
+expected_default_branch = "main"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"
+
+[[repositories]]
+source_url = "https://github.com/example-org/games-monorepo.git"
+source_subdir = "Mahjong"
+module_name = "Mahjong"
+mount_path = "Mahjong"
+lfs_mode = "hydrate"
+submodule_policy = "record_gitlink"
+expected_default_branch = "main"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"
+
+[[repositories]]
+source_url = "https://github.com/example-org/games-monorepo.git"
+source_subdir = "Poker"
+module_name = "Poker"
+mount_path = "Poker"
+lfs_mode = "hydrate"
+submodule_policy = "record_gitlink"
+expected_default_branch = "main"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"
+
+[[repositories]]
+source_url = "https://github.com/example-org/games-monorepo.git"
+source_subdir = "shared"
+module_name = "Shared"
+mount_path = "Shared"
+lfs_mode = "hydrate"
+submodule_policy = "record_gitlink"
+expected_default_branch = "main"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"

@@ -20,6 +20,9 @@ certs/private/
 logs/
 data/
 store/
+backups/
+restore-drill/
+migration-evidence/private/
 
 # Build output
 bin/

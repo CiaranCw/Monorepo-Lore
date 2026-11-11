@@ -339,7 +339,7 @@ func TestSkipIfImportedFourStatesShallowAndTamperedDAGVerification(t *testing.T)
 	octoJob, err := imp.Run(ctx, "carol", Manifest{
 		JobKey:       "job-octo-verify",
 		Project:      "FourState",
-		Repositories: []RepoSpec{{SourceURL: octoSrc, ModuleName: "OctoMod", MountPath: "OctoMod"}},
+		Repositories: []RepoSpec{{SourceURL: octoSrc, ModuleName: "OctoMod", MountPath: "OctoMod", LFSMode: LFSModePointer}},
 	})
 	if err != nil || octoJob.Status != "succeeded" {
 		t.Fatalf("octo import failed: %+v err=%v", octoJob, err)
@@ -363,12 +363,12 @@ func TestSkipIfImportedFourStatesShallowAndTamperedDAGVerification(t *testing.T)
 	refs, _ := InspectRemoteRefs(ctx, gitBin, octoSrc, nil, nil)
 	rawG, _ := ReadMirrorGraph(ctx, gitBin, mirrorDir, refs.DefaultBranch)
 	tc := NewTreeCache()
-	projG, _ := ProjectMirrorGraph(ctx, gitBin, mirrorDir, rawG, "", nil, tc)
+	projG, _ := ProjectMirrorGraph(ctx, gitBin, mirrorDir, rawG, "", nil, nil, tc)
 	_, gitMap, _ := loadExistingGitCommits(ctx, db, octoModID)
 
-	tamperedVer, err := imp.verifyImportedModule(ctx, octoModID, mirrorDir, loreDir, RepoSpec{
-		SourceURL: octoSrc, ModuleName: "OctoMod", MountPath: "OctoMod", LFSMode: LFSModeAuto,
-	}, refs, rawG, projG, itemCheckpoint{ModuleID: octoModID, CommitMap: gitMap, SyntheticCount: 1}, tc)
+	tamperedVer, err := imp.verifyImportedModule(ctx, proj.ID, octoModID, mirrorDir, loreDir, RepoSpec{
+		SourceURL: octoSrc, ModuleName: "OctoMod", MountPath: "OctoMod", LFSMode: LFSModePointer,
+	}, refs, rawG, projG, itemCheckpoint{ModuleID: octoModID, CommitMap: gitMap, SyntheticCount: 1}, map[string]bool{"OctoMod": true}, tc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,6 +455,11 @@ func TestTeamGamesMonorepoSplitProjectionAndIsolation(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(gamesGitDir, ".github", "workflows", "ci.yml"), []byte("name: ci-v2\n"), 0o644)
 	g.run(nil, "add", "-A")
 	shaGlobalOnly := g.commitAs("CI Bot", "ci@teamgames.example", "2025-05-01T10:00:00Z", "ci: update global workflow only", false)
+	// Branch and tag both point at a commit folded in every game module. Their
+	// original target must remain auditable while each module resolves them to
+	// its own effective Lore revision after Manager restart.
+	g.run(nil, "branch", "global-config", shaGlobalOnly)
+	g.run(nil, "tag", "global-config-v2", shaGlobalOnly)
 
 	// Test B + Test C (Interleaved commits C1 -> Chess, C2 -> Mahjong, C3 -> Chess; Poker untouched!):
 	_ = os.WriteFile(filepath.Join(gamesGitDir, "Chess", "board.go"), []byte("package chess // C1\n"), 0o644)
@@ -547,9 +552,14 @@ func TestTeamGamesMonorepoSplitProjectionAndIsolation(t *testing.T) {
 	}
 
 	splitManifest := Manifest{
-		JobKey:      "split-teamgames-001",
-		Project:     "GamesPlatform",
-		Concurrency: 2,
+		JobKey:            "split-teamgames-001",
+		Project:           "GamesPlatform",
+		Concurrency:       2,
+		GlobalFilesPolicy: GlobalPolicyStrict,
+		PathRules: []PathRule{
+			{Pattern: "README.md", Category: PathCategoryExcluded, Reason: "project-level source overview; retained in the Git mirror and migration evidence"},
+			{Pattern: ".github/**", Category: PathCategoryExcluded, Reason: "source-host CI metadata; explicitly excluded from runtime game modules"},
+		},
 		Repositories: []RepoSpec{
 			{SourceURL: gamesGitDir, SourceSubdir: "Chess", ModuleName: "Chess", MountPath: "Chess"},
 			{SourceURL: gamesGitDir, SourceSubdir: "Mahjong", ModuleName: "Mahjong", MountPath: "Mahjong"},
@@ -634,6 +644,50 @@ func TestTeamGamesMonorepoSplitProjectionAndIsolation(t *testing.T) {
 		t.Fatalf("source_subdir not preserved on commits: %q %q %q", chessLang.SourceSubdir, mahjongLang.SourceSubdir, pokerLang.SourceSubdir)
 	}
 
+	// Folded source commit aliases, branches, and tags must be persisted, remain
+	// resolvable after a new Service instance (Manager-restart equivalent), and
+	// map to a distinct Lore revision in every module.
+	restartedHistorySvc := history.Service{DB: db}
+	aliasLoreRevs := map[string]bool{}
+	for _, tc := range []struct {
+		name string
+		id   int64
+	}{
+		{"Chess", chessModID},
+		{"Mahjong", mahjongModID},
+		{"Poker", pokerModID},
+	} {
+		al, aErr := restartedHistorySvc.GetCommitAlias(ctx, bobID, tc.id, shaGlobalOnly)
+		if aErr != nil || al.AliasStatus != history.AliasUnchanged || al.LoreRevision == "" {
+			t.Fatalf("%s folded alias after restart got %+v err=%v", tc.name, al, aErr)
+		}
+		aliasResolved, rErr := restartedHistorySvc.GetCommit(ctx, bobID, tc.id, shaGlobalOnly)
+		if rErr != nil || !aliasResolved.ResolvedViaAlias || aliasResolved.QueriedSourceCommit != shaGlobalOnly || aliasResolved.LoreRevision != al.LoreRevision {
+			t.Fatalf("%s alias commit query got %+v err=%v", tc.name, aliasResolved, rErr)
+		}
+		aliasLoreRevs[al.LoreRevision] = true
+
+		refs, refsErr := restartedHistorySvc.ListModuleRefs(ctx, bobID, tc.id, "")
+		if refsErr != nil {
+			t.Fatal(refsErr)
+		}
+		sawBranch, sawTag := false, false
+		for _, ref := range refs {
+			if ref.Name == "global-config" {
+				sawBranch = ref.OriginalSourceCommitID == shaGlobalOnly && ref.LoreRevision == al.LoreRevision
+			}
+			if ref.Name == "global-config-v2" {
+				sawTag = ref.OriginalSourceCommitID == shaGlobalOnly && ref.LoreRevision == al.LoreRevision
+			}
+		}
+		if !sawBranch || !sawTag {
+			t.Fatalf("%s folded branch/tag provenance missing: branch=%v tag=%v refs=%+v", tc.name, sawBranch, sawTag, refs)
+		}
+	}
+	if len(aliasLoreRevs) != 3 {
+		t.Fatalf("same folded source commit must resolve to independent module Lore revisions, got %v", aliasLoreRevs)
+	}
+
 	// Assert Test D: Cross-module move `Chess/shared_card.txt -> Poker/shared_card.txt`
 	// is a pure `delete` in Chess and a pure `add` in Poker (NO cross-module rename!).
 	chessMove, _ := histSvc.GetCommit(ctx, bobID, chessModID, shaCrossMove)
@@ -673,6 +727,9 @@ func TestTeamGamesMonorepoSplitProjectionAndIsolation(t *testing.T) {
 		ver := run2.Items[idx].Verification
 		if ver.UnmappedPathsCount != 2 {
 			t.Fatalf("%s expected 2 unmapped global paths (.github/workflows/ci.yml, README.md), got %d (%v)", modName, ver.UnmappedPathsCount, ver.UnmappedPaths)
+		}
+		if !ver.CoverageComplete || len(ver.ClassifiedExcluded) != 2 || len(ver.UndecidedPaths) != 0 {
+			t.Fatalf("%s global-path classification incomplete: %+v", modName, ver)
 		}
 		workDir := filepath.Join(imp.WorkspaceRoot, fmt.Sprintf("proj-%d", proj.ID), "lore", modName)
 		for _, forbidden := range []string{"README.md", ".github", "Chess", "Mahjong", "Poker"} {

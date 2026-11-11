@@ -2,12 +2,15 @@ package gitimport
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
 	"lore-monorepo/internal/history"
 	"lore-monorepo/internal/loreadapter"
+	"lore-monorepo/internal/project"
 )
 
 const loreScanChunk = 200
@@ -86,37 +89,41 @@ func readActualLoreDAG(
 }
 
 // verifyImportedModule performs comprehensive 3-layer integrity verification across:
-//   1. Source Bare Git Mirror (MirrorGraph + ProjectedGraph + Git trees/blobs)
-//   2. Physical Lore Repository (Lore revisions, metadata, [parent_self, parent_other] DAG, branches, HEAD files)
-//   3. Manager SQLite Index (module_commits, module_commit_parents, module_refs, module_special_objects)
+//  1. Source Bare Git Mirror (MirrorGraph + ProjectedGraph + Git trees/blobs)
+//  2. Physical Lore Repository (Lore revisions, metadata, [parent_self, parent_other] DAG, branches, HEAD files)
+//  3. Manager SQLite Index (module_commits, module_commit_aliases, module_commit_parents, module_refs, module_special_objects)
 func (im *Importer) verifyImportedModule(
 	ctx context.Context,
-	moduleID int64,
+	projectID, moduleID int64,
 	mirrorDir, loreWorkDir string,
 	spec RepoSpec,
 	remoteRefs RemoteRefSummary,
 	rawGraph MirrorGraph,
 	projGraph ProjectedGraph,
 	cp itemCheckpoint,
+	_ map[string]bool,
 	treeCache *TreeCache,
 ) (VerificationReport, error) {
 	rep := VerificationReport{
-		SourceSubdir:          spec.SourceSubdir,
-		RawSourceCommits:      len(rawGraph.Commits),
-		SourceCommits:         len(projGraph.Commits),
-		AliasedCommits:        projGraph.AliasedCommitsCount,
-		MappedCommits:         len(cp.CommitMap),
-		SyntheticMergeBridges: cp.SyntheticCount,
-		SourceBranches:        len(projGraph.Branches),
-		SourceTags:            len(projGraph.Tags),
-		HeadBranch:            projGraph.DefaultBranch,
-		AdvertisedHiddenRefs:  remoteRefs.AdvertisedHiddenRefs,
-		ShallowMissingParents: rawGraph.ShallowMissingParents,
-		SkippedEmptyBranches:  projGraph.SkippedEmptyBranches,
-		SkippedEmptyTags:      projGraph.SkippedEmptyTags,
-		UnmappedPathsCount:    len(projGraph.UnmappedPaths),
-		LFSFetchAttempted:     rawGraph.LFSFetchAttempted,
-		LFSFetchSucceeded:     rawGraph.LFSFetchSucceeded,
+		CoverageComplete:         projGraph.CoverageComplete,
+		SourceSubdir:             spec.SourceSubdir,
+		RawSourceCommits:         len(rawGraph.Commits),
+		SourceCommits:            len(projGraph.Commits),
+		AliasedCommits:           projGraph.AliasedCommitsCount,
+		MappedCommits:            len(cp.CommitMap),
+		SyntheticMergeBridges:    cp.SyntheticCount,
+		SourceBranches:           len(projGraph.Branches),
+		SourceTags:               len(projGraph.Tags),
+		HeadBranch:               projGraph.DefaultBranch,
+		AdvertisedHiddenRefs:     remoteRefs.AdvertisedHiddenRefs,
+		ShallowMissingParents:    rawGraph.ShallowMissingParents,
+		SkippedEmptyBranches:     projGraph.SkippedEmptyBranches,
+		SkippedEmptyTags:         projGraph.SkippedEmptyTags,
+		UnmappedPathsCount:       len(projGraph.UnmappedPaths),
+		ClassifiedExcluded:       projGraph.ClassifiedExcluded,
+		ClassifiedSeparateModule: projGraph.ClassifiedSeparateModule,
+		LFSFetchAttempted:        rawGraph.LFSFetchAttempted,
+		LFSFetchSucceeded:        rawGraph.LFSFetchSucceeded,
 	}
 	if len(projGraph.UnmappedPaths) > 0 {
 		limit := len(projGraph.UnmappedPaths)
@@ -125,8 +132,20 @@ func (im *Importer) verifyImportedModule(
 		}
 		rep.UnmappedPaths = append([]string{}, projGraph.UnmappedPaths[:limit]...)
 	}
+	if len(projGraph.UndecidedPaths) > 0 {
+		limit := len(projGraph.UndecidedPaths)
+		if limit > 32 {
+			limit = 32
+		}
+		rep.UndecidedPaths = append([]string{}, projGraph.UndecidedPaths[:limit]...)
+	}
 
-	// 1. Shallow / Missing Parent Gate: incomplete source history MUST fail!
+	// Gate A: Unclassified global/shared paths under strict policy block migration completion!
+	if spec.SourceSubdir != "" && spec.GlobalFilesPolicy == GlobalPolicyStrict && !projGraph.CoverageComplete {
+		rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("%d unclassified monorepo path(s) outside module subdirectories", len(projGraph.UndecidedPaths)))
+	}
+
+	// Gate B: Shallow / Missing Parent Gate: incomplete source history MUST fail!
 	if rawGraph.IsShallow {
 		rep.Mismatches = append(rep.Mismatches, "source git repository is shallow (.git/shallow present)")
 	}
@@ -135,7 +154,6 @@ func (im *Importer) verifyImportedModule(
 			len(rawGraph.ShallowMissingParents), rawGraph.ShallowMissingParents[0]))
 	}
 
-	// Collect tag target revisions so tag-only commits (not on any branch) are also scanned from Lore!
 	var tagTargetRevs []string
 	for _, t := range projGraph.Tags {
 		if rev := cp.CommitMap[t.TargetSHA]; rev != "" {
@@ -143,27 +161,37 @@ func (im *Importer) verifyImportedModule(
 		}
 	}
 
-	// 2. Load Layer 2: physical Lore DAG & branches directly from Lore CLI.
+	// Load Layer 2: physical Lore DAG & branches directly from Lore CLI.
 	loreDAG, loreBranches, err := readActualLoreDAG(ctx, im.Lore, loreWorkDir, tagTargetRevs)
 	if err != nil {
 		return rep, fmt.Errorf("verify: read physical lore dag: %w", err)
 	}
 
-	// 3. Load Layer 3: SQLite commits, parents, refs, and special objects for moduleID.
+	// Load Layer 3: SQLite commits (including full metadata!), aliases, parents, refs, and special objects.
 	type sqlCommitRow struct {
-		LoreRev      string
-		SourceSHA    string
-		SourceSubdir string
-		IsSynthetic  bool
-		IsMerge      bool
-		ParentCount  int
+		LoreRev         string
+		SourceSHA       string
+		SourceSubdir    string
+		IsSynthetic     bool
+		IsMerge         bool
+		ParentCount     int
+		AuthorName      string
+		AuthorEmail     string
+		AuthoredUnixMS  int64
+		CommitterName   string
+		CommitterEmail  string
+		CommittedUnixMS int64
+		Message         string
+		GitTreeID       string
 	}
 	sqlCommits := map[string]sqlCommitRow{}
 	sqlBySourceSHA := map[string]string{}
 	var sqlSyntheticCount int
 
 	cRows, err := im.DB.QueryContext(ctx, `
-		SELECT lore_revision, COALESCE(source_commit_id,''), source_subdir, is_synthetic, is_merge, parent_count
+		SELECT lore_revision, COALESCE(source_commit_id,''), source_subdir, is_synthetic, is_merge, parent_count,
+		       author_name, author_email, authored_unix_ms, committer_name, committer_email, committed_unix_ms,
+		       message, COALESCE(git_tree_id,'')
 		FROM module_commits
 		WHERE module_id=? AND origin_kind='git_import'
 	`, moduleID)
@@ -173,7 +201,11 @@ func (im *Importer) verifyImportedModule(
 	for cRows.Next() {
 		var r sqlCommitRow
 		var synth, merge int
-		if err := cRows.Scan(&r.LoreRev, &r.SourceSHA, &r.SourceSubdir, &synth, &merge, &r.ParentCount); err != nil {
+		if err := cRows.Scan(
+			&r.LoreRev, &r.SourceSHA, &r.SourceSubdir, &synth, &merge, &r.ParentCount,
+			&r.AuthorName, &r.AuthorEmail, &r.AuthoredUnixMS, &r.CommitterName, &r.CommitterEmail, &r.CommittedUnixMS,
+			&r.Message, &r.GitTreeID,
+		); err != nil {
 			cRows.Close()
 			return rep, err
 		}
@@ -203,7 +235,7 @@ func (im *Importer) verifyImportedModule(
 		rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("mapped commits %d != projected source commits %d", len(cp.CommitMap), rep.SourceCommits))
 	}
 
-	// Verify no Lore revision in `module_commits` belongs to another module (global uniqueness check across modules!).
+	// Verify zero cross-module Lore revision sharing across the entire database!
 	var crossModCount int
 	if err := im.DB.QueryRowContext(ctx, `
 		SELECT COUNT(*)
@@ -214,7 +246,62 @@ func (im *Importer) verifyImportedModule(
 		rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("cross-module lore_revision collision detected (%d)", crossModCount))
 	}
 
-	// Load all SQLite parent edges for moduleID AND verify every parent revision belongs to THIS module!
+	// Verify SQLite `module_commit_aliases` persistence across ALL rawGraph.Commits!
+	sqlAliases := map[string]history.CommitAlias{}
+	aRows, err := im.DB.QueryContext(ctx, `
+		SELECT source_commit_id, alias_status, effective_source_commit_id, lore_revision, source_subdir
+		FROM module_commit_aliases
+		WHERE module_id = ?
+	`, moduleID)
+	if err != nil {
+		return rep, err
+	}
+	for aRows.Next() {
+		var al history.CommitAlias
+		if err := aRows.Scan(&al.SourceCommitID, &al.AliasStatus, &al.EffectiveSourceCommitID, &al.LoreRevision, &al.SourceSubdir); err != nil {
+			aRows.Close()
+			return rep, err
+		}
+		sqlAliases[al.SourceCommitID] = al
+	}
+	if err := aRows.Close(); err != nil {
+		return rep, err
+	}
+	rep.PersistedAliases = len(sqlAliases)
+
+	if len(sqlAliases) != len(rawGraph.Commits) {
+		rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("persisted commit aliases %d != raw source commits %d", len(sqlAliases), len(rawGraph.Commits)))
+	}
+	for _, rc := range rawGraph.Commits {
+		al, exists := sqlAliases[rc.SHA]
+		if !exists {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("missing persisted alias row for source commit %s", short12(rc.SHA)))
+			continue
+		}
+		wantEff := projGraph.EffectiveCommitOf[rc.SHA]
+		wantStatus := history.AliasUnchanged
+		wantRev := ""
+		if wantEff == "" {
+			wantStatus = history.AliasPreModule
+		} else if wantEff == rc.SHA {
+			wantStatus = history.AliasDirect
+			wantRev = cp.CommitMap[rc.SHA]
+		} else {
+			wantRev = cp.CommitMap[wantEff]
+		}
+		if al.AliasStatus != wantStatus || al.EffectiveSourceCommitID != wantEff || al.LoreRevision != wantRev || al.SourceSubdir != spec.SourceSubdir {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("alias mismatch on %s: got (%s eff=%s rev=%s), want (%s eff=%s rev=%s)",
+				short12(rc.SHA), al.AliasStatus, short12(al.EffectiveSourceCommitID), short12(al.LoreRevision),
+				wantStatus, short12(wantEff), short12(wantRev)))
+		}
+		if al.LoreRevision != "" {
+			if _, belongsToThisModule := sqlCommits[al.LoreRevision]; !belongsToThisModule {
+				rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("alias %s points to lore_revision %s outside module %d", short12(rc.SHA), short12(al.LoreRevision), moduleID))
+			}
+		}
+	}
+
+	// Load all SQLite parent edges for moduleID AND verify every parent revision belongs strictly to THIS module!
 	sqlParents := map[string][]history.ParentLink{}
 	var totalParentEdges int
 	pRows, err := im.DB.QueryContext(ctx, `
@@ -246,7 +333,7 @@ func (im *Importer) verifyImportedModule(
 		return rep, err
 	}
 
-	// 4. Per-Commit 3-Layer Verification: Mapping Bijection, Lore Existence, Metadata, and Exact Ordered Parents!
+	// Per-Commit 3-Layer Bijection, Full Metadata Preservation, and Exact Parent Order Verification!
 	seenLoreRevs := map[string]string{}
 	expectedTotalParentEdges := 0
 
@@ -262,7 +349,6 @@ func (im *Importer) verifyImportedModule(
 		}
 		seenLoreRevs[loreRev] = c.SHA
 
-		// Layer 2 check: Lore store entry & metadata.
 		le, inLore := loreDAG[loreRev]
 		if !inLore {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("mapped lore revision %s for commit %s not found in physical lore store", loreRev[:12], c.SHA[:12]))
@@ -275,7 +361,6 @@ func (im *Importer) verifyImportedModule(
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("lore revision %s git.subdir=%q != %q", loreRev[:12], le.Metadata["git.subdir"], spec.SourceSubdir))
 		}
 
-		// Layer 3 check: SQLite row.
 		sc, inSQL := sqlCommits[loreRev]
 		if !inSQL {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("commit %s (%s) missing from module_commits", c.SHA[:12], loreRev[:12]))
@@ -285,8 +370,13 @@ func (im *Importer) verifyImportedModule(
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("module_commits mismatch for %s: got (%s,%q), want (%s,%q)",
 				loreRev[:12], sc.SourceSHA, sc.SourceSubdir, c.SHA, spec.SourceSubdir))
 		}
+		// Full metadata fidelity check on EVERY commit (not just HEAD!):
+		if sc.AuthorName != c.AuthorName || sc.AuthorEmail != c.AuthorEmail || sc.AuthoredUnixMS != c.AuthoredUnixMS ||
+			sc.CommitterName != c.CommitterName || sc.CommitterEmail != c.CommitterEmail || sc.CommittedUnixMS != c.CommittedUnixMS ||
+			sc.Message != c.Message || sc.GitTreeID != c.TreeSHA {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("commit %s metadata loss/mismatch in SQLite", c.SHA[:12]))
+		}
 
-		// Parent Edge Identity & Exact Order Check (SQLite + Physical Lore DAG)!
 		wantN := len(c.Parents)
 		expectedTotalParentEdges += wantN
 		gotEdges := sqlParents[loreRev]
@@ -311,7 +401,6 @@ func (im *Importer) verifyImportedModule(
 			}
 		}
 
-		// Verify physical Lore [parent_self, parent_other] DAG topology & order!
 		if !verifyPhysicalLoreParents(le, wantParentLoreRevs, loreDAG) {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("physical lore parent topology/order mismatch on commit %s (%s)", c.SHA[:12], loreRev[:12]))
 			edgesMatch = false
@@ -325,7 +414,6 @@ func (im *Importer) verifyImportedModule(
 		}
 	}
 
-	// Ensure no extra non-synthetic Lore revisions with git.commit exist unindexed, and no extra SQLite parent rows!
 	for rev, le := range loreDAG {
 		if le.Metadata["git.synthetic"] == "1" {
 			continue
@@ -334,7 +422,7 @@ func (im *Importer) verifyImportedModule(
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("unexplained extra lore revision %s (git.commit=%s) in repository", short12(rev), short12(le.Metadata["git.commit"])))
 		}
 	}
-	// Subtract any synthetic bridge parent edges if synthetic commits recorded parents (synthetic commits don't write parents, so totalParentEdges == expectedTotalParentEdges).
+
 	var nonSynthParentEdges int
 	_ = im.DB.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM module_commit_parents p
@@ -346,13 +434,13 @@ func (im *Importer) verifyImportedModule(
 	}
 	_ = sqlSyntheticCount
 
-	// 5. Verify ALL Standard Branches, Default Branch, and Tags!
+	// Verify Standard Branches, Default Branch, and Tags (including OriginalSourceCommitID provenance)!
 	sqlBranches := map[string]history.RefDetail{}
 	sqlTags := map[string]history.RefDetail{}
 	var sqlDefaultBranches []string
 
 	rRows, err := im.DB.QueryContext(ctx, `
-		SELECT ref_type, ref_name, lore_revision, COALESCE(source_commit_id,''), COALESCE(source_tag_object_id,''),
+		SELECT ref_type, ref_name, lore_revision, COALESCE(source_commit_id,''), original_source_commit_id, COALESCE(source_tag_object_id,''),
 		       is_default, is_annotated, tagger_name, tagger_email, tagged_at, tag_message
 		FROM module_refs
 		WHERE module_id=?
@@ -363,7 +451,7 @@ func (im *Importer) verifyImportedModule(
 	for rRows.Next() {
 		var d history.RefDetail
 		var isDef, isAnn int
-		if err := rRows.Scan(&d.Type, &d.Name, &d.LoreRevision, &d.SourceCommitID, &d.SourceTagObjectID,
+		if err := rRows.Scan(&d.Type, &d.Name, &d.LoreRevision, &d.SourceCommitID, &d.OriginalSourceCommitID, &d.SourceTagObjectID,
 			&isDef, &isAnn, &d.TaggerName, &d.TaggerEmail, &d.TaggedAt, &d.TagMessage); err != nil {
 			rRows.Close()
 			return rep, err
@@ -391,14 +479,19 @@ func (im *Importer) verifyImportedModule(
 	}
 	for bName, wantSHA := range projGraph.Branches {
 		wantRev := cp.CommitMap[wantSHA]
+		wantOrig := projGraph.OriginalBranches[bName]
+		if wantOrig == "" {
+			wantOrig = wantSHA
+		}
 		sb, ok := sqlBranches[bName]
 		if !ok {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("missing branch %q in module_refs", bName))
 			continue
 		}
-		if sb.SourceCommitID != wantSHA || sb.LoreRevision != wantRev {
-			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("branch %q mapping mismatch: got (%s,%s), want (%s,%s)",
-				bName, short12(sb.SourceCommitID), short12(sb.LoreRevision), short12(wantSHA), short12(wantRev)))
+		if sb.SourceCommitID != wantSHA || sb.LoreRevision != wantRev || sb.OriginalSourceCommitID != wantOrig {
+			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("branch %q mapping mismatch: got (%s/%s,%s), want (%s/%s,%s)",
+				bName, short12(sb.SourceCommitID), short12(sb.OriginalSourceCommitID), short12(sb.LoreRevision),
+				short12(wantSHA), short12(wantOrig), short12(wantRev)))
 		}
 		lb, inLore := loreBranches[bName]
 		if !inLore || lb.Latest != wantRev {
@@ -412,11 +505,10 @@ func (im *Importer) verifyImportedModule(
 		}
 	}
 
-	// Verify no unexpected extra non-bootstrap branches exist in physical Lore repository.
 	for bName, lb := range loreBranches {
 		if _, wanted := projGraph.Branches[bName]; !wanted {
 			if bName == "main" && cp.BootstrapMainRev != "" && lb.Latest == cp.BootstrapMainRev {
-				continue // Lore's un-deletable initial bootstrap branch frozen at C1
+				continue
 			}
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("unexpected extra branch %q in physical lore repository", bName))
 		}
@@ -427,12 +519,16 @@ func (im *Importer) verifyImportedModule(
 	}
 	for _, wantTag := range projGraph.Tags {
 		wantRev := cp.CommitMap[wantTag.TargetSHA]
+		wantOrig := wantTag.OriginalTargetSHA
+		if wantOrig == "" {
+			wantOrig = wantTag.TargetSHA
+		}
 		st, ok := sqlTags[wantTag.Name]
 		if !ok {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("missing tag %q in module_refs", wantTag.Name))
 			continue
 		}
-		if st.SourceCommitID != wantTag.TargetSHA || st.LoreRevision != wantRev || st.IsAnnotated != wantTag.IsAnnotated || st.SourceTagObjectID != wantTag.TagObjectID {
+		if st.SourceCommitID != wantTag.TargetSHA || st.OriginalSourceCommitID != wantOrig || st.LoreRevision != wantRev || st.IsAnnotated != wantTag.IsAnnotated || st.SourceTagObjectID != wantTag.TagObjectID {
 			rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("tag %q target/metadata mismatch in module_refs", wantTag.Name))
 		}
 		if wantTag.IsAnnotated && (st.TaggerEmail != wantTag.TaggerEmail || st.TagMessage != wantTag.Message) {
@@ -440,7 +536,7 @@ func (im *Importer) verifyImportedModule(
 		}
 	}
 
-	// 6. Verify Special Objects (count, kind, path, OID, size, and detail JSON) across EVERY commit!
+	// Verify Special Objects (LFS hydration vs pointer, Submodule dependencies, Symlinks) across EVERY commit!
 	reader, err := NewBatchBlobReader(ctx, im.GitBinary, mirrorDir)
 	if err != nil {
 		return rep, err
@@ -466,13 +562,36 @@ func (im *Importer) verifyImportedModule(
 		}
 		totalSQLSpecials++
 		sqlSpecials[sp.LoreRevision] = append(sqlSpecials[sp.LoreRevision], sp)
+		switch sp.Kind {
+		case "lfs_hydrated":
+			rep.LFSHydratedCount++
+		case "lfs_pointer":
+			rep.LFSUnhydratedCount++
+		}
 	}
 	if err := sRows.Close(); err != nil {
 		return rep, err
 	}
 	rep.SpecialObjectsCount = totalSQLSpecials
 
+	// Enforce LFS Honesty Invariant:
+	if spec.LFSMode != LFSModePointer && rep.LFSUnhydratedCount > 0 {
+		rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("found %d unhydrated LFS pointer(s) under lfs_mode=%s; pointer-only content cannot be claimed as full migration", rep.LFSUnhydratedCount, spec.LFSMode))
+	}
+	if rep.LFSUnhydratedCount > 0 {
+		rep.LFSHydrationStatus = "pointer_only_unhydrated"
+		rep.FullContentMigrated = false
+	} else if rep.LFSHydratedCount > 0 {
+		rep.LFSHydrationStatus = "hydrated_verified"
+		rep.FullContentMigrated = true
+	} else {
+		rep.LFSHydrationStatus = "not_applicable"
+		rep.FullContentMigrated = true
+	}
+
 	expectedSpecialTotal := 0
+	subByPath := map[string]SubmoduleDependency{}
+
 	for _, c := range projGraph.Commits {
 		loreRev := cp.CommitMap[c.SHA]
 		if loreRev == "" {
@@ -484,7 +603,8 @@ func (im *Importer) verifyImportedModule(
 		}
 		wantSpecs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader)
 		if sErr != nil {
-			return rep, sErr
+			rep.Mismatches = append(rep.Mismatches, sErr.Error())
+			continue
 		}
 		expectedSpecialTotal += len(wantSpecs)
 		gotSpecs := sqlSpecials[loreRev]
@@ -504,21 +624,86 @@ func (im *Importer) verifyImportedModule(
 					c.SHA[:12], i, g.Kind, g.Path, short12(g.OID), g.SizeBytes, g.DetailJSON,
 					w.Kind, w.Path, short12(w.OID), w.SizeBytes, wDetail))
 			}
+			if w.Kind == "submodule_gitlink" {
+				var meta map[string]string
+				_ = json.Unmarshal([]byte(wDetail), &meta)
+				subByPath[w.Path] = SubmoduleDependency{
+					Path:            w.Path,
+					URL:             meta["url"],
+					Branch:          meta["branch"],
+					LatestCommitSHA: w.OID,
+				}
+			}
 		}
 	}
 	if totalSQLSpecials != expectedSpecialTotal {
 		rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("extra special object rows in SQLite (%d != %d)", totalSQLSpecials, expectedSpecialTotal))
 	}
 
-	// 7. Verify Per-Module Content Isolation across Lore revisions when source_subdir is used,
-	//    AND verify HEAD working tree SHA-256 content digest byte-for-byte!
-	if spec.SourceSubdir != "" {
-		// Check every Lore revision's delta paths via `lore revision info --delta <rev>` to prove
-		// that NO file belonging to sibling subdirs or root unmapped files ever entered ANY Lore revision!
-		forbiddenSet := map[string]bool{}
-		for _, up := range projGraph.UnmappedPaths {
-			forbiddenSet[up] = true
+	// Build SubmoduleDependency report & check project module registration!
+	if len(subByPath) > 0 {
+		knownProjectMods := map[string]string{} // lowercase base/name -> ModuleName
+		if pMods, mErr := project.ListModules(ctx, im.DB, projectID, false); mErr == nil {
+			for _, pm := range pMods {
+				if pm.ID == moduleID {
+					continue
+				}
+				knownProjectMods[strings.ToLower(pm.Name)] = pm.Name
+				knownProjectMods[strings.ToLower(pm.MountPath)] = pm.Name
+			}
 		}
+		// Also map by imported `source_url` in this project!
+		importedURLs := map[string]string{}
+		uRows, uErr := im.DB.QueryContext(ctx, `
+			SELECT i.source_url, i.module_name FROM import_job_items i
+			JOIN import_jobs j ON j.job_id=i.job_id
+			WHERE j.project_id=? AND i.status='succeeded'
+		`, projectID)
+		if uErr == nil {
+			for uRows.Next() {
+				var su, mn string
+				if uRows.Scan(&su, &mn) == nil {
+					importedURLs[strings.TrimSuffix(strings.ToLower(su), ".git")] = mn
+				}
+			}
+			uRows.Close()
+		}
+
+		subPaths := make([]string, 0, len(subByPath))
+		for p := range subByPath {
+			subPaths = append(subPaths, p)
+		}
+		sort.Strings(subPaths)
+		for _, p := range subPaths {
+			dep := subByPath[p]
+			matched := ""
+			if dep.URL != "" {
+				normURL := strings.TrimSuffix(strings.ToLower(dep.URL), ".git")
+				matched = importedURLs[normURL]
+				if matched == "" {
+					base := strings.TrimSuffix(strings.ToLower(path.Base(dep.URL)), ".git")
+					matched = knownProjectMods[base]
+				}
+			}
+			if matched == "" {
+				matched = knownProjectMods[strings.ToLower(path.Base(dep.Path))]
+			}
+			if matched != "" {
+				dep.MatchedModule = matched
+				dep.MigrationStatus = "registered_in_project"
+			} else {
+				dep.MigrationStatus = "unmigrated_independent_repo"
+				if spec.SubmodulePolicy == SubmoduleRequireRegistered {
+					rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("submodule %q (%s) is not yet registered as an independent module in project", dep.Path, dep.URL))
+				}
+			}
+			rep.SubmoduleDependencies = append(rep.SubmoduleDependencies, dep)
+		}
+	}
+
+	// Verify Per-Module Content Isolation across Lore revisions when source_subdir is used,
+	// AND verify no submodule working files leaked into parent module!
+	if spec.SourceSubdir != "" || len(subByPath) > 0 {
 		for _, c := range projGraph.Commits {
 			loreRev := cp.CommitMap[c.SHA]
 			if loreRev == "" {
@@ -529,7 +714,6 @@ func (im *Importer) verifyImportedModule(
 				rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("failed reading lore revision delta for %s: %v", short12(loreRev), dErr))
 				continue
 			}
-			// Verify expected valid relative paths in this commit's module subtree.
 			allEntries, tErr := treeCache.Entries(ctx, im.GitBinary, mirrorDir, c.TreeSHA)
 			if tErr != nil {
 				return rep, tErr
@@ -537,6 +721,9 @@ func (im *Importer) verifyImportedModule(
 			scopedEntries, _ := filterEntriesForSubdir(allEntries, spec.SourceSubdir, nil)
 			validAddedOrKept := map[string]bool{}
 			for _, se := range scopedEntries {
+				if se.Mode == "160000" || se.Type == "commit" {
+					continue // Submodule gitlink paths MUST NOT exist as files inside parent module!
+				}
 				validAddedOrKept[se.Path] = true
 				dir := se.Path
 				for idx := strings.LastIndexByte(dir, '/'); idx > 0; idx = strings.LastIndexByte(dir, '/') {
@@ -549,10 +736,9 @@ func (im *Importer) verifyImportedModule(
 					continue
 				}
 				if !validAddedOrKept[d.Path] {
-					rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("CONTENT ISOLATION VIOLATION: revision %s contains non-module path %q", short12(loreRev), d.Path))
+					rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("CONTENT ISOLATION VIOLATION: revision %s contains non-module or submodule path %q", short12(loreRev), d.Path))
 				}
 			}
-			_ = forbiddenSet
 		}
 	}
 
@@ -561,18 +747,19 @@ func (im *Importer) verifyImportedModule(
 		if ok {
 			gitFiles, gitDigest, err := ComputeGitTreeContentDigest(ctx, im.GitBinary, mirrorDir, headCommit.TreeSHA, spec.SourceSubdir, spec.LFSMode, reader)
 			if err != nil {
-				return rep, err
-			}
-			loreFiles, loreDigest, err := ComputeWorkdirDigest(loreWorkDir)
-			if err != nil {
-				return rep, err
-			}
-			rep.HeadFileCount = loreFiles
-			rep.HeadGitDigest = gitDigest
-			rep.HeadLoreDigest = loreDigest
-			if gitFiles != loreFiles || gitDigest != loreDigest {
-				rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("HEAD tree digest mismatch (git %d:%s vs lore %d:%s)",
-					gitFiles, short12(gitDigest), loreFiles, short12(loreDigest)))
+				rep.Mismatches = append(rep.Mismatches, err.Error())
+			} else {
+				loreFiles, loreDigest, wErr := ComputeWorkdirDigest(loreWorkDir)
+				if wErr != nil {
+					return rep, wErr
+				}
+				rep.HeadFileCount = loreFiles
+				rep.HeadGitDigest = gitDigest
+				rep.HeadLoreDigest = loreDigest
+				if gitFiles != loreFiles || gitDigest != loreDigest {
+					rep.Mismatches = append(rep.Mismatches, fmt.Sprintf("HEAD tree digest mismatch (git %d:%s vs lore %d:%s)",
+						gitFiles, short12(gitDigest), loreFiles, short12(loreDigest)))
+				}
 			}
 		}
 	}
@@ -605,8 +792,6 @@ func verifyPhysicalLoreParents(le loreadapter.HistoryEntry, wantParentRevs []str
 		return p0 == wantParentRevs[0] && p1 == wantParentRevs[1]
 
 	default:
-		// N-parent Octopus merge: walk backwards down synthetic bridge chain!
-		// Final commit has [bridge_{N-2}, wantParentRevs[N-1]], ..., bridge_1 has [wantParentRevs[0], wantParentRevs[1]].
 		cur := le
 		for idx := len(wantParentRevs) - 1; idx >= 2; idx-- {
 			cp0, cp1 := "", ""

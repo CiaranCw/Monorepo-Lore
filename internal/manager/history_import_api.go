@@ -181,12 +181,31 @@ func (a *App) moduleRefsRoute(w http.ResponseWriter, r *http.Request, actor *use
 	writeJSON(w, http.StatusOK, map[string]any{"refs": refs})
 }
 
+func (a *App) moduleAliasesRoute(w http.ResponseWriter, r *http.Request, actor *user.User, m *project.Module, sub []string) {
+	if len(sub) != 1 || sub[0] == "" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	al, err := a.historySvc().GetCommitAlias(r.Context(), actor.ID, m.ID, sub[0])
+	if err != nil {
+		writeHistoryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, al)
+}
+
 type importAPIRequest struct {
-	JobKey         string               `json:"job_key,omitempty"`
-	DryRun         bool                 `json:"dry_run,omitempty"`
-	ConflictPolicy string               `json:"conflict_policy,omitempty"`
-	Concurrency    int                  `json:"concurrency,omitempty"`
-	Repositories   []gitimport.RepoSpec `json:"repositories"`
+	JobKey            string               `json:"job_key,omitempty"`
+	DryRun            bool                 `json:"dry_run,omitempty"`
+	ConflictPolicy    string               `json:"conflict_policy,omitempty"`
+	GlobalFilesPolicy string               `json:"global_files_policy,omitempty"`
+	Concurrency       int                  `json:"concurrency,omitempty"`
+	PathRules         []gitimport.PathRule `json:"path_rules,omitempty"`
+	Repositories      []gitimport.RepoSpec `json:"repositories"`
 	// RuntimeTokens supplies in-memory HTTPS tokens keyed by module_name from the client.
 	// Manager NEVER evaluates client-supplied TokenEnv or SSHKeyEnv names against server os.Getenv!
 	RuntimeTokens map[string]string `json:"runtime_tokens,omitempty"`
@@ -217,12 +236,14 @@ func (a *App) projectImports(w http.ResponseWriter, r *http.Request, actor *user
 				return
 			}
 			manifest := gitimport.Manifest{
-				JobKey:         req.JobKey,
-				Project:        p.Name,
-				DryRun:         req.DryRun,
-				ConflictPolicy: req.ConflictPolicy,
-				Concurrency:    req.Concurrency,
-				Repositories:   req.Repositories,
+				JobKey:            req.JobKey,
+				Project:           p.Name,
+				DryRun:            req.DryRun,
+				ConflictPolicy:    req.ConflictPolicy,
+				GlobalFilesPolicy: req.GlobalFilesPolicy,
+				Concurrency:       req.Concurrency,
+				PathRules:         req.PathRules,
+				Repositories:      req.Repositories,
 			}
 			defer func() {
 				for i := range manifest.Repositories {

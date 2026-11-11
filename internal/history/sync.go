@@ -166,7 +166,44 @@ func UpsertCommit(ctx context.Context, tx *sql.Tx, in CommitInput) error {
 			return err
 		}
 	}
+
+	if in.SourceCommitID != "" && !in.IsSynthetic {
+		if err := UpsertCommitAlias(ctx, tx, CommitAlias{
+			ModuleID:                in.ModuleID,
+			SourceCommitID:          in.SourceCommitID,
+			AliasStatus:             AliasDirect,
+			EffectiveSourceCommitID: in.SourceCommitID,
+			LoreRevision:            in.LoreRevision,
+			SourceSubdir:            in.SourceSubdir,
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// UpsertCommitAlias persists a per-module source commit mapping (direct, unchanged_alias, or pre_module_empty).
+func UpsertCommitAlias(ctx context.Context, tx *sql.Tx, a CommitAlias) error {
+	if a.ModuleID == 0 || strings.TrimSpace(a.SourceCommitID) == "" {
+		return fmt.Errorf("history: alias requires module_id and source_commit_id")
+	}
+	switch a.AliasStatus {
+	case AliasDirect, AliasUnchanged, AliasPreModule:
+	default:
+		return fmt.Errorf("history: invalid alias_status %q", a.AliasStatus)
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO module_commit_aliases (
+			module_id, source_commit_id, alias_status, effective_source_commit_id, lore_revision, source_subdir, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+		ON CONFLICT(module_id, source_commit_id) DO UPDATE SET
+			alias_status               = excluded.alias_status,
+			effective_source_commit_id = excluded.effective_source_commit_id,
+			lore_revision              = excluded.lore_revision,
+			source_subdir              = CASE WHEN excluded.source_subdir <> '' THEN excluded.source_subdir ELSE module_commit_aliases.source_subdir END,
+			updated_at                 = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+	`, a.ModuleID, a.SourceCommitID, a.AliasStatus, a.EffectiveSourceCommitID, a.LoreRevision, a.SourceSubdir)
+	return err
 }
 
 // UpsertRef inserts or updates a branch or tag record for a module.
@@ -174,6 +211,10 @@ func UpsertRef(ctx context.Context, tx *sql.Tx, ref RefDetail) error {
 	var srcCommit, srcTagObj, branchID any
 	if ref.SourceCommitID != "" {
 		srcCommit = ref.SourceCommitID
+	}
+	origSrc := ref.OriginalSourceCommitID
+	if origSrc == "" {
+		origSrc = ref.SourceCommitID
 	}
 	if ref.SourceTagObjectID != "" {
 		srcTagObj = ref.SourceTagObjectID
@@ -190,24 +231,25 @@ func UpsertRef(ctx context.Context, tx *sql.Tx, ref RefDetail) error {
 	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO module_refs (
-			module_id, ref_type, ref_name, lore_revision, source_commit_id, source_tag_object_id,
+			module_id, ref_type, ref_name, lore_revision, source_commit_id, original_source_commit_id, source_tag_object_id,
 			lore_branch_id, is_default, is_annotated, tagger_name, tagger_email, tagged_at, tag_message,
 			updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 		ON CONFLICT(module_id, ref_type, ref_name) DO UPDATE SET
-			lore_revision        = excluded.lore_revision,
-			source_commit_id     = COALESCE(excluded.source_commit_id, module_refs.source_commit_id),
-			source_tag_object_id = COALESCE(excluded.source_tag_object_id, module_refs.source_tag_object_id),
-			lore_branch_id       = COALESCE(excluded.lore_branch_id, module_refs.lore_branch_id),
-			is_default           = excluded.is_default,
-			is_annotated         = excluded.is_annotated,
-			tagger_name          = excluded.tagger_name,
-			tagger_email         = excluded.tagger_email,
-			tagged_at            = excluded.tagged_at,
-			tag_message          = excluded.tag_message,
-			updated_at           = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+			lore_revision             = excluded.lore_revision,
+			source_commit_id          = COALESCE(excluded.source_commit_id, module_refs.source_commit_id),
+			original_source_commit_id = CASE WHEN excluded.original_source_commit_id <> '' THEN excluded.original_source_commit_id ELSE module_refs.original_source_commit_id END,
+			source_tag_object_id      = COALESCE(excluded.source_tag_object_id, module_refs.source_tag_object_id),
+			lore_branch_id            = COALESCE(excluded.lore_branch_id, module_refs.lore_branch_id),
+			is_default                = excluded.is_default,
+			is_annotated              = excluded.is_annotated,
+			tagger_name               = excluded.tagger_name,
+			tagger_email              = excluded.tagger_email,
+			tagged_at                 = excluded.tagged_at,
+			tag_message               = excluded.tag_message,
+			updated_at                = strftime('%Y-%m-%dT%H:%M:%SZ','now')
 	`,
-		ref.ModuleID, ref.Type, ref.Name, ref.LoreRevision, srcCommit, srcTagObj,
+		ref.ModuleID, ref.Type, ref.Name, ref.LoreRevision, srcCommit, origSrc, srcTagObj,
 		branchID, isDef, isAnn, ref.TaggerName, ref.TaggerEmail, ref.TaggedAt, ref.TagMessage,
 	)
 	return err

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,15 +53,18 @@ type GitCommit struct {
 
 // GitTag holds either a lightweight or annotated Git tag.
 type GitTag struct {
-	Name        string
-	TargetSHA   string // resolved commit SHA
-	TagObjectID string // non-empty for annotated tags
-	IsAnnotated bool
-	TaggerName  string
-	TaggerEmail string
-	TaggedAt    string
-	Message     string
+	Name              string
+	TargetSHA         string // resolved module-projected commit SHA
+	OriginalTargetSHA string // original unprojected source commit SHA (when folded via alias)
+	TagObjectID       string // non-empty for annotated tags
+	IsAnnotated       bool
+	TaggerName        string
+	TaggerEmail       string
+	TaggedAt          string
+	Message           string
 }
+
+var ErrLFSHydrationFailed = errors.New("gitimport: git-lfs object missing or failed sha256/size verification under hydrate mode")
 
 // MirrorGraph is the complete, topologically ordered object graph of a mirrored Git repository.
 type MirrorGraph struct {
@@ -289,7 +293,7 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 	// If source was shallow, mirror or source may carry a shallow boundary file.
 	copySourceShallowMarkerIfPresent(sourceURL, mirrorDir)
 
-	if lfsMode == LFSModeAuto {
+	if lfsMode == LFSModeHydrate || lfsMode == LFSModeAuto {
 		copyLocalLFSObjects(sourceURL, mirrorDir)
 		if _, verErr := runGit(ctx, gitBin, "", nil, nil, "lfs", "version"); verErr == nil {
 			lfsAttempted = true
@@ -867,32 +871,27 @@ func materializeScopedEntries(
 				DetailJSON: string(detailB),
 			})
 		} else if lfsOID, lfsSize, isLFS := parseLFSPointer(raw); isLFS {
-			lfsObjPath := filepath.Join(mirrorDir, "lfs", "objects", lfsOID[:2], lfsOID[2:4], lfsOID)
-			hydrated := false
-			if lfsMode == LFSModeAuto {
-				if st, sErr := os.Stat(lfsObjPath); sErr == nil && !st.IsDir() && st.Size() == lfsSize {
-					if lfsData, rErr := os.ReadFile(lfsObjPath); rErr == nil {
-						writeBytes = lfsData
-						cacheTag = "lfs:" + lfsOID
-						hydrated = true
-					}
-				}
-			}
-			if hydrated {
-				specials = append(specials, history.SpecialObject{
-					Kind:      "lfs_hydrated",
-					Path:      relPath,
-					OID:       lfsOID,
-					SizeBytes: lfsSize,
-				})
-			} else {
-				detailB, _ := json.Marshal(map[string]string{"status": "pointer_preserved"})
+			if lfsMode == LFSModePointer {
+				detailB, _ := json.Marshal(map[string]string{"status": "pointer_preserved_unhydrated"})
 				specials = append(specials, history.SpecialObject{
 					Kind:       "lfs_pointer",
 					Path:       relPath,
 					OID:        lfsOID,
 					SizeBytes:  lfsSize,
 					DetailJSON: string(detailB),
+				})
+			} else {
+				lfsData, lfsErr := readVerifiedLFSObject(mirrorDir, lfsOID, lfsSize)
+				if lfsErr != nil {
+					return TreeMaterializeResult{}, fmt.Errorf("%w: %s (%s): %v", ErrLFSHydrationFailed, relPath, shortOID(lfsOID), lfsErr)
+				}
+				writeBytes = lfsData
+				cacheTag = "lfs:" + lfsOID
+				specials = append(specials, history.SpecialObject{
+					Kind:      "lfs_hydrated",
+					Path:      relPath,
+					OID:       lfsOID,
+					SizeBytes: lfsSize,
 				})
 			}
 		}
@@ -982,29 +981,25 @@ func InspectExpectedSpecialObjects(
 			return nil, err
 		}
 		if lfsOID, lfsSize, isLFS := parseLFSPointer(raw); isLFS {
-			lfsObjPath := filepath.Join(mirrorDir, "lfs", "objects", lfsOID[:2], lfsOID[2:4], lfsOID)
-			hydrated := false
-			if lfsMode == LFSModeAuto {
-				if st, sErr := os.Stat(lfsObjPath); sErr == nil && !st.IsDir() && st.Size() == lfsSize {
-					hydrated = true
-				}
-			}
-			if hydrated {
-				specials = append(specials, history.SpecialObject{
-					Kind:       "lfs_hydrated",
-					Path:       e.Path,
-					OID:        lfsOID,
-					SizeBytes:  lfsSize,
-					DetailJSON: "{}",
-				})
-			} else {
-				detailB, _ := json.Marshal(map[string]string{"status": "pointer_preserved"})
+			if lfsMode == LFSModePointer {
+				detailB, _ := json.Marshal(map[string]string{"status": "pointer_preserved_unhydrated"})
 				specials = append(specials, history.SpecialObject{
 					Kind:       "lfs_pointer",
 					Path:       e.Path,
 					OID:        lfsOID,
 					SizeBytes:  lfsSize,
 					DetailJSON: string(detailB),
+				})
+			} else {
+				if _, lfsErr := readVerifiedLFSObject(mirrorDir, lfsOID, lfsSize); lfsErr != nil {
+					return nil, fmt.Errorf("%w: %s (%s): %v", ErrLFSHydrationFailed, e.Path, shortOID(lfsOID), lfsErr)
+				}
+				specials = append(specials, history.SpecialObject{
+					Kind:       "lfs_hydrated",
+					Path:       e.Path,
+					OID:        lfsOID,
+					SizeBytes:  lfsSize,
+					DetailJSON: "{}",
 				})
 			}
 		}
@@ -1156,13 +1151,12 @@ func ComputeGitTreeContentDigest(ctx context.Context, gitBin, mirrorDir, treeSHA
 		}
 		writeBytes := raw
 		if e.Mode != "120000" {
-			if lfsOID, lfsSize, isLFS := parseLFSPointer(raw); isLFS && lfsMode == LFSModeAuto {
-				lfsObjPath := filepath.Join(mirrorDir, "lfs", "objects", lfsOID[:2], lfsOID[2:4], lfsOID)
-				if st, sErr := os.Stat(lfsObjPath); sErr == nil && !st.IsDir() && st.Size() == lfsSize {
-					if lfsData, rErr := os.ReadFile(lfsObjPath); rErr == nil {
-						writeBytes = lfsData
-					}
+			if lfsOID, lfsSize, isLFS := parseLFSPointer(raw); isLFS && lfsMode != LFSModePointer {
+				lfsData, lfsErr := readVerifiedLFSObject(mirrorDir, lfsOID, lfsSize)
+				if lfsErr != nil {
+					return 0, "", fmt.Errorf("%w: %s (%s): %v", ErrLFSHydrationFailed, e.Path, shortOID(lfsOID), lfsErr)
 				}
+				writeBytes = lfsData
 			}
 		}
 		s := sha256.Sum256(writeBytes)
@@ -1174,6 +1168,37 @@ func ComputeGitTreeContentDigest(ctx context.Context, gitBin, mirrorDir, treeSHA
 		_, _ = fmt.Fprintf(h, "%s\t%s\n", item.rel, item.sum)
 	}
 	return len(list), hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func readVerifiedLFSObject(mirrorDir, lfsOID string, wantSize int64) ([]byte, error) {
+	if len(lfsOID) != 64 {
+		return nil, fmt.Errorf("invalid lfs oid %q", lfsOID)
+	}
+	lfsObjPath := filepath.Join(mirrorDir, "lfs", "objects", lfsOID[:2], lfsOID[2:4], lfsOID)
+	st, err := os.Stat(lfsObjPath)
+	if err != nil {
+		return nil, fmt.Errorf("lfs binary object not present in mirror")
+	}
+	if st.IsDir() || st.Size() != wantSize {
+		return nil, fmt.Errorf("lfs size mismatch: disk=%d want=%d", st.Size(), wantSize)
+	}
+	data, err := os.ReadFile(lfsObjPath)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(data)
+	gotOID := hex.EncodeToString(sum[:])
+	if gotOID != lfsOID {
+		return nil, fmt.Errorf("lfs sha256 mismatch: got=%s want=%s", gotOID[:12], lfsOID[:12])
+	}
+	return data, nil
+}
+
+func shortOID(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
 }
 
 func parseLFSPointer(raw []byte) (oid string, size int64, ok bool) {

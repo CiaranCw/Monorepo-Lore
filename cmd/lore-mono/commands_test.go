@@ -86,6 +86,75 @@ func TestCloneAllSkipsUnauthorized(t *testing.T) {
 	}
 }
 
+func TestBatchCommitRunsIndependentRepositoryCommitsAndPreservesMixedResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/me/batch" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			Action string `json:"action"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Action != "commit" {
+			http.Error(w, "wrong action", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[` +
+			`{"ProjectName":"Alpha","Name":"Engine","MountPath":"Engine","RepositoryURL":"grpc://127.0.0.1:53547/engine"},` +
+			`{"ProjectName":"Alpha","Name":"GameClient","MountPath":"GameClient","RepositoryURL":"grpc://127.0.0.1:53547/gameclient"}` +
+			`]}`))
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	cfgPath := filepath.Join(root, "client.toml")
+	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: "lore", Project: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var commitCalls []string
+	prevExec := execRun
+	execRun = func(_ context.Context, _ string, req loreexec.Request) (loreexec.CommandResult, error) {
+		if len(req.Argv) > 0 && req.Argv[0] == "auth" {
+			return loreexec.CommandResult{ExitCode: 0, Stdout: "Token: token-value\n"}, nil
+		}
+		call := strings.Join(req.Argv, " ")
+		commitCalls = append(commitCalls, call)
+		if strings.Contains(call, filepath.Join(root, "GameClient")) {
+			return loreexec.CommandResult{ExitCode: 40}, nil // independent failure
+		}
+		return loreexec.CommandResult{ExitCode: 0}, nil
+	}
+	defer func() { execRun = prevExec }()
+
+	prevOut := stdout
+	var out bytes.Buffer
+	stdout = &out
+	defer func() { stdout = prevOut }()
+
+	err := batchAction("commit", []string{"--all", "--message", "independent commit", "--config", cfgPath, "--root", root})
+	if err == nil {
+		t.Fatal("mixed per-module result must return summary error")
+	}
+	if len(commitCalls) != 2 {
+		t.Fatalf("batch commit invoked %d Lore processes, want 2: %v", len(commitCalls), commitCalls)
+	}
+	if !strings.Contains(commitCalls[0], filepath.Join(root, "Engine")) ||
+		!strings.Contains(commitCalls[1], filepath.Join(root, "GameClient")) {
+		t.Fatalf("batch commit did not target independent repository directories: %v", commitCalls)
+	}
+	if strings.Contains(commitCalls[0], "GameClient") || strings.Contains(commitCalls[1], "Engine") {
+		t.Fatalf("one Lore commit command referenced multiple modules: %v", commitCalls)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Engine\tok") ||
+		!strings.Contains(got, "GameClient\tfailed") ||
+		!strings.Contains(got, "summary ok=1 failed=1") {
+		t.Fatalf("mixed per-module results were overwritten or missing:\n%s", got)
+	}
+}
+
 func TestLoreEnvKeepsCAOutOfProcess(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ca.pem")

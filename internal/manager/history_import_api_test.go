@@ -114,6 +114,7 @@ func TestHistoryAndImportAPIWithPermissionIsolation(t *testing.T) {
 		"/api/v1/modules/" + itoa(secID) + "/history",
 		"/api/v1/modules/" + itoa(secID) + "/commits/" + fmt.Sprintf("%040x", 202),
 		"/api/v1/modules/" + itoa(secID) + "/refs",
+		"/api/v1/modules/" + itoa(secID) + "/aliases/" + fmt.Sprintf("%040x", 202),
 		"/api/v1/modules/999999/history",
 	} {
 		st, body := apiJSON(t, http.MethodGet, srv+path, aliceTok, nil)
@@ -135,6 +136,10 @@ func TestHistoryAndImportAPIWithPermissionIsolation(t *testing.T) {
 	st, refsBody := apiJSON(t, http.MethodGet, srv+"/api/v1/modules/"+itoa(engID)+"/refs?type=tag", aliceTok, nil)
 	if st != http.StatusOK || !strings.Contains(mustJSON(refsBody), "v1.0.0") {
 		t.Fatalf("refs %d %v", st, refsBody)
+	}
+	st, aliasBody := apiJSON(t, http.MethodGet, srv+"/api/v1/modules/"+itoa(engID)+"/aliases/"+fmt.Sprintf("%040x", 101), aliceTok, nil)
+	if st != http.StatusOK || aliasBody["alias_status"] != history.AliasDirect || aliasBody["lore_revision"] != fmt.Sprintf("%064x", 101) {
+		t.Fatalf("alias %d %v", st, aliasBody)
 	}
 
 	// 6. Ordinary member Alice cannot trigger or read project import jobs (403 Forbidden)!

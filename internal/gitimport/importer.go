@@ -22,9 +22,13 @@ import (
 )
 
 var (
-	ErrConflict = errors.New("gitimport: target module conflict")
-	ErrJobBusy  = errors.New("gitimport: import job is already running")
-	ErrVerify   = errors.New("gitimport: post-import integrity verification failed")
+	ErrConflict                = errors.New("gitimport: target module conflict")
+	ErrJobBusy                 = errors.New("gitimport: import job is already running")
+	ErrVerify                  = errors.New("gitimport: post-import integrity verification failed")
+	ErrSourceMovedDuringFetch  = errors.New("gitimport: source repository branches or tags changed during mirror fetch; re-run against a stable snapshot")
+	ErrSourceMovedDuringResume = errors.New("gitimport: source repository changed incompatibly with pinned job snapshot during resume")
+	ErrExpectedRefMismatch     = errors.New("gitimport: source repository refs do not match expected pinned refs")
+	ErrUnclassifiedGlobalPaths = errors.New("gitimport: monorepo contains unclassified paths outside module subdirectories (migration blocker)")
 
 	repoID32Re = regexp.MustCompile(`[0-9a-f]{32}`)
 
@@ -56,36 +60,57 @@ func newWorkerToken() string {
 	return hex.EncodeToString(b[:])
 }
 
+// SubmoduleDependency reports a Git submodule gitlink discovered in a parent module
+// and whether its target repository has been independently registered in the project.
+type SubmoduleDependency struct {
+	Path            string `json:"path"`
+	URL             string `json:"url,omitempty"`
+	Branch          string `json:"branch,omitempty"`
+	LatestCommitSHA string `json:"latest_commit_sha"`
+	MatchedModule   string `json:"matched_module,omitempty"`
+	MigrationStatus string `json:"migration_status"` // "registered_in_project" or "unmigrated_independent_repo"
+}
+
 // VerificationReport records the automated pre/post 3-layer integrity checks for one imported repository.
 type VerificationReport struct {
-	Passed                bool     `json:"passed"`
-	SourceSubdir          string   `json:"source_subdir,omitempty"`
-	RawSourceCommits      int      `json:"raw_source_commits,omitempty"`
-	SourceCommits         int      `json:"source_commits"`
-	AliasedCommits        int      `json:"aliased_commits,omitempty"`
-	MappedCommits         int      `json:"mapped_commits"`
-	IndexedCommits        int      `json:"indexed_commits"`
-	SyntheticMergeBridges int      `json:"synthetic_merge_bridges"`
-	SourceBranches        int      `json:"source_branches"`
-	ImportedBranches      int      `json:"imported_branches"`
-	SourceTags            int      `json:"source_tags"`
-	ImportedTags          int      `json:"imported_tags"`
-	MergeCommitsVerified  int      `json:"merge_commits_verified"`
-	OctopusMergesVerified int      `json:"octopus_merges_verified"`
-	SpecialObjectsCount   int      `json:"special_objects_count"`
-	HeadBranch            string   `json:"head_branch"`
-	HeadGitDigest         string   `json:"head_git_digest"`
-	HeadLoreDigest        string   `json:"head_lore_digest"`
-	HeadFileCount         int      `json:"head_file_count"`
-	AdvertisedHiddenRefs  []string `json:"advertised_hidden_refs,omitempty"`
-	ShallowMissingParents []string `json:"shallow_missing_parents,omitempty"`
-	SkippedEmptyBranches  []string `json:"skipped_empty_branches,omitempty"`
-	SkippedEmptyTags      []string `json:"skipped_empty_tags,omitempty"`
-	UnmappedPathsCount    int      `json:"unmapped_paths_count,omitempty"`
-	UnmappedPaths         []string `json:"unmapped_paths,omitempty"`
-	LFSFetchAttempted     bool     `json:"lfs_fetch_attempted"`
-	LFSFetchSucceeded     bool     `json:"lfs_fetch_succeeded"`
-	Mismatches            []string `json:"mismatches,omitempty"`
+	Passed                   bool                  `json:"passed"`
+	FullContentMigrated      bool                  `json:"full_content_migrated"`
+	CoverageComplete         bool                  `json:"coverage_complete"`
+	SourceSubdir             string                `json:"source_subdir,omitempty"`
+	RawSourceCommits         int                   `json:"raw_source_commits,omitempty"`
+	SourceCommits            int                   `json:"source_commits"`
+	AliasedCommits           int                   `json:"aliased_commits,omitempty"`
+	PersistedAliases         int                   `json:"persisted_aliases,omitempty"`
+	MappedCommits            int                   `json:"mapped_commits"`
+	IndexedCommits           int                   `json:"indexed_commits"`
+	SyntheticMergeBridges    int                   `json:"synthetic_merge_bridges"`
+	SourceBranches           int                   `json:"source_branches"`
+	ImportedBranches         int                   `json:"imported_branches"`
+	SourceTags               int                   `json:"source_tags"`
+	ImportedTags             int                   `json:"imported_tags"`
+	MergeCommitsVerified     int                   `json:"merge_commits_verified"`
+	OctopusMergesVerified    int                   `json:"octopus_merges_verified"`
+	SpecialObjectsCount      int                   `json:"special_objects_count"`
+	LFSHydrationStatus       string                `json:"lfs_hydration_status,omitempty"` // "not_applicable", "hydrated_verified", "pointer_only_unhydrated"
+	LFSHydratedCount         int                   `json:"lfs_hydrated_count,omitempty"`
+	LFSUnhydratedCount       int                   `json:"lfs_unhydrated_count,omitempty"`
+	SubmoduleDependencies    []SubmoduleDependency `json:"submodule_dependencies,omitempty"`
+	HeadBranch               string                `json:"head_branch"`
+	HeadGitDigest            string                `json:"head_git_digest"`
+	HeadLoreDigest           string                `json:"head_lore_digest"`
+	HeadFileCount            int                   `json:"head_file_count"`
+	AdvertisedHiddenRefs     []string              `json:"advertised_hidden_refs,omitempty"`
+	ShallowMissingParents    []string              `json:"shallow_missing_parents,omitempty"`
+	SkippedEmptyBranches     []string              `json:"skipped_empty_branches,omitempty"`
+	SkippedEmptyTags         []string              `json:"skipped_empty_tags,omitempty"`
+	UnmappedPathsCount       int                   `json:"unmapped_paths_count,omitempty"`
+	UnmappedPaths            []string              `json:"unmapped_paths,omitempty"`
+	ClassifiedExcluded       []ClassifiedPath      `json:"classified_excluded,omitempty"`
+	ClassifiedSeparateModule []ClassifiedPath      `json:"classified_separate_module,omitempty"`
+	UndecidedPaths           []string              `json:"undecided_paths,omitempty"`
+	LFSFetchAttempted        bool                  `json:"lfs_fetch_attempted"`
+	LFSFetchSucceeded        bool                  `json:"lfs_fetch_succeeded"`
+	Mismatches               []string              `json:"mismatches,omitempty"`
 }
 
 // ItemResult is the per-repository outcome in a single or batch import job.
@@ -143,9 +168,6 @@ type Importer struct {
 	WorkspaceRoot string
 	RemoteBaseURL string
 
-	// Security policy boundaries enforced on the server:
-	// - Manager HTTP API sets RestrictLocalSources = true and configures AllowedLocalDirs / AllowedSSHKeyDirs.
-	// - Server-side BuildGitAuthEnv ALWAYS forbids reading os.Getenv(TokenEnv / SSHKeyEnv).
 	RestrictLocalSources bool
 	AllowedLocalDirs     []string
 	RestrictSSHKeyPaths  bool
@@ -154,6 +176,10 @@ type Importer struct {
 	// FaultHook is a test-only hook invoked after replayCommitIndex (0-based) for
 	// deterministic crash/interruption and checkpoint-resume testing.
 	FaultHook func(moduleName string, replayCommitIndex int) error
+
+	// AfterInspectRefs is a test-only hook invoked right after InspectRemoteRefs and
+	// before SyncBareMirror to test upstream repository mutation detection during fetch.
+	AfterInspectRefs func(sourceURL string)
 }
 
 func (im *Importer) authPolicy() AuthPolicy {
@@ -196,8 +222,8 @@ func RecoverInterruptedJobs(ctx context.Context, db *sql.DB) error {
 }
 
 // Run executes a dry-run or live import manifest with job-level concurrency mutex,
-// shared mirror locking, per-module target locking, 4-state conflict classification,
-// checkpoint reconciliation, and 3-layer DAG verification.
+// shared mirror locking, ref snapshot drift protection, per-module target locking,
+// 4-state conflict classification, checkpoint reconciliation, and 3-layer DAG verification.
 func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResult, error) {
 	if im.DB == nil {
 		return JobResult{}, errors.New("gitimport: database is nil")
@@ -246,19 +272,26 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 		return im.readJobResult(ctx, jobID, proj.Name)
 	}
 
-	// Group sibling subdirs by source_url so monorepo splitting knows all declared module prefixes
-	// and shares one MirrorGraph + TreeCache per source_url!
 	siblingSubdirsByURL := map[string][]string{}
+	manifestModNames := map[string]bool{}
 	for _, r := range m.Repositories {
+		manifestModNames[r.ModuleName] = true
 		if r.SourceSubdir != "" {
 			siblingSubdirsByURL[r.SourceURL] = append(siblingSubdirsByURL[r.SourceURL], r.SourceSubdir)
 		}
 	}
 
 	mirrorStates := map[string]*sharedMirrorState{}
-	for _, r := range m.Repositories {
+	pinnedByURL := map[string]*RemoteRefSummary{}
+	for idx, r := range m.Repositories {
 		if _, exists := mirrorStates[r.SourceURL]; !exists {
 			mirrorStates[r.SourceURL] = &sharedMirrorState{tc: NewTreeCache()}
+		}
+		if pinnedByURL[r.SourceURL] == nil && idx < len(items) && items[idx].PinnedRefsJSON != "" && items[idx].PinnedRefsJSON != "{}" {
+			var pr RemoteRefSummary
+			if json.Unmarshal([]byte(items[idx].PinnedRefsJSON), &pr) == nil && len(pr.Branches) > 0 {
+				pinnedByURL[r.SourceURL] = &pr
+			}
 		}
 	}
 
@@ -278,9 +311,9 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 			if m.DryRun {
 				results[idx] = im.runDryRunItem(ctx, proj, items[idx], spec)
 			} else {
-				results[idx] = im.runImportItem(ctx, actor, proj, items[idx], spec, siblings, func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
+				results[idx] = im.runImportItem(ctx, actor, proj, items[idx], spec, siblings, m.PathRules, manifestModNames, func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
 					return ms.get(func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
-						return im.syncSharedMirror(ctx, items[idx].GitMirrorPath, spec, ms.tc)
+						return im.syncSharedMirror(ctx, items[idx].GitMirrorPath, spec, pinnedByURL[spec.SourceURL], ms.tc)
 					})
 				})
 			}
@@ -348,6 +381,7 @@ type storedItem struct {
 	LoreRepoID     string
 	LoreRepoURL    string
 	BootstrapRev   string
+	PinnedRefsJSON string
 	GitMirrorPath  string
 	LoreWorkPath   string
 	CheckpointJSON string
@@ -426,7 +460,7 @@ func (im *Importer) acquireOrCreateJob(
 
 	rows, err := im.DB.QueryContext(ctx, `
 		SELECT item_id, job_id, ord, source_subdir, status, COALESCE(module_id,0), lore_repository_id, lore_repository_url,
-		       bootstrap_main_rev, git_mirror_path, lore_work_path, checkpoint_json, verification_json, error
+		       bootstrap_main_rev, pinned_refs_json, git_mirror_path, lore_work_path, checkpoint_json, verification_json, error
 		FROM import_job_items
 		WHERE job_id=?
 		ORDER BY ord ASC
@@ -438,7 +472,7 @@ func (im *Importer) acquireOrCreateJob(
 	for rows.Next() {
 		var it storedItem
 		if err := rows.Scan(&it.ItemID, &it.JobID, &it.Ord, &it.SourceSubdir, &it.Status, &it.ModuleID, &it.LoreRepoID, &it.LoreRepoURL,
-			&it.BootstrapRev, &it.GitMirrorPath, &it.LoreWorkPath, &it.CheckpointJSON, &it.VerifyJSON, &it.Error); err != nil {
+			&it.BootstrapRev, &it.PinnedRefsJSON, &it.GitMirrorPath, &it.LoreWorkPath, &it.CheckpointJSON, &it.VerifyJSON, &it.Error); err != nil {
 			return 0, nil, false, err
 		}
 		items = append(items, it)
@@ -494,12 +528,7 @@ func (im *Importer) readJobResult(ctx context.Context, jobID int64, projectName 
 	return res, rows.Err()
 }
 
-// moduleImportState classifies an existing module for rigorous skip_if_imported / resume / fail handling:
-//   - "ordinary": normal manually created module with NO git_import history or import_job_items
-//   - "complete": verified completed import matching `(source_url, source_subdir)`
-//   - "partial": interrupted/failed import matching `(source_url, source_subdir)` with consistent state
-//   - "uncertain": mismatched source_url/source_subdir, unverified status, or inconsistent commit records
-func (im *Importer) classifyExistingModule(ctx context.Context, mod *project.Module, spec RepoSpec) (state, detail string, lastWorkDir, lastBootstrap string) {
+func (im *Importer) classifyExistingModule(ctx context.Context, mod *project.Module, spec RepoSpec) (state, detail, lastWorkDir, lastBootstrap string) {
 	if mod.Name != spec.ModuleName || mod.MountPath != spec.MountPath {
 		return "ordinary", fmt.Sprintf("mount_path %q conflicts with existing module %q (%s)", spec.MountPath, mod.Name, mod.MountPath), "", ""
 	}
@@ -593,6 +622,44 @@ func (im *Importer) validateSourceAndAuth(spec RepoSpec) (resolvedSourceURL stri
 	return resolvedSourceURL, extraEnv, secrets, authMethod, nil
 }
 
+func checkExpectedSpecRefs(refs RemoteRefSummary, spec RepoSpec) error {
+	if spec.ExpectedDefaultBranch != "" && refs.DefaultBranch != spec.ExpectedDefaultBranch {
+		return fmt.Errorf("%w: default branch %q != expected %q", ErrExpectedRefMismatch, refs.DefaultBranch, spec.ExpectedDefaultBranch)
+	}
+	for bName, wantSHA := range spec.ExpectedBranches {
+		if gotSHA := refs.Branches[bName]; gotSHA != wantSHA {
+			return fmt.Errorf("%w: branch %q sha %q != expected %q", ErrExpectedRefMismatch, bName, short12(gotSHA), short12(wantSHA))
+		}
+	}
+	for tName, wantSHA := range spec.ExpectedTags {
+		if gotSHA := refs.Tags[tName]; gotSHA != wantSHA {
+			return fmt.Errorf("%w: tag %q sha %q != expected %q", ErrExpectedRefMismatch, tName, short12(gotSHA), short12(wantSHA))
+		}
+	}
+	return nil
+}
+
+func verifyMirrorMatchesSnapshot(g MirrorGraph, snap RemoteRefSummary, mismatchBaseErr error) error {
+	if len(g.Branches) != len(snap.Branches) {
+		return fmt.Errorf("%w: branch count changed (%d vs %d)", mismatchBaseErr, len(g.Branches), len(snap.Branches))
+	}
+	for bName, wantSHA := range snap.Branches {
+		if gotSHA := g.Branches[bName]; gotSHA != wantSHA {
+			return fmt.Errorf("%w: branch %q moved (%s -> %s)", mismatchBaseErr, bName, short12(wantSHA), short12(gotSHA))
+		}
+	}
+	if len(g.Tags) != len(snap.Tags) {
+		return fmt.Errorf("%w: tag count changed (%d vs %d)", mismatchBaseErr, len(g.Tags), len(snap.Tags))
+	}
+	for _, t := range g.Tags {
+		origOrTarget := t.TargetSHA
+		if wantSHA, ok := snap.Tags[t.Name]; !ok || wantSHA != origOrTarget {
+			return fmt.Errorf("%w: tag %q moved (%s -> %s)", mismatchBaseErr, t.Name, short12(wantSHA), short12(origOrTarget))
+		}
+	}
+	return nil
+}
+
 func (im *Importer) runDryRunItem(ctx context.Context, proj *project.Project, st storedItem, spec RepoSpec) ItemResult {
 	resolvedSourceURL, extraEnv, secrets, authMethod, authErr := im.validateSourceAndAuth(spec)
 	out := ItemResult{
@@ -638,11 +705,8 @@ func (im *Importer) runDryRunItem(ctx context.Context, proj *project.Project, st
 				im.saveItemFinal(ctx, st.ItemID, out)
 				return out
 			}
-			// ConflictResume on an already complete module falls through to planned/resumable preview.
 		case "partial":
-			if spec.ConflictPolicy == ConflictSkipIfImported || spec.ConflictPolicy == ConflictResume {
-				// Partial import: Dry-run previews that it will resume rather than falsely skipping!
-			} else {
+			if spec.ConflictPolicy == ConflictFail {
 				out.Status = "conflict"
 				out.Error = detail
 				im.saveItemFinal(ctx, st.ItemID, out)
@@ -663,12 +727,27 @@ func (im *Importer) runDryRunItem(ctx context.Context, proj *project.Project, st
 		im.saveItemFinal(ctx, st.ItemID, out)
 		return out
 	}
+	if err := checkExpectedSpecRefs(refs, spec); err != nil {
+		out.Status = "failed"
+		out.RemoteRefs = &refs
+		out.Error = err.Error()
+		im.saveItemFinal(ctx, st.ItemID, out)
+		return out
+	}
 	out.RemoteRefs = &refs
+	fullMigrated := spec.LFSMode != LFSModePointer
+	lfsStatus := "not_applicable"
+	if spec.LFSMode == LFSModePointer {
+		lfsStatus = "pointer_only_unhydrated"
+	}
 	out.Verification = VerificationReport{
 		Passed:               true,
+		FullContentMigrated:  fullMigrated,
+		CoverageComplete:     true,
 		SourceSubdir:         spec.SourceSubdir,
 		SourceBranches:       len(refs.Branches),
 		SourceTags:           len(refs.Tags),
+		LFSHydrationStatus:   lfsStatus,
 		HeadBranch:           refs.DefaultBranch,
 		AdvertisedHiddenRefs: refs.AdvertisedHiddenRefs,
 	}
@@ -681,6 +760,7 @@ func (im *Importer) syncSharedMirror(
 	ctx context.Context,
 	mirrorDir string,
 	spec RepoSpec,
+	pinned *RemoteRefSummary,
 	tc *TreeCache,
 ) (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
 	resolvedSourceURL, extraEnv, secrets, _, authErr := im.validateSourceAndAuth(spec)
@@ -691,19 +771,64 @@ func (im *Importer) syncSharedMirror(
 	unlockMirror := lockByKey(&mirrorLocks, mirrorDir)
 	defer unlockMirror()
 
-	refs, err := InspectRemoteRefs(ctx, im.GitBinary, resolvedSourceURL, extraEnv, secrets)
+	// Resume Snapshot Consistency: if this job already pinned a consistent RemoteRefSummary
+	// on an earlier attempt AND the local Bare Mirror already holds that exact snapshot,
+	// reuse the frozen local mirror without re-fetching newer upstream pushes!
+	if pinned != nil && len(pinned.Branches) > 0 {
+		if _, statErr := os.Stat(filepath.Join(mirrorDir, "HEAD")); statErr == nil {
+			if localG, gErr := ReadMirrorGraph(ctx, im.GitBinary, mirrorDir, pinned.DefaultBranch); gErr == nil {
+				if verifyMirrorMatchesSnapshot(localG, *pinned, ErrSourceMovedDuringResume) == nil {
+					localG.LFSFetchAttempted = spec.LFSMode != LFSModePointer
+					localG.LFSFetchSucceeded = hasAnyLocalLFSObjects(mirrorDir)
+					return resolvedSourceURL, *pinned, localG, tc, nil
+				}
+			}
+		}
+	}
+
+	preRefs, err := InspectRemoteRefs(ctx, im.GitBinary, resolvedSourceURL, extraEnv, secrets)
 	if err != nil {
 		return "", RemoteRefSummary{}, MirrorGraph{}, tc, err
 	}
+	if err := checkExpectedSpecRefs(preRefs, spec); err != nil {
+		return "", RemoteRefSummary{}, MirrorGraph{}, tc, err
+	}
+	if pinned != nil && len(pinned.Branches) > 0 {
+		// Local mirror was missing on resume; verify remote has not drifted from pinned snapshot!
+		if len(preRefs.Branches) != len(pinned.Branches) || len(preRefs.Tags) != len(pinned.Tags) {
+			return "", RemoteRefSummary{}, MirrorGraph{}, tc, fmt.Errorf("%w: remote branch/tag count changed since job started", ErrSourceMovedDuringResume)
+		}
+		for b, want := range pinned.Branches {
+			if preRefs.Branches[b] != want {
+				return "", RemoteRefSummary{}, MirrorGraph{}, tc, fmt.Errorf("%w: branch %q moved on remote since job started", ErrSourceMovedDuringResume, b)
+			}
+		}
+		for t, want := range pinned.Tags {
+			if preRefs.Tags[t] != want {
+				return "", RemoteRefSummary{}, MirrorGraph{}, tc, fmt.Errorf("%w: tag %q moved on remote since job started", ErrSourceMovedDuringResume, t)
+			}
+		}
+	}
+
+	if im.AfterInspectRefs != nil {
+		im.AfterInspectRefs(resolvedSourceURL)
+	}
+
 	lfsAttempted, lfsOK, err := SyncBareMirror(ctx, im.GitBinary, resolvedSourceURL, mirrorDir, spec.LFSMode, extraEnv, secrets)
 	if err != nil {
 		return "", RemoteRefSummary{}, MirrorGraph{}, tc, err
 	}
-	graph, err := ReadMirrorGraph(ctx, im.GitBinary, mirrorDir, refs.DefaultBranch)
+	graph, err := ReadMirrorGraph(ctx, im.GitBinary, mirrorDir, preRefs.DefaultBranch)
 	if err != nil {
 		return "", RemoteRefSummary{}, MirrorGraph{}, tc, err
 	}
+
+	// Verify zero ref movement occurred between `ls-remote` and `git fetch` completion!
+	if err := verifyMirrorMatchesSnapshot(graph, preRefs, ErrSourceMovedDuringFetch); err != nil {
+		return "", RemoteRefSummary{}, MirrorGraph{}, tc, err
+	}
+
 	graph.LFSFetchAttempted = lfsAttempted
 	graph.LFSFetchSucceeded = lfsOK
-	return resolvedSourceURL, refs, graph, tc, nil
+	return resolvedSourceURL, preRefs, graph, tc, nil
 }

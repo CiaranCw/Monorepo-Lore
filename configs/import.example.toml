@@ -6,12 +6,14 @@
 project = "Alpha"
 conflict_policy = "fail" # "fail", "skip_if_imported", or "resume"
 concurrency = 2
+global_files_policy = "strict"
 
 [[repositories]]
 source_url = "https://github.com/example-org/engine.git"
 module_name = "Engine"
 mount_path = "Engine"
-lfs_mode = "auto"
+lfs_mode = "hydrate" # requires all LFS binaries; use "pointer" only for explicitly incomplete pointer-only migration
+submodule_policy = "record_gitlink"
 
 [repositories.auth]
 auth_method = "https_token"
@@ -33,3 +35,4 @@ known_hosts = "/path/to/known_hosts"
 # source_subdir = "Chess"
 # module_name = "Chess"
 # mount_path = "Chess"
+# expected_default_branch = "main"

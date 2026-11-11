@@ -1,0 +1,2 @@
+mapping_id,source_url,source_subdirectory,target_project,target_module,target_mount_path,expected_default_branch,lfs_policy,submodule_policy,global_files_policy,overlap_review,path_classification_review,required_users,migration_status,notes
+MAP-001,,,,,,,hydrate,require_registered,strict,PENDING,PENDING,,MAPPING_PENDING,

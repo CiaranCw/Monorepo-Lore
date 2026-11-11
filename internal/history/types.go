@@ -27,12 +27,28 @@ const (
 	OriginNativeLore = "native_lore"
 	OriginGitImport  = "git_import"
 
+	AliasDirect    = "direct"
+	AliasUnchanged = "unchanged_alias"
+	AliasPreModule = "pre_module_empty"
+
 	OrderDesc = "desc"
 	OrderAsc  = "asc"
 
 	DefaultLimit = 50
 	MaxLimit     = 500
 )
+
+// CommitAlias persists the per-module projection mapping for every source Git commit
+// (distinguishing the raw source commit, the module's actual Lore revision, and folded aliases).
+type CommitAlias struct {
+	ModuleID                int64  `json:"module_id"`
+	SourceCommitID          string `json:"source_commit_id"`
+	AliasStatus             string `json:"alias_status"` // direct, unchanged_alias, pre_module_empty
+	EffectiveSourceCommitID string `json:"effective_source_commit_id,omitempty"`
+	LoreRevision            string `json:"lore_revision,omitempty"`
+	SourceSubdir            string `json:"source_subdir,omitempty"`
+	UpdatedAt               string `json:"updated_at,omitempty"`
+}
 
 // ParentLink represents one ordered parent edge in a module's commit DAG.
 type ParentLink struct {
@@ -51,21 +67,22 @@ type RefBadge struct {
 
 // RefDetail is full branch or tag metadata for a module.
 type RefDetail struct {
-	ModuleID          int64  `json:"module_id"`
-	ModuleName        string `json:"module_name"`
-	Type              string `json:"type"`
-	Name              string `json:"name"`
-	LoreRevision      string `json:"lore_revision"`
-	SourceCommitID    string `json:"source_commit_id,omitempty"`
-	SourceTagObjectID string `json:"source_tag_object_id,omitempty"`
-	LoreBranchID      string `json:"lore_branch_id,omitempty"`
-	IsDefault         bool   `json:"is_default"`
-	IsAnnotated       bool   `json:"is_annotated"`
-	TaggerName        string `json:"tagger_name,omitempty"`
-	TaggerEmail       string `json:"tagger_email,omitempty"`
-	TaggedAt          string `json:"tagged_at,omitempty"`
-	TagMessage        string `json:"tag_message,omitempty"`
-	UpdatedAt         string `json:"updated_at"`
+	ModuleID               int64  `json:"module_id"`
+	ModuleName             string `json:"module_name"`
+	Type                   string `json:"type"`
+	Name                   string `json:"name"`
+	LoreRevision           string `json:"lore_revision"`
+	SourceCommitID         string `json:"source_commit_id,omitempty"`
+	OriginalSourceCommitID string `json:"original_source_commit_id,omitempty"`
+	SourceTagObjectID      string `json:"source_tag_object_id,omitempty"`
+	LoreBranchID           string `json:"lore_branch_id,omitempty"`
+	IsDefault              bool   `json:"is_default"`
+	IsAnnotated            bool   `json:"is_annotated"`
+	TaggerName             string `json:"tagger_name,omitempty"`
+	TaggerEmail            string `json:"tagger_email,omitempty"`
+	TaggedAt               string `json:"tagged_at,omitempty"`
+	TagMessage             string `json:"tag_message,omitempty"`
+	UpdatedAt              string `json:"updated_at"`
 }
 
 // SpecialObject describes a Git LFS file, submodule gitlink, or symlink associated with a commit.
@@ -91,6 +108,9 @@ type Commit struct {
 	LoreRevision        string            `json:"lore_revision"`
 	LoreRevisionNumber  int               `json:"lore_revision_number"`
 	SourceCommitID      string            `json:"source_commit_id,omitempty"`
+	QueriedSourceCommit string            `json:"queried_source_commit_id,omitempty"`
+	ResolvedViaAlias    bool              `json:"resolved_via_alias,omitempty"`
+	AliasStatus         string            `json:"alias_status,omitempty"`
 	SourceSubdir        string            `json:"source_subdir,omitempty"`
 	OriginKind          string            `json:"origin_kind"`
 	IsMerge             bool              `json:"is_merge"`

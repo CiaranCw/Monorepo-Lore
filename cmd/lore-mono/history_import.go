@@ -708,11 +708,13 @@ func importCmd(args []string) error {
 	}
 
 	reqBody := map[string]any{
-		"job_key":         manifest.JobKey,
-		"dry_run":         manifest.DryRun,
-		"conflict_policy": manifest.ConflictPolicy,
-		"concurrency":     manifest.Concurrency,
-		"repositories":    manifest.Repositories,
+		"job_key":             manifest.JobKey,
+		"dry_run":             manifest.DryRun,
+		"conflict_policy":     manifest.ConflictPolicy,
+		"global_files_policy": manifest.GlobalFilesPolicy,
+		"concurrency":         manifest.Concurrency,
+		"path_rules":          manifest.PathRules,
+		"repositories":        manifest.Repositories,
 	}
 	if len(runtimeTokens) > 0 {
 		reqBody["runtime_tokens"] = runtimeTokens
@@ -739,9 +741,13 @@ func importCmd(args []string) error {
 		return fmt.Errorf("import parse failed")
 	}
 	for _, it := range job.Items {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\tcommits=%d\tbranches=%d\ttags=%d\n",
+		lfsNote := ""
+		if it.Verification.LFSHydrationStatus == "pointer_only_unhydrated" {
+			lfsNote = "\t[LFS:POINTER_ONLY_UNHYDRATED]"
+		}
+		fmt.Fprintf(stdout, "%s\t%s\t%s\tcommits=%d\tbranches=%d\ttags=%d%s\n",
 			it.ModuleName, it.Platform, it.Status,
-			it.Verification.IndexedCommits, it.Verification.ImportedBranches, it.Verification.ImportedTags)
+			it.Verification.IndexedCommits, it.Verification.ImportedBranches, it.Verification.ImportedTags, lfsNote)
 	}
 	fmt.Fprintf(stdout, "job=%d mode=%s status=%s ok=%d failed=%d skipped=%d\n",
 		job.JobID, job.Mode, job.Status, job.SucceededItems, job.FailedItems, job.SkippedItems)

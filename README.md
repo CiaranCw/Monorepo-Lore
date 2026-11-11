@@ -74,6 +74,27 @@ go build -mod=readonly ./...
 
 Tests that talk to a live Lore server are skipped unless their environment variables are set. A skipped live test is not a pass of that live scenario.
 
+### Migration operations
+
+Operational migration documents and fillable templates are under
+[`docs/migration/`](docs/migration/):
+
+- final migration-readiness report;
+- import and backup/rollback runbooks;
+- repository inventory, Monorepo mapping, and user-permission CSV templates;
+- per-import acceptance checklist and known limitations.
+
+`manager-ops` provides executable backup, verification, isolated restore,
+consistency audit, and per-module quarantine operations:
+
+```sh
+go build -mod=readonly ./cmd/manager-ops
+manager-ops backup --db /path/manager.db --store /path/store --imports /path/imports --keys /path/keys --configs /path/config --certs /path/certs --out /new/backup
+manager-ops verify --bundle /new/backup
+manager-ops restore --bundle /new/backup --target /new/restore-drill
+manager-ops audit --db /new/restore-drill/db/manager.db
+```
+
 ### Protobuf generation
 
 The generated Go files are committed under `gen/`. To regenerate them, install the Buf CLI and the exact plugin versions used by this repository, and make sure the Go binary directory is on `PATH`:

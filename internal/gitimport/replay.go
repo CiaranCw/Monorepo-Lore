@@ -16,8 +16,8 @@ import (
 
 	"lore-monorepo/internal/database"
 	"lore-monorepo/internal/history"
-	"lore-monorepo/internal/project"
 	"lore-monorepo/internal/loreexec"
+	"lore-monorepo/internal/project"
 )
 
 type sharedMirrorState struct {
@@ -43,6 +43,8 @@ func (im *Importer) runImportItem(
 	st storedItem,
 	spec RepoSpec,
 	siblingSubdirs []string,
+	pathRules []PathRule,
+	manifestModNames map[string]bool,
 	getMirror func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error),
 ) ItemResult {
 	if st.Status == "succeeded" {
@@ -183,6 +185,10 @@ func (im *Importer) runImportItem(
 		return out
 	}
 	out.RemoteRefs = &remoteRefs
+	if pinnedBytes, pErr := json.Marshal(remoteRefs); pErr == nil {
+		_, _ = im.DB.ExecContext(ctx, `UPDATE import_job_items SET pinned_refs_json=? WHERE item_id=? AND (pinned_refs_json='' OR pinned_refs_json='{}')`,
+			string(pinnedBytes), st.ItemID)
+	}
 
 	// Gate 1: Reject shallow / missing-parent Git history immediately before mutating Lore!
 	if rawGraph.IsShallow || len(rawGraph.ShallowMissingParents) > 0 {
@@ -200,7 +206,7 @@ func (im *Importer) runImportItem(
 	}
 
 	// Step 2: Project MirrorGraph onto this module's independent DAG (`source_subdir` or whole repo).
-	projGraph, pErr := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, treeCache)
+	projGraph, pErr := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache)
 	if pErr != nil {
 		out.Status = "failed"
 		out.Error = pErr.Error()
@@ -210,6 +216,39 @@ func (im *Importer) runImportItem(
 	if len(projGraph.Commits) == 0 {
 		out.Status = "failed"
 		out.Error = fmt.Sprintf("gitimport: zero commits matched module %q (source_subdir=%q)", spec.ModuleName, spec.SourceSubdir)
+		im.saveItemFinal(ctx, st.ItemID, out)
+		return out
+	}
+	// A `separate_module` classification is only complete when that target
+	// module is explicitly present in this same reviewed manifest.
+	for _, classified := range projGraph.ClassifiedSeparateModule {
+		if classified.TargetModule == "" || !manifestModNames[classified.TargetModule] {
+			projGraph.CoverageComplete = false
+			projGraph.UndecidedPaths = append(projGraph.UndecidedPaths, classified.Path)
+		}
+	}
+	sort.Strings(projGraph.UndecidedPaths)
+
+	// Gate 2: Enforce 4-category Global/Unmapped Path Classification Policy BEFORE mutating Lore!
+	if spec.SourceSubdir != "" && spec.GlobalFilesPolicy == GlobalPolicyStrict && !projGraph.CoverageComplete {
+		out.Status = "failed"
+		limit := len(projGraph.UndecidedPaths)
+		if limit > 32 {
+			limit = 32
+		}
+		out.Verification = VerificationReport{
+			Passed:                   false,
+			CoverageComplete:         false,
+			SourceSubdir:             spec.SourceSubdir,
+			RawSourceCommits:         len(rawGraph.Commits),
+			SourceCommits:            len(projGraph.Commits),
+			UnmappedPathsCount:       len(projGraph.UnmappedPaths),
+			ClassifiedExcluded:       projGraph.ClassifiedExcluded,
+			ClassifiedSeparateModule: projGraph.ClassifiedSeparateModule,
+			UndecidedPaths:           projGraph.UndecidedPaths[:limit],
+			Mismatches:               []string{fmt.Sprintf("%d unclassified monorepo path(s) outside module subdirectories", len(projGraph.UndecidedPaths))},
+		}
+		out.Error = fmt.Sprintf("%s: %d undecided path(s) (first: %s)", ErrUnclassifiedGlobalPaths.Error(), len(projGraph.UndecidedPaths), projGraph.UndecidedPaths[0])
 		im.saveItemFinal(ctx, st.ItemID, out)
 		return out
 	}
@@ -262,16 +301,16 @@ func (im *Importer) runImportItem(
 		}
 	}
 
-	// Step 6: Persist branch & tag refs and run 3-Layer DAG Integrity Verification!
+	// Step 6: Persist per-module commit aliases, branch & tag refs, and run 3-Layer DAG Integrity Verification!
 	im.updateItemProgress(ctx, st.ItemID, "verifying", cp)
-	if err := im.persistRefs(ctx, cp.ModuleID, st.LoreWorkPath, projGraph, cp.CommitMap); err != nil {
+	if err := im.persistAliasesAndRefs(ctx, cp.ModuleID, st.LoreWorkPath, spec.SourceSubdir, rawGraph, projGraph, cp.CommitMap); err != nil {
 		out.Status = "failed"
 		out.Error = err.Error()
 		im.saveItemFinal(ctx, st.ItemID, out)
 		return out
 	}
 
-	ver, vErr := im.verifyImportedModule(ctx, cp.ModuleID, st.GitMirrorPath, st.LoreWorkPath, spec, remoteRefs, rawGraph, projGraph, cp, treeCache)
+	ver, vErr := im.verifyImportedModule(ctx, proj.ID, cp.ModuleID, st.GitMirrorPath, st.LoreWorkPath, spec, remoteRefs, rawGraph, projGraph, cp, manifestModNames, treeCache)
 	out.Verification = ver
 	if vErr != nil || !ver.Passed {
 		out.Status = "failed"
@@ -990,10 +1029,12 @@ func (im *Importer) indexProjectedCommitInDB(
 	})
 }
 
-func (im *Importer) persistRefs(
+func (im *Importer) persistAliasesAndRefs(
 	ctx context.Context,
 	moduleID int64,
 	loreWorkDir string,
+	sourceSubdir string,
+	rawGraph MirrorGraph,
 	g ProjectedGraph,
 	commitMap map[string]string,
 ) error {
@@ -1007,7 +1048,41 @@ func (im *Importer) persistRefs(
 	}
 
 	return database.Tx(ctx, im.DB, func(tx *sql.Tx) error {
-		// Prune any stale branch/tag refs before writing the authoritative projected refs.
+		// 1. Persist complete per-module source commit alias map in SQLite!
+		if _, err := tx.ExecContext(ctx, `DELETE FROM module_commit_aliases WHERE module_id=?`, moduleID); err != nil {
+			return err
+		}
+		for _, rc := range rawGraph.Commits {
+			effSHA := g.EffectiveCommitOf[rc.SHA]
+			var status, loreRev string
+			if effSHA == "" {
+				status = history.AliasPreModule
+			} else if effSHA == rc.SHA {
+				status = history.AliasDirect
+				loreRev = commitMap[rc.SHA]
+				if loreRev == "" {
+					return fmt.Errorf("gitimport: direct commit %s missing lore revision for alias persistence", rc.SHA)
+				}
+			} else {
+				status = history.AliasUnchanged
+				loreRev = commitMap[effSHA]
+				if loreRev == "" {
+					return fmt.Errorf("gitimport: folded commit %s effective target %s missing lore revision", rc.SHA, effSHA)
+				}
+			}
+			if err := history.UpsertCommitAlias(ctx, tx, history.CommitAlias{
+				ModuleID:                moduleID,
+				SourceCommitID:          rc.SHA,
+				AliasStatus:             status,
+				EffectiveSourceCommitID: effSHA,
+				LoreRevision:            loreRev,
+				SourceSubdir:            sourceSubdir,
+			}); err != nil {
+				return err
+			}
+		}
+
+		// 2. Prune stale branch/tag refs and write authoritative projected refs with original commit provenance.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM module_refs WHERE module_id=?`, moduleID); err != nil {
 			return err
 		}
@@ -1017,14 +1092,19 @@ func (im *Importer) persistRefs(
 			if rev == "" {
 				return fmt.Errorf("gitimport: branch %s commit %s has no lore revision", bName, sha)
 			}
+			origSHA := g.OriginalBranches[bName]
+			if origSHA == "" {
+				origSHA = sha
+			}
 			if err := history.UpsertRef(ctx, tx, history.RefDetail{
-				ModuleID:       moduleID,
-				Type:           "branch",
-				Name:           bName,
-				LoreRevision:   rev,
-				SourceCommitID: sha,
-				LoreBranchID:   loreBranchIDs[bName],
-				IsDefault:      bName == g.DefaultBranch,
+				ModuleID:               moduleID,
+				Type:                   "branch",
+				Name:                   bName,
+				LoreRevision:           rev,
+				SourceCommitID:         sha,
+				OriginalSourceCommitID: origSHA,
+				LoreBranchID:           loreBranchIDs[bName],
+				IsDefault:              bName == g.DefaultBranch,
 			}); err != nil {
 				return err
 			}
@@ -1034,18 +1114,23 @@ func (im *Importer) persistRefs(
 			if rev == "" {
 				return fmt.Errorf("gitimport: tag %s target %s has no lore revision", t.Name, t.TargetSHA)
 			}
+			origSHA := t.OriginalTargetSHA
+			if origSHA == "" {
+				origSHA = t.TargetSHA
+			}
 			if err := history.UpsertRef(ctx, tx, history.RefDetail{
-				ModuleID:          moduleID,
-				Type:              "tag",
-				Name:              t.Name,
-				LoreRevision:      rev,
-				SourceCommitID:    t.TargetSHA,
-				SourceTagObjectID: t.TagObjectID,
-				IsAnnotated:       t.IsAnnotated,
-				TaggerName:        t.TaggerName,
-				TaggerEmail:       t.TaggerEmail,
-				TaggedAt:          t.TaggedAt,
-				TagMessage:        t.Message,
+				ModuleID:               moduleID,
+				Type:                   "tag",
+				Name:                   t.Name,
+				LoreRevision:           rev,
+				SourceCommitID:         t.TargetSHA,
+				OriginalSourceCommitID: origSHA,
+				SourceTagObjectID:      t.TagObjectID,
+				IsAnnotated:            t.IsAnnotated,
+				TaggerName:             t.TaggerName,
+				TaggerEmail:            t.TaggerEmail,
+				TaggedAt:               t.TaggedAt,
+				TagMessage:             t.Message,
 			}); err != nil {
 				return err
 			}

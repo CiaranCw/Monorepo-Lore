@@ -42,22 +42,37 @@ func (tc *TreeCache) Entries(ctx context.Context, gitBin, mirrorDir, treeSHA str
 	return list, nil
 }
 
+// ClassifiedPath records an explicit classification decision for a path outside
+// a module's subdirectory in an external Git Monorepo.
+type ClassifiedPath struct {
+	Path         string `json:"path"`
+	Category     string `json:"category"` // "excluded" or "separate_module"
+	Pattern      string `json:"pattern"`
+	TargetModule string `json:"target_module,omitempty"`
+	Reason       string `json:"reason"`
+}
+
 // ProjectedGraph is a single module's independent DAG projected from MirrorGraph.
 // Every commit in ProjectedGraph.Commits belongs strictly to this module, and every
 // parent SHA in GitCommit.Parents points strictly to an earlier commit in ProjectedGraph.Commits!
 type ProjectedGraph struct {
-	SourceSubdir         string
-	DefaultBranch        string
-	Commits              []GitCommit
-	CommitsBySHA         map[string]GitCommit
-	RawGitParents        map[string][]string // projected commit sha -> original unprojected git parents
-	EffectiveCommitOf    map[string]string   // any source git sha -> effective projected commit sha in this module ("" if pre-creation)
-	Branches             map[string]string   // branch name -> projected commit sha
-	Tags                 []GitTag            // tags whose target commit maps to a non-empty projected commit
-	SkippedEmptyBranches []string
-	SkippedEmptyTags     []string
-	UnmappedPaths        []string // root/global paths outside sourceSubdir & siblingSubdirs (e.g. .github/*, README.md)
-	AliasedCommitsCount  int
+	SourceSubdir             string
+	DefaultBranch            string
+	Commits                  []GitCommit
+	CommitsBySHA             map[string]GitCommit
+	RawGitParents            map[string][]string // projected commit sha -> original unprojected git parents
+	EffectiveCommitOf        map[string]string   // any source git sha -> effective projected commit sha in this module ("" if pre-creation)
+	Branches                 map[string]string   // branch name -> projected commit sha
+	OriginalBranches         map[string]string   // branch name -> raw source git sha before alias folding
+	Tags                     []GitTag            // tags whose target commit maps to a non-empty projected commit
+	SkippedEmptyBranches     []string
+	SkippedEmptyTags         []string
+	UnmappedPaths            []string         // all paths outside sourceSubdir & siblingSubdirs
+	ClassifiedExcluded       []ClassifiedPath // paths explicitly excluded with documented reason
+	ClassifiedSeparateModule []ClassifiedPath // paths explicitly assigned to a governance/shared module
+	UndecidedPaths           []string         // unclassified paths that block strict migration completeness
+	CoverageComplete         bool
+	AliasedCommitsCount      int
 }
 
 func ProjectMirrorGraph(
@@ -66,6 +81,7 @@ func ProjectMirrorGraph(
 	g MirrorGraph,
 	sourceSubdir string,
 	siblingSubdirs []string,
+	pathRules []PathRule,
 	cache *TreeCache,
 ) (ProjectedGraph, error) {
 	sourceSubdir = strings.Trim(strings.TrimSpace(sourceSubdir), "/")
@@ -83,11 +99,19 @@ func ProjectMirrorGraph(
 			rawParents[c.SHA] = append([]string{}, c.Parents...)
 		}
 		branches := make(map[string]string, len(g.Branches))
+		origBranches := make(map[string]string, len(g.Branches))
 		for k, v := range g.Branches {
 			branches[k] = v
+			origBranches[k] = v
 		}
 		tags := make([]GitTag, len(g.Tags))
-		copy(tags, g.Tags)
+		for i, t := range g.Tags {
+			pt := t
+			if pt.OriginalTargetSHA == "" {
+				pt.OriginalTargetSHA = t.TargetSHA
+			}
+			tags[i] = pt
+		}
 		return ProjectedGraph{
 			SourceSubdir:      "",
 			DefaultBranch:     g.DefaultBranch,
@@ -96,7 +120,9 @@ func ProjectMirrorGraph(
 			RawGitParents:     rawParents,
 			EffectiveCommitOf: eff,
 			Branches:          branches,
+			OriginalBranches:  origBranches,
 			Tags:              tags,
+			CoverageComplete:  true,
 		}, nil
 	}
 
@@ -106,9 +132,9 @@ func ProjectMirrorGraph(
 		RawGitParents:     map[string][]string{},
 		EffectiveCommitOf: map[string]string{},
 		Branches:          map[string]string{},
+		OriginalBranches:  map[string]string{},
 	}
 
-	// Build prefix list of all declared module subdirs in this manifest for unmapped-path classification.
 	allDeclaredPrefixes := []string{sourceSubdir + "/"}
 	for _, sib := range siblingSubdirs {
 		sib = strings.Trim(strings.TrimSpace(sib), "/")
@@ -118,8 +144,8 @@ func ProjectMirrorGraph(
 	}
 
 	unmappedSet := map[string]bool{}
-	projSubtree := map[string]string{}          // projected commit SHA -> module subtree digest ("" = empty)
-	ancestors := map[string]map[string]bool{}   // projected commit SHA -> set of ancestor projected commit SHAs (inclusive)
+	projSubtree := map[string]string{}
+	ancestors := map[string]map[string]bool{}
 
 	modulePrefix := sourceSubdir + "/"
 
@@ -141,7 +167,6 @@ func ProjectMirrorGraph(
 				}
 				continue
 			}
-			// Check if e.Path belongs to any sibling module subdir in the manifest; if not, record as unmapped global path!
 			inSibling := false
 			for _, pfx := range allDeclaredPrefixes {
 				if strings.HasPrefix(e.Path, pfx) {
@@ -225,8 +250,6 @@ func ProjectMirrorGraph(
 			}
 
 		default:
-			// Multi-parent merge: prune secondary parents that are ALREADY ancestors of an earlier parent
-			// (i.e. side branches that only modified other modules and added zero commits to this module!).
 			kept := []string{rawMapped[0]}
 			for j := 1; j < len(rawMapped); j++ {
 				cand := rawMapped[j]
@@ -255,10 +278,31 @@ func ProjectMirrorGraph(
 	}
 	sort.Strings(out.UnmappedPaths)
 
+	for _, uPath := range out.UnmappedPaths {
+		if rule, matched := MatchPathRule(uPath, pathRules); matched {
+			cp := ClassifiedPath{
+				Path:         uPath,
+				Category:     rule.Category,
+				Pattern:      rule.Pattern,
+				TargetModule: rule.TargetModule,
+				Reason:       rule.Reason,
+			}
+			if rule.Category == PathCategorySeparateModule {
+				out.ClassifiedSeparateModule = append(out.ClassifiedSeparateModule, cp)
+			} else {
+				out.ClassifiedExcluded = append(out.ClassifiedExcluded, cp)
+			}
+		} else {
+			out.UndecidedPaths = append(out.UndecidedPaths, uPath)
+		}
+	}
+	out.CoverageComplete = len(out.UndecidedPaths) == 0
+
 	for _, bName := range sortedKeys(g.Branches) {
 		tipSHA := g.Branches[bName]
 		if eff := out.EffectiveCommitOf[tipSHA]; eff != "" {
 			out.Branches[bName] = eff
+			out.OriginalBranches[bName] = tipSHA
 		} else {
 			out.SkippedEmptyBranches = append(out.SkippedEmptyBranches, bName)
 		}
@@ -279,6 +323,7 @@ func ProjectMirrorGraph(
 	for _, t := range g.Tags {
 		if eff := out.EffectiveCommitOf[t.TargetSHA]; eff != "" {
 			pt := t
+			pt.OriginalTargetSHA = t.TargetSHA
 			pt.TargetSHA = eff
 			out.Tags = append(out.Tags, pt)
 		} else {

@@ -198,8 +198,8 @@ func (s Service) ProjectHistory(ctx context.Context, userID, projectID int64, fi
 	return page, nil
 }
 
-// GetCommit fetches a single commit in moduleID by either its 64-hex Lore revision
-// or its original Git commit SHA.
+// GetCommit fetches a single commit in moduleID by its 64-hex Lore revision,
+// its direct Git commit SHA, or a persisted folded source commit alias in module_commit_aliases.
 func (s Service) GetCommit(ctx context.Context, userID, moduleID int64, refID string) (Commit, error) {
 	refID = strings.TrimSpace(refID)
 	if refID == "" {
@@ -217,18 +217,85 @@ func (s Service) GetCommit(ctx context.Context, userID, moduleID int64, refID st
 	if err != nil {
 		return Commit{}, err
 	}
-	defer rows.Close()
 	list, err := scanCommits(rows)
+	rows.Close()
 	if err != nil {
 		return Commit{}, err
 	}
-	if len(list) == 0 {
+	if len(list) > 0 {
+		if err := s.hydrateCommits(ctx, list); err != nil {
+			return Commit{}, err
+		}
+		if list[0].SourceCommitID == refID {
+			list[0].AliasStatus = AliasDirect
+		}
+		return list[0], nil
+	}
+
+	// Check persistent per-module alias mapping (survives Manager restarts!).
+	var aliasStatus, effLoreRev string
+	aErr := s.DB.QueryRowContext(ctx, `
+		SELECT alias_status, lore_revision
+		FROM module_commit_aliases
+		WHERE module_id = ? AND source_commit_id = ?
+	`, moduleID, refID).Scan(&aliasStatus, &effLoreRev)
+	if errors.Is(aErr, sql.ErrNoRows) || effLoreRev == "" {
 		return Commit{}, ErrNotFound
 	}
-	if err := s.hydrateCommits(ctx, list); err != nil {
+	if aErr != nil {
+		return Commit{}, aErr
+	}
+
+	aRows, err := s.DB.QueryContext(ctx, commitSelectSQL+`
+		WHERE mc.module_id = ? AND mc.is_synthetic = 0 AND mc.lore_revision = ?
+		LIMIT 1
+	`, moduleID, effLoreRev)
+	if err != nil {
 		return Commit{}, err
 	}
-	return list[0], nil
+	defer aRows.Close()
+	aList, err := scanCommits(aRows)
+	if err != nil {
+		return Commit{}, err
+	}
+	if len(aList) == 0 {
+		return Commit{}, ErrNotFound
+	}
+	if err := s.hydrateCommits(ctx, aList); err != nil {
+		return Commit{}, err
+	}
+	out := aList[0]
+	out.QueriedSourceCommit = refID
+	out.ResolvedViaAlias = aliasStatus == AliasUnchanged
+	out.AliasStatus = aliasStatus
+	return out, nil
+}
+
+// GetCommitAlias returns the persisted per-module CommitAlias record for sourceCommitID
+// (including `pre_module_empty` commits that predate a module subdirectory).
+func (s Service) GetCommitAlias(ctx context.Context, userID, moduleID int64, sourceCommitID string) (CommitAlias, error) {
+	sourceCommitID = strings.TrimSpace(sourceCommitID)
+	if sourceCommitID == "" {
+		return CommitAlias{}, ErrNotFound
+	}
+	perms := permission.Service{DB: s.DB}
+	if err := perms.CanReadModule(ctx, userID, moduleID); err != nil {
+		return CommitAlias{}, ErrNotFound
+	}
+	mod, err := project.GetModuleByID(ctx, s.DB, moduleID)
+	if err != nil || mod.Archived() {
+		return CommitAlias{}, ErrNotFound
+	}
+	var a CommitAlias
+	err = s.DB.QueryRowContext(ctx, `
+		SELECT module_id, source_commit_id, alias_status, effective_source_commit_id, lore_revision, source_subdir, updated_at
+		FROM module_commit_aliases
+		WHERE module_id = ? AND source_commit_id = ?
+	`, moduleID, sourceCommitID).Scan(&a.ModuleID, &a.SourceCommitID, &a.AliasStatus, &a.EffectiveSourceCommitID, &a.LoreRevision, &a.SourceSubdir, &a.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CommitAlias{}, ErrNotFound
+	}
+	return a, err
 }
 
 // ListModuleRefs returns branches and/or tags for one accessible module.
@@ -243,7 +310,7 @@ func (s Service) ListModuleRefs(ctx context.Context, userID, moduleID int64, ref
 	}
 	query := `
 		SELECT r.module_id, m.name, r.ref_type, r.ref_name, r.lore_revision,
-		       COALESCE(r.source_commit_id,''), COALESCE(r.source_tag_object_id,''), COALESCE(r.lore_branch_id,''),
+		       COALESCE(r.source_commit_id,''), r.original_source_commit_id, COALESCE(r.source_tag_object_id,''), COALESCE(r.lore_branch_id,''),
 		       r.is_default, r.is_annotated, r.tagger_name, r.tagger_email, r.tagged_at, r.tag_message, r.updated_at
 		FROM module_refs r
 		JOIN modules m ON m.module_id = r.module_id
@@ -268,7 +335,7 @@ func (s Service) ListModuleRefs(ctx context.Context, userID, moduleID int64, ref
 		var isDef, isAnn int
 		if err := rows.Scan(
 			&d.ModuleID, &d.ModuleName, &d.Type, &d.Name, &d.LoreRevision,
-			&d.SourceCommitID, &d.SourceTagObjectID, &d.LoreBranchID,
+			&d.SourceCommitID, &d.OriginalSourceCommitID, &d.SourceTagObjectID, &d.LoreBranchID,
 			&isDef, &isAnn, &d.TaggerName, &d.TaggerEmail, &d.TaggedAt, &d.TagMessage, &d.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -309,6 +376,18 @@ func (s Service) resolveStartRevision(ctx context.Context, moduleID int64, branc
 	var target string
 	err := s.DB.QueryRowContext(ctx, `SELECT lore_revision FROM module_commits WHERE module_id=? AND is_synthetic=0 AND (lore_revision=? OR source_commit_id=?) LIMIT 1`,
 		moduleID, rev, rev).Scan(&target)
+	if err == nil {
+		return target, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	// Fall back to persisted folded commit alias in module_commit_aliases!
+	err = s.DB.QueryRowContext(ctx, `
+		SELECT lore_revision FROM module_commit_aliases
+		WHERE module_id=? AND source_commit_id=? AND lore_revision <> ''
+		LIMIT 1
+	`, moduleID, rev).Scan(&target)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
