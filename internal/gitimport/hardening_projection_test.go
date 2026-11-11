@@ -801,6 +801,11 @@ func TestTeamGamesMonorepoSplitProjectionAndIsolation(t *testing.T) {
 	if err != nil || rerunSkip.SkippedItems != 3 {
 		t.Fatalf("re-import with skip_if_imported expected 3 skipped, got %+v err=%v", rerunSkip, err)
 	}
+	for _, it := range rerunSkip.Items {
+		if it.Status != "skipped" || !it.Verification.Passed || it.Verification.ReusedFromJobID == 0 {
+			t.Fatalf("skipped item must reuse a passed verification, got %+v", it)
+		}
+	}
 
 	// Verify Snapshot Publisher pins each of the 3 independent module revisions cleanly without merging module commits!
 	memPub := &postImportPublishDriver{

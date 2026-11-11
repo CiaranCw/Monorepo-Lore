@@ -79,6 +79,7 @@ type SubmoduleDependency struct {
 // VerificationReport records the automated pre/post 3-layer integrity checks for one imported repository.
 type VerificationReport struct {
 	Passed                   bool                  `json:"passed"`
+	ReusedFromJobID          int64                 `json:"reused_from_job_id,omitempty"`
 	PreflightOnly            bool                  `json:"preflight_only,omitempty"`
 	FullContentMigrated      bool                  `json:"full_content_migrated"`
 	CoverageComplete         bool                  `json:"coverage_complete"`
@@ -564,6 +565,26 @@ func (im *Importer) readJobResult(ctx context.Context, jobID int64, projectName 
 	return res, rows.Err()
 }
 
+func (im *Importer) priorPassedVerification(ctx context.Context, moduleID int64) (VerificationReport, int64) {
+	var jobID int64
+	var raw string
+	err := im.DB.QueryRowContext(ctx, `
+		SELECT j.job_id, i.verification_json
+		FROM import_job_items i
+		JOIN import_jobs j ON j.job_id = i.job_id
+		WHERE i.module_id=? AND j.mode='import' AND i.status='succeeded'
+		ORDER BY i.item_id DESC LIMIT 1
+	`, moduleID).Scan(&jobID, &raw)
+	if err != nil {
+		return VerificationReport{}, 0
+	}
+	var ver VerificationReport
+	if json.Unmarshal([]byte(raw), &ver) != nil || !ver.Passed {
+		return VerificationReport{}, 0
+	}
+	return ver, jobID
+}
+
 func (im *Importer) classifyExistingModule(ctx context.Context, mod *project.Module, spec RepoSpec) (state, detail, lastWorkDir, lastBootstrap string) {
 	if mod.Name != spec.ModuleName || mod.MountPath != spec.MountPath {
 		return "ordinary", fmt.Sprintf("mount_path %q conflicts with existing module %q (%s)", spec.MountPath, mod.Name, mod.MountPath), "", ""
@@ -742,6 +763,15 @@ func (im *Importer) runDryRunItem(
 		switch state {
 		case "complete":
 			if spec.ConflictPolicy == ConflictSkipIfImported {
+				ver, sourceJob := im.priorPassedVerification(ctx, existing.ID)
+				if !ver.Passed || sourceJob == 0 {
+					out.Status = "conflict"
+					out.Error = "skip refused: the previous import has no passed verification"
+					im.saveItemFinal(ctx, st.ItemID, out)
+					return out
+				}
+				ver.ReusedFromJobID = sourceJob
+				out.Verification = ver
 				out.Status = "skipped"
 				im.saveItemFinal(ctx, st.ItemID, out)
 				return out
