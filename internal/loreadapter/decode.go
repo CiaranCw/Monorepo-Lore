@@ -35,22 +35,51 @@ type Link struct {
 	Raw          json.RawMessage
 }
 
-// HistoryEntry is one revisionHistoryEntry captured in E5 step M-4.
+// HistoryEntry is one revisionHistoryEntry captured in E5 step M-4,
+// together with the metadata events Lore emits immediately after it.
 type HistoryEntry struct {
-	Revision       string
-	RevisionNumber int
-	Parent         []string
-	Raw            json.RawMessage
+	Revision        string
+	RevisionNumber  int
+	Parent          []string
+	TimestampUnixMS int64
+	Metadata        map[string]string
+	Raw             json.RawMessage
 }
 
 // Branch is a branchListEntry.
 // NOT_VERIFIED against a P3-A capture; see ListBranches.
 type Branch struct {
-	ID        string
-	Name      string
-	Latest    string
-	IsCurrent bool
-	Raw       json.RawMessage
+	ID            string
+	Name          string
+	Latest        string
+	Location      string
+	Creator       string
+	CreatedUnixMS int64
+	IsCurrent     bool
+	Archived      bool
+	Raw           json.RawMessage
+}
+
+// FileDelta is one revisionInfoDelta event emitted by `lore revision info --delta`.
+type FileDelta struct {
+	Path       string `json:"path"`
+	FromPath   string `json:"from_path,omitempty"`
+	Size       uint64 `json:"size"`
+	Action     string `json:"action"`
+	FlagModify bool   `json:"flag_modify"`
+	FlagMerged bool   `json:"flag_merged"`
+	FlagFile   bool   `json:"flag_file"`
+}
+
+// RevisionDetail is the full result of `lore revision info [--delta]`.
+type RevisionDetail struct {
+	RepositoryID    string
+	Revision        string
+	RevisionNumber  int
+	Parent          []string
+	TimestampUnixMS int64
+	Metadata        map[string]string
+	Deltas          []FileDelta
 }
 
 func decodeStatus(res loreexec.CommandResult) (Status, bool) {
@@ -108,23 +137,71 @@ func decodeLinks(res loreexec.CommandResult) ([]Link, error) {
 }
 
 func decodeHistory(res loreexec.CommandResult) ([]HistoryEntry, error) {
-	raws := allData(res, "revisionHistoryEntry")
-	out := make([]HistoryEntry, 0, len(raws))
-	for _, raw := range raws {
-		var wire struct {
-			Revision       string   `json:"revision"`
-			RevisionNumber int      `json:"revisionNumber"`
-			Parent         []string `json:"parent"`
+	var out []HistoryEntry
+	for _, ln := range res.StdoutParse.Lines {
+		switch ln.TagName {
+		case "revisionHistoryEntry":
+			var wire struct {
+				Revision       string   `json:"revision"`
+				RevisionNumber int      `json:"revisionNumber"`
+				Parent         []string `json:"parent"`
+			}
+			if err := json.Unmarshal(ln.Data, &wire); err != nil || wire.Revision == "" {
+				return nil, fmt.Errorf("%w: revisionHistoryEntry did not match the captured fields", ErrOutput)
+			}
+			out = append(out, HistoryEntry{
+				Revision:       wire.Revision,
+				RevisionNumber: wire.RevisionNumber,
+				Parent:         wire.Parent,
+				Metadata:       map[string]string{},
+				Raw:            append(json.RawMessage(nil), ln.Data...),
+			})
+		case "metadata":
+			if len(out) == 0 {
+				continue
+			}
+			k, v, num, hasNum, ok := decodeMetadataLine(ln.Data)
+			if !ok {
+				continue
+			}
+			cur := &out[len(out)-1]
+			cur.Metadata[k] = v
+			if k == "timestamp" && hasNum {
+				cur.TimestampUnixMS = num
+			}
 		}
-		if err := json.Unmarshal(raw, &wire); err != nil || wire.Revision == "" {
-			return nil, fmt.Errorf("%w: revisionHistoryEntry did not match the captured fields", ErrOutput)
-		}
-		out = append(out, HistoryEntry{
-			Revision: wire.Revision, RevisionNumber: wire.RevisionNumber, Parent: wire.Parent,
-			Raw: append(json.RawMessage(nil), raw...),
-		})
 	}
 	return out, nil
+}
+
+func decodeMetadataLine(raw json.RawMessage) (key, val string, num int64, hasNum, ok bool) {
+	var wire struct {
+		Key   string `json:"key"`
+		Value struct {
+			TagName string          `json:"tagName"`
+			Data    json.RawMessage `json:"data"`
+		} `json:"value"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &wire) != nil || wire.Key == "" {
+		return "", "", 0, false, false
+	}
+	switch wire.Value.TagName {
+	case "numeric":
+		var n int64
+		if json.Unmarshal(wire.Value.Data, &n) == nil {
+			return wire.Key, fmt.Sprintf("%d", n), n, true, true
+		}
+		var u uint64
+		if json.Unmarshal(wire.Value.Data, &u) == nil {
+			return wire.Key, fmt.Sprintf("%d", u), int64(u), true, true
+		}
+	default:
+		var s string
+		if json.Unmarshal(wire.Value.Data, &s) == nil {
+			return wire.Key, s, 0, false, true
+		}
+	}
+	return wire.Key, string(bytes.TrimSpace(wire.Value.Data)), 0, false, true
 }
 
 func decodeBranches(res loreexec.CommandResult) ([]Branch, error) {
@@ -135,15 +212,76 @@ func decodeBranches(res loreexec.CommandResult) ([]Branch, error) {
 			ID        string `json:"id"`
 			Name      string `json:"name"`
 			Latest    string `json:"latest"`
+			Location  string `json:"location"`
+			Creator   string `json:"creator"`
+			Created   int64  `json:"created"`
 			IsCurrent bit    `json:"isCurrent"`
+			Archived  bit    `json:"archived"`
 		}
 		if err := json.Unmarshal(raw, &wire); err != nil || wire.Name == "" {
 			return nil, fmt.Errorf("%w: branchListEntry did not match the source struct", ErrVerify)
 		}
 		out = append(out, Branch{
-			ID: wire.ID, Name: wire.Name, Latest: wire.Latest, IsCurrent: bool(wire.IsCurrent),
+			ID: wire.ID, Name: wire.Name, Latest: wire.Latest,
+			Location: wire.Location, Creator: wire.Creator, CreatedUnixMS: wire.Created,
+			IsCurrent: bool(wire.IsCurrent), Archived: bool(wire.Archived),
 			Raw: append(json.RawMessage(nil), raw...),
 		})
+	}
+	return out, nil
+}
+
+func decodeRevisionDetail(res loreexec.CommandResult) (RevisionDetail, error) {
+	var out RevisionDetail
+	out.Metadata = map[string]string{}
+	sawInfo := false
+	for _, ln := range res.StdoutParse.Lines {
+		switch ln.TagName {
+		case "revisionInfo":
+			var wire struct {
+				Repository     string   `json:"repository"`
+				Revision       string   `json:"revision"`
+				RevisionNumber int      `json:"revisionNumber"`
+				Parent         []string `json:"parent"`
+			}
+			if err := json.Unmarshal(ln.Data, &wire); err != nil || wire.Revision == "" {
+				return RevisionDetail{}, fmt.Errorf("%w: revisionInfo decode failed", ErrOutput)
+			}
+			out.RepositoryID = wire.Repository
+			out.Revision = wire.Revision
+			out.RevisionNumber = wire.RevisionNumber
+			out.Parent = wire.Parent
+			sawInfo = true
+		case "metadata":
+			k, v, num, hasNum, ok := decodeMetadataLine(ln.Data)
+			if !ok {
+				continue
+			}
+			out.Metadata[k] = v
+			if k == "timestamp" && hasNum {
+				out.TimestampUnixMS = num
+			}
+		case "revisionInfoDelta":
+			var wire struct {
+				Path       string `json:"path"`
+				FromPath   string `json:"fromPath"`
+				Size       uint64 `json:"size"`
+				Action     string `json:"action"`
+				FlagModify bit    `json:"flagModify"`
+				FlagMerged bit    `json:"flagMerged"`
+				FlagFile   bit    `json:"flagFile"`
+			}
+			if err := json.Unmarshal(ln.Data, &wire); err != nil {
+				return RevisionDetail{}, fmt.Errorf("%w: revisionInfoDelta decode failed", ErrOutput)
+			}
+			out.Deltas = append(out.Deltas, FileDelta{
+				Path: wire.Path, FromPath: wire.FromPath, Size: wire.Size, Action: wire.Action,
+				FlagModify: bool(wire.FlagModify), FlagMerged: bool(wire.FlagMerged), FlagFile: bool(wire.FlagFile),
+			})
+		}
+	}
+	if !sawInfo {
+		return RevisionDetail{}, fmt.Errorf("%w: revisionInfo missing", ErrOutput)
 	}
 	return out, nil
 }

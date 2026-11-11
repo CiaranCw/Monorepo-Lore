@@ -683,7 +683,8 @@ func readComplete(data json.RawMessage) (status, code int, message string, hasEr
 func trailingAuthNoise(msg string) bool {
 	return strings.Contains(msg, "authentication requires a configured auth endpoint") ||
 		strings.Contains(msg, "Disconnected from server") ||
-		strings.Contains(msg, "resolving auth endpoint from remote")
+		strings.Contains(msg, "resolving auth endpoint from remote") ||
+		strings.Contains(msg, "No remote configured")
 }
 
 func nothingStaged(res loreexec.CommandResult) bool {

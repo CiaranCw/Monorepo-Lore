@@ -41,7 +41,7 @@ func run(args []string) int {
 		}
 		fmt.Fprintln(stdout, "logged in")
 		return 0
-	case "logout", "project", "module", "clone", "status", "sync", "commit", "push", "publish":
+	case "logout", "project", "module", "clone", "status", "sync", "commit", "push", "publish", "history", "refs", "show", "import":
 		if err := dispatch(args); err != nil {
 			fmt.Fprintln(stderr, err.Error())
 			return 1
@@ -228,6 +228,11 @@ Usage:
   lore-mono commit <module> --message text [--config file] [--root dir]
   lore-mono push --all [--config file] [--root dir]
   lore-mono push <module> [--config file] [--root dir]
+  lore-mono history [module|--all] [--project name] [--branch b] [--tag t] [--author a] [--search q] [--limit n] [--cursor c] [--all-pages]
+  lore-mono refs <module> [--type branch|tag] [--config file]
+  lore-mono show <module> <commit-or-revision> [--config file]
+  lore-mono import --manifest file [--dry-run] [--on-conflict policy] [--config file]
+  lore-mono import --source url --module name [--mount path] [--token-env VAR] [--ssh-key file] [--dry-run]
   lore-mono publish [--config file] --parent dir [--module name=dir]
   lore-mono help
 

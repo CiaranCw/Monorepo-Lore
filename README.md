@@ -29,7 +29,9 @@ The gateway forwards HTTP/2. It does not decide repository access. AuthBridge do
 
 - Username and password login, then a Lore identity token stored by the Lore CLI.
 - Projects, modules, membership, and per-module read or write grants.
-- `lore-mono` commands for login, project selection, module list, clone, status, sync, commit, push, and publish.
+- `lore-mono` commands for login, project selection, module list, clone, status, sync, commit, push, history, refs, show, import, and publish.
+- Complete per-module commit DAG indexing (all branches, tags, and merge parents without truncation) and permission-filtered monorepo aggregated commit timelines with keyset cursor pagination.
+- Single and batch external Git repository import (GitHub, Gitee, GitLab, Gongfeng, and generic Git) preserving commit DAG topology, branches, tags, original authorship/timestamps, and Git LFS / submodule metadata, with dry-run, checkpoint resume, failure isolation, and post-import digest verification.
 - Batch commands run one Lore process per authorized module and print a per-module result plus a summary.
 - A client `ca_file` is passed to Lore child processes as `SSL_CERT_FILE`. It is not written into the parent process environment.
 

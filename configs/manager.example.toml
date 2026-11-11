@@ -32,3 +32,9 @@ access_ttl = "5m"
 private_key = "data/keys/identity-active.pem"
 public_key = "data/keys/identity-active.pub.pem"
 jwks = "data/keys/jwks.json"
+
+# Optional server-side external Git import workspace.
+# [import]
+# workspace = "data/imports"
+# git_binary = "git"
+# remote_base_url = "grpcs://lore-host.internal:53747"

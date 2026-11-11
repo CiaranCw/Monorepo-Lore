@@ -46,6 +46,14 @@ type Config struct {
 	LogFormat       string
 	Auth            Auth
 	Publish         Publish
+	Import          Import
+}
+
+// Import configures external Git repository batch importing.
+type Import struct {
+	Workspace     string
+	GitBinary     string
+	RemoteBaseURL string
 }
 
 // Publish is the server-side snapshot publisher. Empty Workspace leaves it unmounted.
@@ -106,6 +114,11 @@ type fileConfig struct {
 		AuthPath  string `toml:"auth_path"`
 		CAFile    string `toml:"ca_file"`
 	} `toml:"publish"`
+	Import struct {
+		Workspace     string `toml:"workspace"`
+		GitBinary     string `toml:"git_binary"`
+		RemoteBaseURL string `toml:"remote_base_url"`
+	} `toml:"import"`
 }
 
 // Load reads path and validates it. Missing files and malformed TOML are errors.
@@ -149,6 +162,11 @@ func Load(path string) (Config, error) {
 			AuthStore: strings.TrimSpace(raw.Publish.AuthStore),
 			AuthPath:  strings.TrimSpace(raw.Publish.AuthPath),
 			CAFile:    strings.TrimSpace(raw.Publish.CAFile),
+		},
+		Import: Import{
+			Workspace:     strings.TrimSpace(raw.Import.Workspace),
+			GitBinary:     strings.TrimSpace(raw.Import.GitBinary),
+			RemoteBaseURL: strings.TrimSpace(raw.Import.RemoteBaseURL),
 		},
 	}
 	if cfg.Listen == "" {
@@ -205,6 +223,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Publish.CAFile != "" {
 		cfg.Publish.CAFile = resolve(base, cfg.Publish.CAFile)
+	}
+	if cfg.Import.Workspace != "" {
+		cfg.Import.Workspace = resolve(base, cfg.Import.Workspace)
 	}
 	cfg.Auth.PrivateKey = resolve(base, cfg.Auth.PrivateKey)
 	cfg.Auth.PublicKey = resolve(base, cfg.Auth.PublicKey)

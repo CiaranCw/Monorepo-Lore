@@ -63,6 +63,21 @@ func validateName(name string) error {
 	return nil
 }
 
+// validateBranchName accepts standard Git/Lore branch names including slash
+// hierarchies such as feature/login or release/v1.0, while rejecting flags,
+// path traversal, empty segments, and whitespace/control characters.
+func validateBranchName(name string) error {
+	if name == "" || len(name) > 255 || strings.HasPrefix(name, "-") || strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || strings.Contains(name, "..") || strings.Contains(name, "//") {
+		return fmt.Errorf("%w: branch name %q", ErrInvalid, name)
+	}
+	for _, r := range name {
+		if r <= 0x20 || r == 0x7f || r == '\\' || r == '~' || r == '^' || r == ':' || r == '?' || r == '*' || r == '[' {
+			return fmt.Errorf("%w: branch name %q", ErrInvalid, name)
+		}
+	}
+	return nil
+}
+
 func validateLinkPath(p string) error {
 	if p == "" || strings.HasPrefix(p, "-") || strings.HasPrefix(p, "/") || strings.ContainsAny(p, "\\\r\n") {
 		return fmt.Errorf("%w: link path", ErrInvalid)

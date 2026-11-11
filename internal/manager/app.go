@@ -17,6 +17,7 @@ import (
 	"lore-monorepo/internal/authbridge"
 	"lore-monorepo/internal/config"
 	"lore-monorepo/internal/database"
+	"lore-monorepo/internal/gitimport"
 	"lore-monorepo/internal/logging"
 	"lore-monorepo/internal/loreadapter"
 	"lore-monorepo/internal/loreexec"
@@ -54,6 +55,7 @@ type App struct {
 	PublishDriver publish.Driver
 	PublishLore   *loreadapter.Client
 	PublishRoot   string
+	Importer      *gitimport.Importer
 	HTTP          *http.Server
 	grpcSrv       *grpc.Server
 
@@ -110,6 +112,15 @@ func New(cfg config.Config, log *logging.Logger) (*App, error) {
 		Timeout: cfg.CommandTimeout,
 		Env:     envOrNil,
 	}}
+	loreClient := &loreadapter.Client{Exec: exec, Env: envOrNil}
+	importWorkspace := cfg.Import.Workspace
+	if importWorkspace == "" {
+		importWorkspace = filepath.Join(filepath.Dir(cfg.DatabasePath), "imports")
+	}
+	gitBin := cfg.Import.GitBinary
+	if gitBin == "" {
+		gitBin = "git"
+	}
 	app := &App{
 		Config:   cfg,
 		Log:      log,
@@ -117,8 +128,15 @@ func New(cfg config.Config, log *logging.Logger) (*App, error) {
 		Users:    &UserStore{DB: db},
 		Projects: &ProjectStore{DB: db},
 		Exec:     exec,
-		Lore:     &loreadapter.Client{Exec: exec},
+		Lore:     loreClient,
 		Tokens:   tokens,
+		Importer: &gitimport.Importer{
+			DB:            db,
+			Lore:          loreClient,
+			GitBinary:     gitBin,
+			WorkspaceRoot: importWorkspace,
+			RemoteBaseURL: cfg.Import.RemoteBaseURL,
+		},
 	}
 	app.Bridge = authbridge.New(
 		authbridge.UserDirectory{Get: app.userByID},

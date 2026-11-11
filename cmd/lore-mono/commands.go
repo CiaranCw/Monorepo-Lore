@@ -36,6 +36,14 @@ func dispatch(args []string) error {
 		return batchAction("push", args[1:])
 	case "publish":
 		return publishCmd(args[1:])
+	case "history":
+		return historyCmd(args[1:])
+	case "refs":
+		return refsCmd(args[1:])
+	case "show":
+		return showCmd(args[1:])
+	case "import":
+		return importCmd(args[1:])
 	default:
 		return fmt.Errorf("unknown command")
 	}

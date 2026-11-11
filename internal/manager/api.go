@@ -114,6 +114,14 @@ func (a *App) projects(w http.ResponseWriter, r *http.Request, actor *user.User,
 			a.projectStatus(w, r, actor, p)
 			return
 		}
+	case "history":
+		if len(rest) == 2 {
+			a.projectHistory(w, r, actor, p)
+			return
+		}
+	case "imports":
+		a.projectImports(w, r, actor, p, rest[2:])
+		return
 	}
 	writeError(w, http.StatusNotFound, "not found")
 }
@@ -159,6 +167,18 @@ func (a *App) modules(w http.ResponseWriter, r *http.Request, actor *user.User, 
 	}
 	if len(rest) >= 2 && rest[1] == "permissions" {
 		a.modulePermissions(w, r, actor, m, rest[2:])
+		return
+	}
+	if len(rest) >= 2 && rest[1] == "history" {
+		a.moduleHistoryRoutes(w, r, actor, m, rest[2:])
+		return
+	}
+	if len(rest) >= 2 && rest[1] == "commits" {
+		a.moduleCommitDetail(w, r, actor, m, rest[2:])
+		return
+	}
+	if len(rest) >= 2 && rest[1] == "refs" {
+		a.moduleRefsRoute(w, r, actor, m, rest[2:])
 		return
 	}
 	writeError(w, http.StatusNotFound, "not found")

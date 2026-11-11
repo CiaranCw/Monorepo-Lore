@@ -65,6 +65,9 @@ func run(args []string) int {
 		app.PublishDriver = drv
 		app.PublishLore = lore
 		app.PublishRoot = cfg.Publish.Workspace
+		if app.Importer != nil {
+			app.Importer.Lore = lore
+		}
 	}
 	ctx, cancel := manager.NotifyContext(context.Background())
 	defer cancel()
