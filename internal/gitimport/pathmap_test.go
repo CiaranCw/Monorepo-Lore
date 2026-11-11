@@ -201,6 +201,28 @@ func TestFileMappingDoesNotImportWholePackage(t *testing.T) {
 	}
 }
 
+func TestSeedConfiguredLFSCacheLinksObjects(t *testing.T) {
+	cache := t.TempDir()
+	oid := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	src := filepath.Join(cache, "objects", oid[:2], oid[2:4], oid)
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("lfs-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mirror := t.TempDir()
+	t.Setenv("LORE_IMPORT_LFS_CACHE", cache)
+	if !seedConfiguredLFSCache(mirror) {
+		t.Fatal("cache was not seeded")
+	}
+	dst := filepath.Join(mirror, "lfs", "objects", oid[:2], oid[2:4], oid)
+	body, err := os.ReadFile(dst)
+	if err != nil || string(body) != "lfs-bytes" {
+		t.Fatalf("seeded object missing: %v %q", err, body)
+	}
+}
+
 func TestDeletedGameDoesNotCreateModuleHistory(t *testing.T) {
 	ctx := context.Background()
 	gitBin := findRealGit(t)

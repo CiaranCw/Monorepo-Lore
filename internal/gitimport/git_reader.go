@@ -309,6 +309,9 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 // treating the presence of one stale/partial object as complete hydration.
 func FetchLFSObjects(ctx context.Context, gitBin, sourceURL, mirrorDir string, extraEnv, secrets []string) (attempted, complete bool, err error) {
 	copyLocalLFSObjects(sourceURL, mirrorDir)
+	if seedConfiguredLFSCache(mirrorDir) {
+		return true, hasAnyLocalLFSObjects(mirrorDir), nil
+	}
 	if _, verErr := runGit(ctx, gitBin, "", nil, nil, "lfs", "version"); verErr != nil {
 		return false, hasAnyLocalLFSObjects(mirrorDir), nil
 	}
@@ -375,6 +378,40 @@ func copyLocalLFSObjects(sourceURL, mirrorDir string) {
 			})
 		}
 	}
+}
+
+// seedConfiguredLFSCache links objects from LORE_IMPORT_LFS_CACHE into the
+// mirror's lfs/objects directory. It lets hydrate verify a pre-checked cache
+// without a network fetch. Existing mirror objects are left unchanged.
+func seedConfiguredLFSCache(mirrorDir string) bool {
+	cache := strings.TrimSpace(os.Getenv("LORE_IMPORT_LFS_CACHE"))
+	if cache == "" {
+		return false
+	}
+	src := filepath.Join(cache, "objects")
+	if st, err := os.Stat(src); err != nil || !st.IsDir() {
+		src = cache
+	}
+	_ = filepath.Walk(src, func(p string, info os.FileInfo, wErr error) error {
+		if wErr != nil || info == nil || info.IsDir() || len(info.Name()) != 64 {
+			return nil
+		}
+		name := info.Name()
+		dst := filepath.Join(mirrorDir, "lfs", "objects", name[:2], name[2:4], name)
+		if _, err := os.Stat(dst); err == nil {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return nil
+		}
+		if err := os.Link(p, dst); err != nil {
+			if data, rErr := os.ReadFile(p); rErr == nil {
+				_ = os.WriteFile(dst, data, 0o644)
+			}
+		}
+		return nil
+	})
+	return true
 }
 
 func hasAnyLocalLFSObjects(mirrorDir string) bool {
