@@ -294,22 +294,37 @@ func SyncBareMirror(ctx context.Context, gitBin, sourceURL, mirrorDir, lfsMode s
 	copySourceShallowMarkerIfPresent(sourceURL, mirrorDir)
 
 	if lfsMode == LFSModeHydrate || lfsMode == LFSModeAuto {
-		copyLocalLFSObjects(sourceURL, mirrorDir)
-		if _, verErr := runGit(ctx, gitBin, "", nil, nil, "lfs", "version"); verErr == nil {
-			lfsAttempted = true
-			var lfsArgs []string
-			if isNetworkGitURL(sourceURL) {
-				lfsArgs = append(lfsArgs, "-c", "protocol.file.allow=never")
-			}
-			lfsArgs = append(lfsArgs, "lfs", "fetch", "--all", "origin")
-			if _, lfsErr := runGit(ctx, gitBin, mirrorDir, extraEnv, secrets, lfsArgs...); lfsErr == nil {
-				lfsOK = true
-			} else if hasAnyLocalLFSObjects(mirrorDir) {
-				lfsOK = true
-			}
+		lfsAttempted, lfsOK, err = FetchLFSObjects(ctx, gitBin, sourceURL, mirrorDir, extraEnv, secrets)
+		if err != nil {
+			return lfsAttempted, false, err
 		}
 	}
 	return lfsAttempted, lfsOK, nil
+}
+
+// FetchLFSObjects refreshes LFS content for hydrate mode. Fetch/plugin failure
+// is reported through complete=false, then every referenced object is still
+// verified pointer-by-pointer by InspectExpectedSpecialObjects/materialization.
+// This lets repositories without LFS work when git-lfs is absent while never
+// treating the presence of one stale/partial object as complete hydration.
+func FetchLFSObjects(ctx context.Context, gitBin, sourceURL, mirrorDir string, extraEnv, secrets []string) (attempted, complete bool, err error) {
+	copyLocalLFSObjects(sourceURL, mirrorDir)
+	if _, verErr := runGit(ctx, gitBin, "", nil, nil, "lfs", "version"); verErr != nil {
+		return false, hasAnyLocalLFSObjects(mirrorDir), nil
+	}
+
+	attempted = true
+	var lfsArgs []string
+	if isNetworkGitURL(sourceURL) {
+		lfsArgs = append(lfsArgs, "-c", "protocol.file.allow=never")
+	}
+	lfsArgs = append(lfsArgs, "lfs", "fetch", "--all", "origin")
+	if _, lfsErr := runGit(ctx, gitBin, mirrorDir, extraEnv, secrets, lfsArgs...); lfsErr != nil {
+		// Keep fetch failure non-fatal here: exhaustive pointer verification is
+		// the acceptance gate, and pinned resume will retry this fetch.
+		return true, false, nil
+	}
+	return true, true, nil
 }
 
 func copySourceShallowMarkerIfPresent(sourceURL, mirrorDir string) {

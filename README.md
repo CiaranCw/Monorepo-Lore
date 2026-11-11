@@ -48,6 +48,7 @@ A user sees only modules with an explicit grant. The same module name in two pro
 A snapshot is the set of module revisions captured at one moment. Later module commits do not change that set. One project publishes at a time. If Lore already contains that publish, recovery records success instead of pushing again. A publish that cannot be matched to a remote commit is left for a person to review.
 
 The Manager process mounts this publisher only when `[publish]` is configured with a workspace and a service-account credential path.
+`lore-mono publish` sends only the selected project and message; callers cannot supply server parent/module paths. The Manager prepares project-scoped workspaces before invoking the service identity.
 
 ## TLS gateway
 

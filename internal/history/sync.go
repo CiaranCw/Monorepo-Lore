@@ -302,7 +302,7 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 	if err != nil {
 		return stats, err
 	}
-	existingBranchNames, existingDefaultBranch, bootstrapMainRev, err := loadExistingBranchState(ctx, db, moduleID)
+	existingBranchNames, originalBranchTips, existingDefaultBranch, bootstrapMainRev, err := loadExistingBranchState(ctx, db, moduleID)
 	if err != nil {
 		return stats, err
 	}
@@ -542,13 +542,14 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 					moduleID, b.Latest).Scan(&srcCommit)
 			}
 			if err := UpsertRef(ctx, tx, RefDetail{
-				ModuleID:       moduleID,
-				Type:           "branch",
-				Name:           b.Name,
-				LoreRevision:   b.Latest,
-				SourceCommitID: srcCommit,
-				LoreBranchID:   b.ID,
-				IsDefault:      b.Name == defaultBranch,
+				ModuleID:               moduleID,
+				Type:                   "branch",
+				Name:                   b.Name,
+				LoreRevision:           b.Latest,
+				SourceCommitID:         srcCommit,
+				OriginalSourceCommitID: originalBranchTips[b.Name],
+				LoreBranchID:           b.ID,
+				IsDefault:              b.Name == defaultBranch,
 			}); err != nil {
 				return err
 			}
@@ -559,26 +560,28 @@ func SyncModuleFromLore(ctx context.Context, db *sql.DB, client *loreadapter.Cli
 	return stats, err
 }
 
-func loadExistingBranchState(ctx context.Context, db *sql.DB, moduleID int64) (names map[string]bool, defaultBranch, bootstrapMainRev string, err error) {
+func loadExistingBranchState(ctx context.Context, db *sql.DB, moduleID int64) (names map[string]bool, originalTips map[string]string, defaultBranch, bootstrapMainRev string, err error) {
 	names = map[string]bool{}
-	rows, err := db.QueryContext(ctx, `SELECT ref_name, is_default FROM module_refs WHERE module_id=? AND ref_type='branch'`, moduleID)
+	originalTips = map[string]string{}
+	rows, err := db.QueryContext(ctx, `SELECT ref_name, is_default, original_source_commit_id FROM module_refs WHERE module_id=? AND ref_type='branch'`, moduleID)
 	if err != nil {
-		return nil, "", "", err
+		return nil, nil, "", "", err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var name string
+		var name, original string
 		var isDef int
-		if err := rows.Scan(&name, &isDef); err != nil {
-			return nil, "", "", err
+		if err := rows.Scan(&name, &isDef, &original); err != nil {
+			return nil, nil, "", "", err
 		}
 		names[name] = true
+		originalTips[name] = original
 		if isDef == 1 && defaultBranch == "" {
 			defaultBranch = name
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", "", err
+		return nil, nil, "", "", err
 	}
 	_ = db.QueryRowContext(ctx, `
 		SELECT COALESCE(bootstrap_main_rev,'')
@@ -586,7 +589,7 @@ func loadExistingBranchState(ctx context.Context, db *sql.DB, moduleID int64) (n
 		WHERE module_id=? AND bootstrap_main_rev <> ''
 		ORDER BY item_id DESC LIMIT 1
 	`, moduleID).Scan(&bootstrapMainRev)
-	return names, defaultBranch, bootstrapMainRev, nil
+	return names, originalTips, defaultBranch, bootstrapMainRev, nil
 }
 
 func loadDanglingParentRevisions(ctx context.Context, db *sql.DB, moduleID int64) ([]string, error) {

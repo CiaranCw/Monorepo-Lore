@@ -171,6 +171,49 @@ func TestLoreEnvKeepsCAOutOfProcess(t *testing.T) {
 	}
 }
 
+func TestPublishNeverSendsCallerControlledServerPaths(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/projects/Alpha/publish" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"operation_id":1}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "client.toml")
+	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: "lore", Project: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	prevExec := execRun
+	execRun = func(_ context.Context, _ string, req loreexec.Request) (loreexec.CommandResult, error) {
+		if len(req.Argv) > 0 && req.Argv[0] == "auth" {
+			return loreexec.CommandResult{ExitCode: 0, Stdout: "Token: token-value\n"}, nil
+		}
+		return loreexec.CommandResult{ExitCode: 0}, nil
+	}
+	defer func() { execRun = prevExec }()
+	prevOut := stdout
+	stdout = &bytes.Buffer{}
+	defer func() { stdout = prevOut }()
+
+	if err := publishCmd([]string{"--parent", "other-project", "--config", cfgPath}); err == nil {
+		t.Fatal("legacy caller-controlled --parent path must be rejected")
+	}
+	if err := publishCmd([]string{"--config", cfgPath}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["parent_dir"]; ok {
+		t.Fatalf("publish request leaked parent_dir: %v", body)
+	}
+	if _, ok := body["module_dirs"]; ok {
+		t.Fatalf("publish request leaked module_dirs: %v", body)
+	}
+}
+
 func TestCloneFailureRemovesWorkspace(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"modules":[{"ProjectName":"Alpha","Name":"Engine","MountPath":"Engine","RepositoryURL":"grpc://127.0.0.1:53547/engine","Permission":"write"}]}`))

@@ -174,7 +174,7 @@ func (p Publisher) recoverOne(ctx context.Context, id, projectID int64, raw, ste
 		}
 		return p.finish(ctx, id, "failed", ErrNeedsHuman.Error()+": "+err.Error())
 	}
-	if found && pinsMatch(man.Pins, pins) {
+	if found && pinsExact(man.Pins, pins) {
 		man.ParentResultRevision = rev
 		body, _ := json.Marshal(man)
 		if _, err := p.DB.ExecContext(ctx, `UPDATE operations SET request_json=? WHERE operation_id=?`, string(body), id); err != nil {
@@ -391,7 +391,7 @@ func (p Publisher) pins(ctx context.Context, req Request, mods []moduleRow) ([]P
 			return nil, err
 		}
 		if rev == "" || strings.Trim(rev, "0") == "" {
-			continue
+			return nil, fmt.Errorf("publish: active module %s has no capturable revision", m.Name)
 		}
 		out = append(out, Pin{Name: m.Name, MountPath: m.Mount, RepositoryID: m.RepositoryID, RepositoryURL: m.RepositoryURL, Revision: rev})
 	}

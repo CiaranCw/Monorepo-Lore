@@ -161,13 +161,34 @@ func TestLFSHydrationPointerHonestyAndIntegrity(t *testing.T) {
 	imp, _ := newReadinessImporter(t, tmp, "LFSProject")
 	gitBin := imp.GitBinary
 
-	missingRepo, _, _ := createLFSPointerRepo(t, gitBin, filepath.Join(tmp, "lfs-missing"), false, false)
-	strictMissing, err := imp.Run(ctx, "carol", Manifest{
+	missingRepo, missingOID, missingPayload := createLFSPointerRepo(t, gitBin, filepath.Join(tmp, "lfs-missing"), false, false)
+	missingManifest := Manifest{
 		JobKey: "lfs-missing", Project: "LFSProject",
-		Repositories: []RepoSpec{{SourceURL: missingRepo, ModuleName: "Missing", MountPath: "Missing", LFSMode: LFSModeHydrate}},
-	})
+		Repositories: []RepoSpec{{
+			SourceURL: missingRepo, ModuleName: "Missing", MountPath: "Missing",
+			LFSMode: LFSModeHydrate, ConflictPolicy: ConflictResume,
+		}},
+	}
+	strictMissing, err := imp.Run(ctx, "carol", missingManifest)
 	if err != nil || strictMissing.Status != "failed" || !strings.Contains(strictMissing.Items[0].Error, ErrLFSHydrationFailed.Error()) {
 		t.Fatalf("strict hydrate with missing object must fail: %+v err=%v", strictMissing, err)
+	}
+	missingObjectDir := filepath.Join(missingRepo, ".git", "lfs", "objects", missingOID[:2], missingOID[2:4])
+	_ = os.MkdirAll(missingObjectDir, 0o755)
+	_ = os.WriteFile(filepath.Join(missingObjectDir, missingOID), missingPayload, 0o644)
+	resumedMissing, err := imp.Run(ctx, "carol", missingManifest)
+	if err != nil || resumedMissing.Status != "succeeded" || !resumedMissing.Items[0].Verification.Passed {
+		t.Fatalf("pinned resume did not refresh newly available LFS objects: %+v err=%v", resumedMissing, err)
+	}
+
+	dryMissingRepo, _, _ := createLFSPointerRepo(t, gitBin, filepath.Join(tmp, "lfs-dry-missing"), false, false)
+	dryMissing, err := imp.Run(ctx, "carol", Manifest{
+		JobKey: "lfs-dry-missing", Project: "LFSProject", DryRun: true,
+		Repositories: []RepoSpec{{SourceURL: dryMissingRepo, ModuleName: "DryMissing", MountPath: "DryMissing", LFSMode: LFSModeHydrate}},
+	})
+	if err != nil || dryMissing.Status != "failed" || dryMissing.Items[0].Verification.Passed ||
+		!dryMissing.Items[0].Verification.PreflightOnly || !strings.Contains(dryMissing.Items[0].Error, ErrLFSHydrationFailed.Error()) {
+		t.Fatalf("dry-run must detect missing LFS content: %+v err=%v", dryMissing, err)
 	}
 
 	pointerRepo, pointerOID, _ := createLFSPointerRepo(t, gitBin, filepath.Join(tmp, "lfs-pointer"), false, false)
@@ -221,6 +242,48 @@ func TestLFSHydrationPointerHonestyAndIntegrity(t *testing.T) {
 	}
 }
 
+func TestSharedMonorepoMirrorUsesStrictestLFSMode(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	imp, _ := newReadinessImporter(t, tmp, "SharedLFSProject")
+	src := filepath.Join(tmp, "shared-lfs-source")
+	_ = os.MkdirAll(filepath.Join(src, "PointerModule"), 0o755)
+	_ = os.MkdirAll(filepath.Join(src, "HydratedModule"), 0o755)
+	g := gitExecHelper{t: t, bin: imp.GitBinary, dir: src}
+	g.run(nil, "init", "-b", "main")
+	payload := []byte("shared-monorepo-lfs-content")
+	sum := sha256.Sum256(payload)
+	oid := hex.EncodeToString(sum[:])
+	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, len(payload))
+	_ = os.WriteFile(filepath.Join(src, "PointerModule", "asset.bin"), []byte(pointer), 0o644)
+	_ = os.WriteFile(filepath.Join(src, "HydratedModule", "asset.bin"), []byte(pointer), 0o644)
+	g.run(nil, "add", ".")
+	_ = g.commitAs("LFS Dev", "lfs@example.com", "2025-07-02T00:00:00Z", "shared lfs object", false)
+	objDir := filepath.Join(src, ".git", "lfs", "objects", oid[:2], oid[2:4])
+	_ = os.MkdirAll(objDir, 0o755)
+	_ = os.WriteFile(filepath.Join(objDir, oid), payload, 0o644)
+
+	result, err := imp.Run(ctx, "carol", Manifest{
+		JobKey: "shared-lfs-modes", Project: "SharedLFSProject", Concurrency: 2,
+		Repositories: []RepoSpec{
+			{SourceURL: src, SourceSubdir: "PointerModule", ModuleName: "PointerModule", MountPath: "PointerModule", LFSMode: LFSModePointer},
+			{SourceURL: src, SourceSubdir: "HydratedModule", ModuleName: "HydratedModule", MountPath: "HydratedModule", LFSMode: LFSModeHydrate},
+		},
+	})
+	if err != nil || result.Status != "succeeded" {
+		t.Fatalf("shared mirror mixed LFS modes failed: %+v err=%v", result, err)
+	}
+	byName := map[string]VerificationReport{}
+	for _, item := range result.Items {
+		byName[item.ModuleName] = item.Verification
+	}
+	if byName["PointerModule"].LFSHydrationStatus != "pointer_only_unhydrated" ||
+		byName["HydratedModule"].LFSHydrationStatus != "hydrated_verified" ||
+		!byName["HydratedModule"].Passed {
+		t.Fatalf("shared mirror did not honor strict hydrate sibling: %+v", byName)
+	}
+}
+
 func TestStrictGlobalPathClassificationAndPreModuleAliasPersistence(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -241,6 +304,22 @@ func TestStrictGlobalPathClassificationAndPreModuleAliasPersistence(t *testing.T
 	moduleSHA := g.commitAs("Future Dev", "future@example.com", "2025-08-02T00:00:00Z", "create Future module", false)
 
 	// Strict policy without a classification rule must block before module creation.
+	blockedDryRun, err := imp.Run(ctx, "carol", Manifest{
+		JobKey: "coverage-blocked-dry-run", Project: "CoverageProject", DryRun: true, GlobalFilesPolicy: GlobalPolicyStrict,
+		Repositories: []RepoSpec{{
+			SourceURL: src, SourceSubdir: "Future", ModuleName: "FutureDryRun", MountPath: "FutureDryRun",
+		}},
+	})
+	if err != nil || blockedDryRun.Status != "failed" || blockedDryRun.Items[0].Verification.Passed ||
+		!blockedDryRun.Items[0].Verification.PreflightOnly || !strings.Contains(blockedDryRun.Items[0].Error, ErrUnclassifiedGlobalPaths.Error()) {
+		t.Fatalf("dry-run must block unclassified global paths: %+v err=%v", blockedDryRun, err)
+	}
+	var dryMirrorPath string
+	_ = imp.DB.QueryRow(`SELECT git_mirror_path FROM import_job_items WHERE job_id=?`, blockedDryRun.JobID).Scan(&dryMirrorPath)
+	if _, statErr := os.Stat(dryMirrorPath); !os.IsNotExist(statErr) {
+		t.Fatalf("dry-run mirror was not isolated/disposed: path=%s err=%v", dryMirrorPath, statErr)
+	}
+
 	blocked, err := imp.Run(ctx, "carol", Manifest{
 		JobKey: "coverage-blocked", Project: "CoverageProject", GlobalFilesPolicy: GlobalPolicyStrict,
 		Repositories: []RepoSpec{{

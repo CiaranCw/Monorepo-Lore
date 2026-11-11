@@ -216,39 +216,7 @@ func statusCmd(args []string) error {
 }
 
 func publishCmd(args []string) error {
-	parent := ""
-	modules := map[string]string{}
-	var rest []string
-	for i := 0; i < len(args); i++ {
-		name, val, ok := splitFlag(args[i])
-		switch name {
-		case "--parent":
-			if !ok {
-				if i+1 >= len(args) {
-					return fmt.Errorf("missing parent")
-				}
-				i++
-				val = args[i]
-			}
-			parent = val
-		case "--module":
-			if !ok {
-				if i+1 >= len(args) {
-					return fmt.Errorf("missing module")
-				}
-				i++
-				val = args[i]
-			}
-			parts := strings.SplitN(val, "=", 2)
-			if len(parts) != 2 {
-				return fmt.Errorf("module must be name=dir")
-			}
-			modules[parts[0]] = parts[1]
-		default:
-			rest = append(rest, args[i])
-		}
-	}
-	cfg, err := loadCmd(rest)
+	cfg, err := loadCmd(args)
 	if err != nil {
 		return err
 	}
@@ -260,7 +228,7 @@ func publishCmd(args []string) error {
 		return err
 	}
 	defer wipe([]byte(token))
-	payload, _ := json.Marshal(map[string]any{"parent_dir": parent, "module_dirs": modules, "message": "publish module pins"})
+	payload, _ := json.Marshal(map[string]string{"message": "publish module pins"})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(cfg.ManagerURL, "/")+"/api/v1/projects/"+cfg.Project+"/publish", bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("publish failed")

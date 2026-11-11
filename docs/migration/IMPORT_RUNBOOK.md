@@ -59,12 +59,12 @@ Review:
 
 - detected platform and default branch;
 - standard branches/tags and advertised hidden refs;
+- full DAG traversal and any shallow/missing parents;
 - module/mount conflicts and four-state status (`ordinary`, `complete`, `partial`, `uncertain`);
-- shallow/missing parent warnings;
 - Monorepo `unmapped_paths`, `classified_excluded`, `classified_separate_module`, and `undecided_paths`;
-- LFS and submodule policies.
+- LFS OID/size availability and submodule registration policy.
 
-Dry-run must be `succeeded`/`planned`, with zero undecided paths in strict mode. Dry-run creates no module or Lore revision.
+Dry-run must be `succeeded`/`planned`, `verification.passed=true`, and have zero undecided paths in strict mode. It uses an isolated disposable mirror but creates no module or Lore revision. Its report is explicitly `preflight_only=true` and `full_content_migrated=false`; only formal import can assert that content was migrated.
 
 ## 5. Path ownership review
 
@@ -142,6 +142,7 @@ Run single and batch clone/status/sync/commit/push. Batch commit must produce on
 ## 11. Snapshot acceptance
 
 1. Capture and publish a snapshot using the publisher service identity.
+   The API and CLI accept no parent/module filesystem paths; the Manager always prepares project-scoped server workspaces.
 2. Clone the parent as publisher.
 3. Compare every Link Pin with captured module revisions.
 4. Clone each pinned historical module revision and verify content.

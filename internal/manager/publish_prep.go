@@ -12,7 +12,6 @@ import (
 	"lore-monorepo/internal/loreadapter"
 	"lore-monorepo/internal/loreexec"
 	"lore-monorepo/internal/project"
-	"lore-monorepo/internal/publish"
 )
 
 // prepareSnapshot clones the parent and each active module into the server
@@ -23,9 +22,6 @@ import (
 func (a *App) prepareSnapshot(ctx context.Context, p *project.Project) (string, map[string]string, error) {
 	if a.PublishLore == nil || a.PublishRoot == "" {
 		return "", nil, fmt.Errorf("publisher unavailable")
-	}
-	if drv, ok := a.PublishDriver.(*publish.LoreDriver); ok {
-		drv.ParentURL = p.ParentRepositoryURL
 	}
 	root := filepath.Join(a.PublishRoot, strconv.FormatInt(p.ID, 10))
 	if err := os.MkdirAll(root, 0o755); err != nil {

@@ -74,3 +74,15 @@ Lore 0.10.1 maps Manager `read` and `write` grants to repository access. A read-
 ### P2-5 — Access token revocation delay
 
 Access token TTL is five minutes. Grant revocation, account disable, or Manager shutdown affects new identity/token exchanges but does not instantly invalidate an already-issued token.
+
+### P2-6 — Snapshot recovery history window
+
+Lore recovery currently scans the latest 20 parent revisions for the operation marker. Pin comparison is exact, so an older operation is never falsely accepted, but it may be marked for human review instead of recovered automatically.
+
+### P2-7 — Historical byte verification depth
+
+The importer materializes every projected tree during replay and verifies metadata, ordered parents, aliases, refs, deltas, and special objects across the full history. The independent end-to-end byte digest comparison is performed for the default-branch HEAD; it is not a second full checkout-and-byte-digest pass for every historical revision.
+
+### P2-8 — Quarantine and archived remote repositories
+
+Snapshot protection currently detects a repository ID in stored pin JSON conservatively before destructive quarantine. Quarantine archives Manager metadata/workspace but does not delete the remote Lore repository. The publisher service identity continues to require archived repositories for historical Snapshot access.

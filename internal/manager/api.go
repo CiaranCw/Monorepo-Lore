@@ -548,9 +548,7 @@ func (a *App) publishProject(w http.ResponseWriter, r *http.Request, actor *user
 		return
 	}
 	var body struct {
-		ParentDir  string            `json:"parent_dir"`
-		ModuleDirs map[string]string `json:"module_dirs"`
-		Message    string            `json:"message"`
+		Message string `json:"message"`
 	}
 	if !decode(w, r, &body) {
 		return
@@ -559,16 +557,22 @@ func (a *App) publishProject(w http.ResponseWriter, r *http.Request, actor *user
 		writeError(w, http.StatusServiceUnavailable, "publisher unavailable")
 		return
 	}
-	parentDir, moduleDirs := body.ParentDir, body.ModuleDirs
-	if parentDir == "" {
-		var err error
-		parentDir, moduleDirs, err = a.prepareSnapshot(r.Context(), p)
-		if err != nil {
-			writeAPIError(w, err)
-			return
-		}
+	preparer := a.prepareSnapshot
+	if a.snapshotPreparer != nil {
+		preparer = a.snapshotPreparer
 	}
-	result, err := (publish.Publisher{DB: a.DB, Driver: a.PublishDriver}).Publish(r.Context(), publish.Request{
+	parentDir, moduleDirs, err := preparer(r.Context(), p)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	requestDriver := a.PublishDriver
+	if shared, ok := a.PublishDriver.(*publish.LoreDriver); ok {
+		scoped := *shared
+		scoped.ParentURL = p.ParentRepositoryURL
+		requestDriver = &scoped
+	}
+	result, err := (publish.Publisher{DB: a.DB, Driver: requestDriver}).Publish(r.Context(), publish.Request{
 		ProjectID: p.ID, ParentDir: parentDir, ModuleDirs: moduleDirs, Actor: actor.Username, Message: body.Message,
 	})
 	if err != nil {

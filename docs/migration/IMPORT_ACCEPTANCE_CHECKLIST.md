@@ -10,6 +10,7 @@ Record PASS / FAIL / NOT_RUN / UNKNOWN and attach evidence for every line. **Do 
 - [ ] All expected branch/tag heads are pinned in the reviewed manifest or Dry-run evidence.
 - [ ] Import did not report `ErrSourceMovedDuringFetch` or `ErrSourceMovedDuringResume`.
 - [ ] Hidden advertised refs reviewed; unavailable/unadvertised refs not claimed migrated.
+- [ ] Dry-run used an isolated mirror and reports `preflight_only=true`; it was not treated as completed migration.
 
 ## Mapping and content ownership
 

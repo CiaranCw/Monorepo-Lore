@@ -119,6 +119,7 @@ Reviewed API dispatch and permission service:
 - service identities receive not-found on human API;
 - Snapshot history filters pins by module grant;
 - user-status API cannot target service accounts, requires target membership, and refuses a global status change unless the actor administers every project the target belongs to.
+- publish callers cannot submit parent/module filesystem paths; only Manager-prepared project-scoped workspaces execute with the publisher service credential.
 
 Known limitation retained: Lore 0.10.1 read labels map to actual repository access and can push. Access tokens last five minutes; already-issued tokens are not instantly revoked.
 
@@ -146,6 +147,12 @@ Real Lore tests revalidated:
 | P1 | Submodule dependency state was recorded but acceptance policy was not explicit | `record_gitlink` vs `require_registered`, dependency report, no child-file materialization |
 | P1 | Operational backup/restore and module isolation rollback were documentation-only | `manager-ops` executable backup/verify/restore/audit/quarantine; non-mutating schema inspection plus missing-source, traversal, tamper, restore, transaction-rollback, and sibling-isolation tests |
 | P1 | Project admin user-status endpoint could target unrelated/service users or globally disable a user in another administrator's project | uniform not-found, human-kind/target-membership checks, and all-memberships administration guard |
+| P0 | Publish API accepted caller-supplied server paths while using the global publisher credential | removed path fields from API/CLI; Manager always creates project-ID-scoped server workspaces and request-scopes the Lore driver parent URL |
+| P1 | Lore history sync replaced a folded imported branch's raw source-tip provenance | sync reloads and preserves `original_source_commit_id`; regression covers publish/history-sync paths |
+| P1 | A pinned retry could reuse a partial LFS mirror without retrying fetch; mixed pointer/hydrate siblings raced on first mode | pinned resume always refreshes LFS, all referenced objects remain OID/size gates, and a shared source uses hydrate when any mapped module requires it |
+| P1 | Dry-run reported verification success after `ls-remote` only | isolated disposable mirror now performs ref pinning, full DAG/shallow checks, module projection, global-path classification, LFS verification, and submodule policy checks; result is explicitly preflight-only |
+| P1 | Parallel sibling-module registration could surface SQLite `BUSY` and partially fail an otherwise valid batch | project registration is serialized and retries transient writer contention; mixed-mode shared-Mirror stress regression runs repeatedly |
+| P2 | Recovery accepted extra parent links and active modules with no revision were omitted | recovery requires exact pin equality; an active module without a capturable revision blocks publication |
 | P2 | Lore has no native Tag entity | Manager compatibility Tag index; historical Lore target remains cloneable |
 | P2 | Lore has two physical parent slots | hidden synthetic bridges plus exact ordered N-parent Manager DAG |
 
@@ -194,13 +201,16 @@ Results:
 - Unicode/multiline metadata;
 - empty commits;
 - LFS hydrate/missing/corrupt/pointer semantics;
+- pinned LFS retry and mixed pointer/hydrate modules sharing one mirror;
 - submodule gitlinks and dependency reporting;
 - Monorepo split A–I;
 - alias restart persistence;
+- folded branch provenance across Lore history sync/Snapshot preparation;
 - source ref drift and pinned resume;
+- full Dry-run preflight for shallow DAGs, unclassified paths, and missing LFS objects;
 - interruption/checkpoint recovery;
 - concurrent job lock;
-- Snapshot Publisher regression;
+- Snapshot Publisher path-injection, exact-pin recovery, and empty-active-module regressions;
 - backup tamper detection, isolated restore, consistency audit, module-local quarantine.
 
 **NOT_RUN by design**:

@@ -657,7 +657,8 @@ func (im *Importer) verifyImportedModule(
 		uRows, uErr := im.DB.QueryContext(ctx, `
 			SELECT i.source_url, i.module_name FROM import_job_items i
 			JOIN import_jobs j ON j.job_id=i.job_id
-			WHERE j.project_id=? AND i.status='succeeded'
+			JOIN modules m ON m.module_id=i.module_id AND m.archived_at IS NULL
+			WHERE j.project_id=? AND i.module_id IS NOT NULL
 		`, projectID)
 		if uErr == nil {
 			for uRows.Next() {

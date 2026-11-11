@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,9 @@ var (
 
 	mirrorLocks sync.Map // map[string]*sync.Mutex
 	targetLocks sync.Map // map[string]*sync.Mutex
+	// SQLite permits one writer. Serialize the module-registration transaction
+	// per project while allowing mirror reads and Lore replay to stay parallel.
+	projectRegistrationLocks sync.Map // map[project-id]*sync.Mutex
 )
 
 const zeroHash64 = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -74,6 +79,7 @@ type SubmoduleDependency struct {
 // VerificationReport records the automated pre/post 3-layer integrity checks for one imported repository.
 type VerificationReport struct {
 	Passed                   bool                  `json:"passed"`
+	PreflightOnly            bool                  `json:"preflight_only,omitempty"`
 	FullContentMigrated      bool                  `json:"full_content_migrated"`
 	CoverageComplete         bool                  `json:"coverage_complete"`
 	SourceSubdir             string                `json:"source_subdir,omitempty"`
@@ -271,11 +277,20 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 	if alreadyDone {
 		return im.readJobResult(ctx, jobID, proj.Name)
 	}
+	if m.DryRun {
+		defer os.RemoveAll(filepath.Join(im.WorkspaceRoot, fmt.Sprintf("proj-%d", proj.ID), "dry-run", fmt.Sprintf("job-%d", jobID)))
+	}
 
 	siblingSubdirsByURL := map[string][]string{}
 	manifestModNames := map[string]bool{}
+	manifestModulesByURL := map[string]string{}
+	lfsModeByURL := map[string]string{}
 	for _, r := range m.Repositories {
 		manifestModNames[r.ModuleName] = true
+		manifestModulesByURL[strings.TrimSuffix(strings.ToLower(r.SourceURL), ".git")] = r.ModuleName
+		if lfsModeByURL[r.SourceURL] == "" || r.LFSMode == LFSModeHydrate {
+			lfsModeByURL[r.SourceURL] = r.LFSMode
+		}
 		if r.SourceSubdir != "" {
 			siblingSubdirsByURL[r.SourceURL] = append(siblingSubdirsByURL[r.SourceURL], r.SourceSubdir)
 		}
@@ -308,14 +323,17 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 			spec := m.Repositories[idx]
 			ms := mirrorStates[spec.SourceURL]
 			siblings := siblingSubdirsByURL[spec.SourceURL]
-			if m.DryRun {
-				results[idx] = im.runDryRunItem(ctx, proj, items[idx], spec)
-			} else {
-				results[idx] = im.runImportItem(ctx, actor, proj, items[idx], spec, siblings, m.PathRules, manifestModNames, func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
-					return ms.get(func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
-						return im.syncSharedMirror(ctx, items[idx].GitMirrorPath, spec, pinnedByURL[spec.SourceURL], ms.tc)
-					})
+			mirrorSpec := spec
+			mirrorSpec.LFSMode = lfsModeByURL[spec.SourceURL]
+			getMirror := func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
+				return ms.get(func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error) {
+					return im.syncSharedMirror(ctx, items[idx].GitMirrorPath, mirrorSpec, pinnedByURL[spec.SourceURL], ms.tc)
 				})
+			}
+			if m.DryRun {
+				results[idx] = im.runDryRunItem(ctx, proj, items[idx], spec, siblings, m.PathRules, manifestModNames, manifestModulesByURL, getMirror)
+			} else {
+				results[idx] = im.runImportItem(ctx, actor, proj, items[idx], spec, siblings, m.PathRules, manifestModNames, getMirror)
 			}
 		}()
 	}
@@ -442,6 +460,15 @@ func (im *Importer) acquireOrCreateJob(
 		for i, r := range m.Repositories {
 			authMethod := inferAuthMethodLabel(r.Auth)
 			mirrorPath := sharedMirrorDir(im.WorkspaceRoot, proj.ID, r.SourceURL)
+			if m.DryRun {
+				mirrorPath = filepath.Join(
+					im.WorkspaceRoot,
+					fmt.Sprintf("proj-%d", proj.ID),
+					"dry-run",
+					fmt.Sprintf("job-%d", jobID),
+					filepath.Base(mirrorPath),
+				)
+			}
 			workPath := filepath.Join(im.WorkspaceRoot, fmt.Sprintf("proj-%d", proj.ID), "lore", r.ModuleName)
 			if _, iErr := tx.ExecContext(ctx, `
 				INSERT INTO import_job_items (
@@ -660,8 +687,18 @@ func verifyMirrorMatchesSnapshot(g MirrorGraph, snap RemoteRefSummary, mismatchB
 	return nil
 }
 
-func (im *Importer) runDryRunItem(ctx context.Context, proj *project.Project, st storedItem, spec RepoSpec) ItemResult {
-	resolvedSourceURL, extraEnv, secrets, authMethod, authErr := im.validateSourceAndAuth(spec)
+func (im *Importer) runDryRunItem(
+	ctx context.Context,
+	proj *project.Project,
+	st storedItem,
+	spec RepoSpec,
+	siblingSubdirs []string,
+	pathRules []PathRule,
+	manifestModNames map[string]bool,
+	manifestModulesByURL map[string]string,
+	getMirror func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error),
+) ItemResult {
+	_, _, _, authMethod, authErr := im.validateSourceAndAuth(spec)
 	out := ItemResult{
 		ItemID:       st.ItemID,
 		Ord:          st.Ord,
@@ -720,37 +757,169 @@ func (im *Importer) runDryRunItem(ctx context.Context, proj *project.Project, st
 		}
 	}
 
-	refs, err := InspectRemoteRefs(ctx, im.GitBinary, resolvedSourceURL, extraEnv, secrets)
+	_, refs, rawGraph, treeCache, err := getMirror()
 	if err != nil {
 		out.Status = "failed"
 		out.Error = err.Error()
 		im.saveItemFinal(ctx, st.ItemID, out)
 		return out
 	}
-	if err := checkExpectedSpecRefs(refs, spec); err != nil {
+	out.RemoteRefs = &refs
+	if rawGraph.IsShallow || len(rawGraph.ShallowMissingParents) > 0 {
 		out.Status = "failed"
-		out.RemoteRefs = &refs
+		out.Verification = VerificationReport{
+			PreflightOnly:         true,
+			Passed:                false,
+			SourceSubdir:          spec.SourceSubdir,
+			RawSourceCommits:      len(rawGraph.Commits),
+			ShallowMissingParents: rawGraph.ShallowMissingParents,
+			Mismatches:            []string{"incomplete/shallow git commit graph: missing parent objects"},
+		}
+		out.Error = fmt.Sprintf("%s: shallow or missing parent commits", ErrVerify)
+		im.saveItemFinal(ctx, st.ItemID, out)
+		return out
+	}
+
+	projGraph, err := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache)
+	if err != nil {
+		out.Status = "failed"
 		out.Error = err.Error()
 		im.saveItemFinal(ctx, st.ItemID, out)
 		return out
 	}
-	out.RemoteRefs = &refs
-	fullMigrated := spec.LFSMode != LFSModePointer
+	if len(projGraph.Commits) == 0 {
+		out.Status = "failed"
+		out.Error = fmt.Sprintf("gitimport: zero commits matched module %q (source_subdir=%q)", spec.ModuleName, spec.SourceSubdir)
+		im.saveItemFinal(ctx, st.ItemID, out)
+		return out
+	}
+	for _, classified := range projGraph.ClassifiedSeparateModule {
+		if classified.TargetModule == "" || !manifestModNames[classified.TargetModule] {
+			projGraph.CoverageComplete = false
+			projGraph.UndecidedPaths = append(projGraph.UndecidedPaths, classified.Path)
+		}
+	}
+	sort.Strings(projGraph.UndecidedPaths)
+
+	report := VerificationReport{
+		PreflightOnly:            true,
+		Passed:                   true,
+		FullContentMigrated:      false,
+		CoverageComplete:         projGraph.CoverageComplete,
+		SourceSubdir:             spec.SourceSubdir,
+		RawSourceCommits:         len(rawGraph.Commits),
+		SourceCommits:            len(projGraph.Commits),
+		AliasedCommits:           projGraph.AliasedCommitsCount,
+		SourceBranches:           len(rawGraph.Branches),
+		SourceTags:               len(rawGraph.Tags),
+		HeadBranch:               projGraph.DefaultBranch,
+		AdvertisedHiddenRefs:     refs.AdvertisedHiddenRefs,
+		SkippedEmptyBranches:     projGraph.SkippedEmptyBranches,
+		SkippedEmptyTags:         projGraph.SkippedEmptyTags,
+		UnmappedPathsCount:       len(projGraph.UnmappedPaths),
+		UnmappedPaths:            projGraph.UnmappedPaths,
+		ClassifiedExcluded:       projGraph.ClassifiedExcluded,
+		ClassifiedSeparateModule: projGraph.ClassifiedSeparateModule,
+		UndecidedPaths:           projGraph.UndecidedPaths,
+		LFSFetchAttempted:        rawGraph.LFSFetchAttempted,
+		LFSFetchSucceeded:        rawGraph.LFSFetchSucceeded,
+	}
+	if spec.SourceSubdir != "" && spec.GlobalFilesPolicy == GlobalPolicyStrict && !projGraph.CoverageComplete {
+		report.Mismatches = append(report.Mismatches, fmt.Sprintf("%s: %d unclassified monorepo path(s) outside module subdirectories", ErrUnclassifiedGlobalPaths, len(projGraph.UndecidedPaths)))
+	}
+
+	reader, readerErr := NewBatchBlobReader(ctx, im.GitBinary, st.GitMirrorPath)
+	if readerErr != nil {
+		out.Status = "failed"
+		out.Error = readerErr.Error()
+		im.saveItemFinal(ctx, st.ItemID, out)
+		return out
+	}
+	defer reader.Close()
+	submodules := map[string]SubmoduleDependency{}
+	for _, commit := range projGraph.Commits {
+		entries, treeErr := treeCache.Entries(ctx, im.GitBinary, st.GitMirrorPath, commit.TreeSHA)
+		if treeErr != nil {
+			report.Mismatches = append(report.Mismatches, treeErr.Error())
+			continue
+		}
+		specials, specialErr := InspectExpectedSpecialObjects(st.GitMirrorPath, spec.SourceSubdir, spec.LFSMode, entries, reader)
+		if specialErr != nil {
+			report.Mismatches = append(report.Mismatches, specialErr.Error())
+			continue
+		}
+		report.SpecialObjectsCount += len(specials)
+		for _, special := range specials {
+			switch special.Kind {
+			case "lfs_hydrated":
+				report.LFSHydratedCount++
+			case "lfs_pointer":
+				report.LFSUnhydratedCount++
+			case "submodule_gitlink":
+				var metadata map[string]string
+				_ = json.Unmarshal([]byte(special.DetailJSON), &metadata)
+				submodules[special.Path] = SubmoduleDependency{
+					Path: special.Path, URL: metadata["url"], Branch: metadata["branch"], LatestCommitSHA: special.OID,
+				}
+			}
+		}
+	}
+
 	lfsStatus := "not_applicable"
-	if spec.LFSMode == LFSModePointer {
+	if report.LFSUnhydratedCount > 0 {
 		lfsStatus = "pointer_only_unhydrated"
+	} else if report.LFSHydratedCount > 0 {
+		lfsStatus = "hydrated_verified"
 	}
-	out.Verification = VerificationReport{
-		Passed:               true,
-		FullContentMigrated:  fullMigrated,
-		CoverageComplete:     true,
-		SourceSubdir:         spec.SourceSubdir,
-		SourceBranches:       len(refs.Branches),
-		SourceTags:           len(refs.Tags),
-		LFSHydrationStatus:   lfsStatus,
-		HeadBranch:           refs.DefaultBranch,
-		AdvertisedHiddenRefs: refs.AdvertisedHiddenRefs,
+	report.LFSHydrationStatus = lfsStatus
+
+	if len(submodules) > 0 {
+		knownModules := map[string]string{}
+		for name := range manifestModNames {
+			knownModules[strings.ToLower(name)] = name
+		}
+		if existingModules, listErr := project.ListModules(ctx, im.DB, proj.ID, false); listErr == nil {
+			for _, module := range existingModules {
+				knownModules[strings.ToLower(module.Name)] = module.Name
+				knownModules[strings.ToLower(module.MountPath)] = module.Name
+			}
+		}
+		paths := make([]string, 0, len(submodules))
+		for subPath := range submodules {
+			paths = append(paths, subPath)
+		}
+		sort.Strings(paths)
+		for _, subPath := range paths {
+			dependency := submodules[subPath]
+			matched := manifestModulesByURL[strings.TrimSuffix(strings.ToLower(dependency.URL), ".git")]
+			if matched == "" {
+				matched = knownModules[strings.ToLower(strings.TrimSuffix(path.Base(dependency.URL), ".git"))]
+			}
+			if matched == "" {
+				matched = knownModules[strings.ToLower(path.Base(dependency.Path))]
+			}
+			if matched == "" {
+				dependency.MigrationStatus = "unmigrated_independent_repo"
+				if spec.SubmodulePolicy == SubmoduleRequireRegistered {
+					report.Mismatches = append(report.Mismatches, fmt.Sprintf("submodule %q (%s) is not yet registered as an independent module in project", dependency.Path, dependency.URL))
+				}
+			} else {
+				dependency.MatchedModule = matched
+				dependency.MigrationStatus = "registered_in_project"
+			}
+			report.SubmoduleDependencies = append(report.SubmoduleDependencies, dependency)
+		}
 	}
+
+	if len(report.Mismatches) > 0 {
+		report.Passed = false
+		out.Verification = report
+		out.Status = "failed"
+		out.Error = fmt.Sprintf("%s: dry-run preflight found %d blocking mismatch(es): %s", ErrVerify, len(report.Mismatches), report.Mismatches[0])
+		im.saveItemFinal(ctx, st.ItemID, out)
+		return out
+	}
+	out.Verification = report
 	out.Status = "planned"
 	im.saveItemFinal(ctx, st.ItemID, out)
 	return out
@@ -778,8 +947,14 @@ func (im *Importer) syncSharedMirror(
 		if _, statErr := os.Stat(filepath.Join(mirrorDir, "HEAD")); statErr == nil {
 			if localG, gErr := ReadMirrorGraph(ctx, im.GitBinary, mirrorDir, pinned.DefaultBranch); gErr == nil {
 				if verifyMirrorMatchesSnapshot(localG, *pinned, ErrSourceMovedDuringResume) == nil {
-					localG.LFSFetchAttempted = spec.LFSMode != LFSModePointer
-					localG.LFSFetchSucceeded = hasAnyLocalLFSObjects(mirrorDir)
+					if spec.LFSMode == LFSModeHydrate {
+						attempted, complete, lfsErr := FetchLFSObjects(ctx, im.GitBinary, resolvedSourceURL, mirrorDir, extraEnv, secrets)
+						localG.LFSFetchAttempted = attempted
+						localG.LFSFetchSucceeded = complete
+						if lfsErr != nil {
+							return "", RemoteRefSummary{}, MirrorGraph{}, tc, lfsErr
+						}
+					}
 					return resolvedSourceURL, *pinned, localG, tc, nil
 				}
 			}

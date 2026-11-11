@@ -130,6 +130,11 @@ func TestSyncModuleReliabilityBranchFailuresDefaultMasterPruningAndBoundaryMerge
 	_ = UpsertRef(ctx, tx, RefDetail{
 		ModuleID: mod.ID, Type: "tag", Name: "v1.0", LoreRevision: rev1, IsAnnotated: true, TagMessage: "keep me",
 	})
+	rawFoldedTip := strings.Repeat("a", 40)
+	_ = UpsertRef(ctx, tx, RefDetail{
+		ModuleID: mod.ID, Type: "branch", Name: "master", LoreRevision: rev1,
+		SourceCommitID: strings.Repeat("b", 40), OriginalSourceCommitID: rawFoldedTip, IsDefault: true,
+	})
 	_ = tx.Commit()
 
 	goodRunner := &flexibleLoreRunner{
@@ -164,6 +169,13 @@ func TestSyncModuleReliabilityBranchFailuresDefaultMasterPruningAndBoundaryMerge
 	}
 	if !sawMasterDefault || !sawFeatureOld || !sawTag {
 		t.Fatalf("refs after sync 1 wrong: masterDef=%v featOld=%v tag=%v (%+v)", sawMasterDefault, sawFeatureOld, sawTag, refs1)
+	}
+	var originalAfterSync string
+	if err := db.QueryRow(`SELECT original_source_commit_id FROM module_refs WHERE module_id=? AND ref_type='branch' AND ref_name='master'`, mod.ID).Scan(&originalAfterSync); err != nil {
+		t.Fatal(err)
+	}
+	if originalAfterSync != rawFoldedTip {
+		t.Fatalf("history sync overwrote folded branch provenance: got %s want %s", originalAfterSync, rawFoldedTip)
 	}
 
 	// 4. Archive `feature/old`, add `feature/new`, AND simulate an already-indexed merge commit `revMerge`

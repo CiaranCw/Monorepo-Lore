@@ -420,13 +420,28 @@ func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 	}
 
 	if cp.ModuleID == 0 {
-		mod, err := project.CreateModule(ctx, im.DB, actor, project.Module{
-			ProjectID:     projectID,
-			Name:          spec.ModuleName,
-			RepositoryID:  cp.LoreRepositoryID,
-			RepositoryURL: cp.LoreRepositoryURL,
-			MountPath:     spec.MountPath,
-		})
+		unlockRegistration := lockByKey(&projectRegistrationLocks, strconv.FormatInt(projectID, 10))
+		var mod *project.Module
+		var err error
+		for attempt := 0; attempt < 12; attempt++ {
+			mod, err = project.CreateModule(ctx, im.DB, actor, project.Module{
+				ProjectID:     projectID,
+				Name:          spec.ModuleName,
+				RepositoryID:  cp.LoreRepositoryID,
+				RepositoryURL: cp.LoreRepositoryURL,
+				MountPath:     spec.MountPath,
+			})
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), "database is locked") {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				err = ctx.Err()
+				attempt = 12
+			case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+			}
+		}
+		unlockRegistration()
 		if err != nil {
 			return err
 		}

@@ -17,7 +17,7 @@ Monorepo-Lore keeps three distinct history concepts strictly separate:
 | Branches | Native branches (including slash names like `feature/ui`) | Created as real Lore branches at exact mapped revisions and indexed in `module_refs` |
 | Lightweight & Annotated Tags | No native `lore tag` entity in Lore 0.10.1 | Indexed losslessly in `module_refs` (`ref_type='tag'`), preserving tag object SHA, tagger, timestamp, and annotation message |
 | Empty Commits | Rejected unless `-f` is passed | Committed with `-f` after metadata staging so every Git commit maps 1-to-1 to a real Lore revision |
-| Git LFS / Submodules / Symlinks | Regular file store | LFS hydrated when available (or pointer tracked as `lfs_pointer`), submodule `160000` gitlinks + `.gitmodules` recorded as `submodule_gitlink`, symlinks recorded as `symlink` in `module_special_objects` |
+| Git LFS / Submodules / Symlinks | Regular file store | Hydrate mode requires every LFS object to pass OID/size verification; explicit pointer mode records `lfs_pointer`, submodule `160000` gitlinks + `.gitmodules` are recorded as `submodule_gitlink`, and symlinks as `symlink` |
 
 ## Deterministic Ordering & Live-Permission Cursor Pagination
 
@@ -50,7 +50,7 @@ Keyset cursors encode `(committed_unix_ms, authored_unix_ms, module_id, lore_rev
 
 ### Engineering Guarantees
 
-- **Dry-run (`--dry-run`)**: Runs `git ls-remote --symref`, validates optional `expected_default_branch` / `expected_branches` / `expected_tags`, classifies existing module collisions (`ordinary`, `complete`, `partial`, `uncertain`), reports advertised branches, tags, and platform-hidden refs (`refs/pull/*`, `refs/merge-requests/*`), and makes zero Lore or module mutations.
+- **Dry-run (`--dry-run`)**: Uses an isolated disposable Bare Mirror, pins and verifies refs, walks the full DAG, rejects shallow/missing parents, projects each module, enforces global-path and submodule policy, and verifies every LFS pointer/object. It classifies existing module collisions and reports hidden refs while making zero Lore or module mutations. `preflight_only=true` and `full_content_migrated=false` prevent a successful Dry-run from being mistaken for a completed migration.
 - **4-State `skip_if_imported` & Concurrency Locks**: Only verified `complete` imports matching `(source_url, source_subdir)` are skipped; `ordinary` pre-existing modules and `uncertain` states conflict; `partial` interrupted imports automatically resume. Concurrent submissions of the same `job_key` or same target module are serialized/rejected cleanly, and Manager startup recovers interrupted `running` jobs.
 - **Coherent source ref snapshot**: Captures `ls-remote` before fetch and compares the fetched mirror against that exact branch/tag set. Ref movement fails the job. Resume reuses `pinned_refs_json` from the coherent local mirror instead of silently mixing later upstream commits.
 - **Strict LFS honesty**: `lfs_mode="hydrate"` requires and cryptographically verifies each object’s SHA-256 OID and size; missing/corrupt objects fail import. Explicit `pointer` mode reports `full_content_migrated=false` and `pointer_only_unhydrated`.

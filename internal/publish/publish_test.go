@@ -53,6 +53,11 @@ func TestPublishSerialAndRecovery(t *testing.T) {
 	if drv.link("Engine") != "rev-engine-1" || drv.pushCount() != 1 {
 		t.Fatalf("link=%s pushes=%d", drv.link("Engine"), drv.pushCount())
 	}
+	drv.setLocal("engine", "")
+	if _, err := pub.Publish(ctx, req); err == nil || !strings.Contains(err.Error(), "has no capturable revision") {
+		t.Fatalf("active module with empty revision produced incomplete snapshot: %v", err)
+	}
+	drv.setLocal("engine", "rev-engine-1")
 
 	hold := make(chan struct{})
 	drv.setBlock(hold)
@@ -154,6 +159,34 @@ func TestRecoverAfterPushKeepsSuccess(t *testing.T) {
 	}
 	if err := pub.Recover(ctx, func(int64) (string, error) { return req.ParentDir, nil }); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRecoverRejectsPublishedRevisionWithExtraLinks(t *testing.T) {
+	ctx := context.Background()
+	db, drv, pub, req := newPublishTest(t)
+	pub.Halt = func(step string) {
+		if step == "pushed" {
+			panic("injected crash after push")
+		}
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = pub.Publish(ctx, req)
+	}()
+	drv.mu.Lock()
+	drv.published[len(drv.published)-1].links["Unexpected"] = "rev-other-project"
+	drv.mu.Unlock()
+	pub.Halt = nil
+	if err := pub.Recover(ctx, func(int64) (string, error) { return req.ParentDir, nil }); err != nil {
+		t.Fatal(err)
+	}
+	var status, reason string
+	if err := db.QueryRow(`SELECT status, error FROM operations ORDER BY operation_id DESC LIMIT 1`).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || !strings.Contains(reason, ErrNeedsHuman.Error()) {
+		t.Fatalf("recovery accepted extra parent links: status=%s reason=%s", status, reason)
 	}
 }
 

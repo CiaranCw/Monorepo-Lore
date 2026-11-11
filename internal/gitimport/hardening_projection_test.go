@@ -321,6 +321,16 @@ func TestSkipIfImportedFourStatesShallowAndTamperedDAGVerification(t *testing.T)
 	gShallow := gitExecHelper{t: t, bin: gitBin, dir: tmp}
 	gShallow.run(nil, "clone", "--depth", "1", "file:///"+strings.TrimLeft(filepath.ToSlash(srcRepo), "/"), shallowDir)
 
+	shallowDryRun, err := imp.Run(ctx, "carol", Manifest{
+		JobKey:       "job-shallow-dry-run-must-fail",
+		Project:      "FourState",
+		DryRun:       true,
+		Repositories: []RepoSpec{{SourceURL: shallowDir, ModuleName: "ShallowDryRun", MountPath: "ShallowDryRun"}},
+	})
+	if err != nil || shallowDryRun.Status != "failed" || shallowDryRun.Items[0].Verification.Passed {
+		t.Fatalf("shallow repository dry-run MUST fail preflight, got %+v err=%v", shallowDryRun, err)
+	}
+
 	shallowImport, err := imp.Run(ctx, "carol", Manifest{
 		JobKey:       "job-shallow-must-fail",
 		Project:      "FourState",

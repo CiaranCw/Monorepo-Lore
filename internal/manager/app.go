@@ -21,6 +21,7 @@ import (
 	"lore-monorepo/internal/logging"
 	"lore-monorepo/internal/loreadapter"
 	"lore-monorepo/internal/loreexec"
+	"lore-monorepo/internal/project"
 	"lore-monorepo/internal/publish"
 	"lore-monorepo/internal/token"
 
@@ -58,6 +59,10 @@ type App struct {
 	Importer      *gitimport.Importer
 	HTTP          *http.Server
 	grpcSrv       *grpc.Server
+
+	// snapshotPreparer is test-only dependency injection. Production always
+	// prepares server-owned parent/module workspaces through prepareSnapshot.
+	snapshotPreparer func(context.Context, *project.Project) (string, map[string]string, error)
 
 	// Gate, if set, runs at the start of every HTTP request. Tests use it
 	// to hold a request across shutdown. Production leaves it nil.
