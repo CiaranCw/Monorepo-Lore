@@ -33,8 +33,10 @@ private_key = "data/keys/identity-active.pem"
 public_key = "data/keys/identity-active.pub.pem"
 jwks = "data/keys/jwks.json"
 
-# Optional server-side external Git import workspace.
+# Optional server-side external Git import workspace and filesystem allowlists.
 # [import]
 # workspace = "data/imports"
 # git_binary = "git"
 # remote_base_url = "grpcs://lore-host.internal:53747"
+# allowed_local_dirs = ["/srv/git-mirrors"]
+# allowed_ssh_dirs = ["/etc/lore-monorepo/ssh"]

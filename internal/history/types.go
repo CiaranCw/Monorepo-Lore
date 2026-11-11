@@ -17,9 +17,10 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("history: not found")
-	ErrInvalidCursor = errors.New("history: invalid pagination cursor")
-	ErrInvalidFilter = errors.New("history: invalid query filter")
+	ErrNotFound        = errors.New("history: not found")
+	ErrInvalidCursor   = errors.New("history: invalid pagination cursor")
+	ErrInvalidFilter   = errors.New("history: invalid query filter")
+	ErrBranchDiscovery = errors.New("history: failed to discover repository branches")
 )
 
 const (
@@ -90,6 +91,7 @@ type Commit struct {
 	LoreRevision        string            `json:"lore_revision"`
 	LoreRevisionNumber  int               `json:"lore_revision_number"`
 	SourceCommitID      string            `json:"source_commit_id,omitempty"`
+	SourceSubdir        string            `json:"source_subdir,omitempty"`
 	OriginKind          string            `json:"origin_kind"`
 	IsMerge             bool              `json:"is_merge"`
 	ParentCount         int               `json:"parent_count"`
@@ -157,7 +159,9 @@ type Page struct {
 
 // SyncStats summarizes a Lore-to-SQLite DAG indexing pass.
 type SyncStats struct {
-	BranchesIndexed  int `json:"branches_indexed"`
-	RevisionsScanned int `json:"revisions_scanned"`
-	CommitsUpserted  int `json:"commits_upserted"`
+	BranchSource     string `json:"branch_source"`
+	BranchesIndexed  int    `json:"branches_indexed"`
+	BranchesPruned   int    `json:"branches_pruned"`
+	RevisionsScanned int    `json:"revisions_scanned"`
+	CommitsUpserted  int    `json:"commits_upserted"`
 }

@@ -391,3 +391,27 @@ func (c *Client) PushBranch(ctx context.Context, dir, branch string) error {
 	}
 	return nil
 }
+
+// DefaultBranchName queries `lore repository metadata get` for `default-branch-name`.
+func (c *Client) DefaultBranchName(ctx context.Context, dir string) (string, error) {
+	if err := requireDir(dir); err != nil {
+		return "", err
+	}
+	res, err := c.runMode(ctx, dir, true, false, true, "repository", "metadata", "get", "--repository", dir)
+	if err != nil {
+		return "", err
+	}
+	if !accepted(res) && !res.OutputSucceeded() {
+		return "", failOutput("repository metadata get", res)
+	}
+	for _, ln := range res.StdoutParse.Lines {
+		if ln.TagName != "metadata" {
+			continue
+		}
+		k, v, _, _, ok := decodeMetadataLine(ln.Data)
+		if ok && k == "default-branch-name" && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v), nil
+		}
+	}
+	return "", nil
+}

@@ -85,7 +85,7 @@ func TestPlatformDetectionAndSecretRejection(t *testing.T) {
 	// Verify BuildGitAuthEnv injects HTTP extraheader and redacts secrets without touching argv.
 	env, secrets, method, err := BuildGitAuthEnv("https://git.woa.com/team/repo.git", PlatformGongfeng, AuthConfig{
 		Token: "super-secret-token-999",
-	})
+	}, AuthPolicy{DisallowProcessEnv: true})
 	if err != nil || method != AuthHTTPSToken || len(env) < 3 {
 		t.Fatalf("auth env err=%v method=%s env=%v", err, method, env)
 	}

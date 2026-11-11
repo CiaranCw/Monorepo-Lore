@@ -482,6 +482,7 @@ func importCmd(args []string) error {
 		manifestPath string
 		projectName  string
 		sourceURL    string
+		sourceSubdir string
 		modName      string
 		mountPath    string
 		platform     string
@@ -537,6 +538,12 @@ func importCmd(args []string) error {
 				return err
 			}
 			sourceURL = v
+		case "--subdir", "--source-subdir":
+			v, err := needVal()
+			if err != nil {
+				return err
+			}
+			sourceSubdir = v
 		case "--module":
 			v, err := needVal()
 			if err != nil {
@@ -662,6 +669,7 @@ func importCmd(args []string) error {
 			Concurrency:    concurrency,
 			Repositories: []gitimport.RepoSpec{{
 				SourceURL:      sourceURL,
+				SourceSubdir:   sourceSubdir,
 				ModuleName:     modName,
 				MountPath:      mountPath,
 				Platform:       platform,
@@ -681,11 +689,21 @@ func importCmd(args []string) error {
 	}
 
 	runtimeTokens := map[string]string{}
-	for _, r := range manifest.Repositories {
-		if r.Auth.TokenEnv != "" {
-			if v := os.Getenv(r.Auth.TokenEnv); v != "" {
-				runtimeTokens[r.ModuleName] = v
+	for i := range manifest.Repositories {
+		r := &manifest.Repositories[i]
+		if r.Auth.SSHKeyEnv != "" {
+			if kp := strings.TrimSpace(os.Getenv(r.Auth.SSHKeyEnv)); kp != "" {
+				r.Auth.SSHKeyPath = kp
 			}
+			r.Auth.SSHKeyEnv = ""
+		}
+		if r.Auth.TokenEnv != "" {
+			v := os.Getenv(r.Auth.TokenEnv)
+			if strings.TrimSpace(v) == "" {
+				return fmt.Errorf("environment variable %s for module %s is empty or unset", r.Auth.TokenEnv, r.ModuleName)
+			}
+			runtimeTokens[r.ModuleName] = v
+			r.Auth.TokenEnv = ""
 		}
 	}
 

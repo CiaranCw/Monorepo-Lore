@@ -35,16 +35,24 @@ Keyset cursors encode `(committed_unix_ms, authored_unix_ms, module_id, lore_rev
 
 - **Platforms**: `github`, `gitee`, `gitlab`, `gongfeng` (`git.woa.com` / `*.code.tencent.com`), `generic_git`, and `local_git`.
 - **Authentication**:
-  - `https_token`: Reads token from `token_env` (resolved in-memory by `lore-mono` or Manager) and passes `http.<origin>.extraheader = Authorization: Basic ...` via `GIT_CONFIG_COUNT` in the `git` child process environment. Tokens are rejected on CLI argv and rejected inside `source_url`.
-  - `ssh_key`: Passes `GIT_SSH_COMMAND` with `IdentitiesOnly=yes` and optional `known_hosts` to the `git` child process.
+  - `https_token`: Requires `https://` (`http://` plaintext is strictly rejected). `token_env` is resolved **exclusively on the client (`lore-mono`)** and sent in-memory via `runtime_tokens`; the Manager server never reads `os.Getenv(token_env)`. Inside `git` child processes, the token is injected via `GIT_CONFIG_COUNT=1` + `http.<origin>.extraheader = Authorization: Basic ...` in a sanitized environment. Tokens, query parameters (`?...`), and URL fragments (`#...`) are strictly rejected inside `source_url` and on CLI argv.
+  - `ssh_key`: Key and `known_hosts` paths are passed in dedicated environment variables (`LORE_GIT_SSH_KEY`, `LORE_GIT_SSH_KH`) referenced by a static `GIT_SSH_COMMAND` string (preventing shell metacharacter command injection) and validated against `import.allowed_ssh_dirs` after symlink resolution.
+  - `local_git`: Local repository paths and `file://` URLs are restricted to administrator-configured `import.allowed_local_dirs` after `EvalSymlinks` resolution.
   - `git_credential_helper` / `none`.
+
+### Per-Module Subdirectory Projection (`source_subdir`)
+
+- A single external Git Monorepo (e.g. `TeamGames/Games` containing `Chess/`, `Mahjong/`, `Poker/`) can be split into multiple independent Lore modules in one manifest using `source_subdir`.
+- All modules sharing the same `source_url` reuse one Bare Git Mirror under mutex protection while projecting an independent per-module commit DAG:
+  - Commits touching $N$ module subdirectories produce $N$ distinct Lore revisions in their respective module repositories, each containing strictly that module's stripped relative paths and module-local parent pointers.
+  - Commits not modifying a module's subdirectory are folded via alias mapping without creating empty revisions.
+  - Unmapped global files outside declared subdirectories (e.g. root `README.md`, `.github/`) are excluded from child modules and explicitly reported in `unmapped_paths`.
 
 ### Engineering Guarantees
 
-- **Dry-run (`--dry-run`)**: Runs `git ls-remote --symref`, checks module/mount conflicts, reports advertised branches, tags, and platform-hidden refs (`refs/pull/*`, `refs/merge-requests/*`), and makes zero Lore or module mutations.
-- **Idempotency & Checkpointing**: Every replayed Git commit checkpoints `commit_map` in `import_job_items`. Re-running an interrupted job resumes from the exact next commit without duplicating Lore revisions or modules.
-- **Failure Isolation**: Each repository in a batch manifest runs independently; one failing repository marks the job `partial_failed` without rolling back sibling modules.
-- **Post-Import Verification**: Compares non-synthetic commit count, 1-to-1 SHA mappings, merge/octopus parent counts, branch/tag counts, and the byte-for-byte SHA-256 content digest of the HEAD working tree.
+- **Dry-run (`--dry-run`)**: Runs `git ls-remote --symref`, classifies existing module collisions (`ordinary`, `complete`, `partial`, `uncertain`), reports advertised branches, tags, and platform-hidden refs (`refs/pull/*`, `refs/merge-requests/*`), and makes zero Lore or module mutations.
+- **4-State `skip_if_imported` & Concurrency Locks**: Only verified `complete` imports matching `(source_url, source_subdir)` are skipped; `ordinary` pre-existing modules and `uncertain` states conflict; `partial` interrupted imports automatically resume. Concurrent submissions of the same `job_key` or same target module are serialized/rejected cleanly, and Manager startup recovers interrupted `running` jobs.
+- **3-Layer Post-Import Verification**: Rejects shallow/missing-parent graphs and verifies bijection across the Bare Git Mirror, physical Lore revisions/branches/deltas, and SQLite (`module_commits`, exact ordered `module_commit_parents` for 2-parent & Octopus merges, `module_refs` including non-`main` default branches and tags, `module_special_objects`, per-revision content isolation, and HEAD SHA-256 tree digest).
 
 ## HTTP API Reference
 
