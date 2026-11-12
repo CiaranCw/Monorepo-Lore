@@ -157,14 +157,33 @@ type JobResult struct {
 }
 
 type itemCheckpoint struct {
-	LoreRepositoryID  string            `json:"lore_repository_id,omitempty"`
-	LoreRepositoryURL string            `json:"lore_repository_url,omitempty"`
-	ModuleID          int64             `json:"module_id,omitempty"`
-	BootstrapMainRev  string            `json:"bootstrap_main_rev,omitempty"`
-	CommitMap         map[string]string `json:"commit_map,omitempty"` // projected git sha -> lore 64-hex revision
-	SyntheticCount    int               `json:"synthetic_count,omitempty"`
-	HelperBranches    []string          `json:"helper_branches,omitempty"`
-	PushedBranches    map[string]bool   `json:"pushed_branches,omitempty"`
+	LoreRepositoryID   string            `json:"lore_repository_id,omitempty"`
+	LoreRepositoryURL  string            `json:"lore_repository_url,omitempty"`
+	ModuleID           int64             `json:"module_id,omitempty"`
+	BootstrapMainRev   string            `json:"bootstrap_main_rev,omitempty"`
+	CommitMap          map[string]string `json:"commit_map,omitempty"`        // projected git sha -> lore 64-hex revision
+	SyntheticBridges   map[string]string `json:"synthetic_bridges,omitempty"` // source SHA:parent index -> Lore revision
+	SyntheticCount     int               `json:"synthetic_count,omitempty"`
+	HelperBranches     []string          `json:"helper_branches,omitempty"`
+	PushedBranches     map[string]bool   `json:"pushed_branches,omitempty"`
+	PublishedRevisions map[string]string `json:"published_revisions,omitempty"`
+	Pending            *pendingReplay    `json:"pending,omitempty"`
+}
+
+// pendingReplay makes a local Lore mutation restartable without adding a new
+// database table. Physical Lore metadata remains authoritative; this record
+// only identifies which operation may have been interrupted.
+type pendingReplay struct {
+	SourceCommit      string `json:"source_commit"`
+	Lane              string `json:"lane"`
+	Kind              string `json:"kind"` // commit or bridge
+	ParentIndex       int    `json:"parent_index,omitempty"`
+	Parent1Revision   string `json:"parent1_revision,omitempty"`
+	Parent2Revision   string `json:"parent2_revision,omitempty"`
+	MergeSourceBranch string `json:"merge_source_branch,omitempty"`
+	ExpectedTree      string `json:"expected_tree,omitempty"`
+	Phase             string `json:"phase"` // merge_start, merge_open, lore_committed
+	LoreRevision      string `json:"lore_revision,omitempty"`
 }
 
 // Importer orchestrates single and batch external Git imports into Monorepo-Lore.
@@ -183,6 +202,9 @@ type Importer struct {
 	// FaultHook is a test-only hook invoked after replayCommitIndex (0-based) for
 	// deterministic crash/interruption and checkpoint-resume testing.
 	FaultHook func(moduleName string, replayCommitIndex int) error
+	// OperationFaultHook is invoked at mutation boundaries that FaultHook cannot
+	// observe: merge start and Lore commit before SQLite/checkpoint completion.
+	OperationFaultHook func(moduleName, sourceCommit, phase string) error
 
 	// AfterInspectRefs is a test-only hook invoked right after InspectRemoteRefs and
 	// before SyncBareMirror to test upstream repository mutation detection during fetch.

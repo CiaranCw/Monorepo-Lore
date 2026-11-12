@@ -11,19 +11,22 @@ import (
 // Status is the repositoryStatusRevision object captured in E5 step M-2.
 // Ahead and availability flags were JSON numbers 0 and 1 in that capture.
 type Status struct {
-	RepositoryID      string
-	BranchID          string
-	BranchName        string
-	Revision          string
-	RevisionNumber    int
-	RevisionLocal     string
-	RevisionRemote    string
-	RemoteAvailable   bool
-	RemoteAuthorized  bool
-	RemoteBranchExist bool
-	IsLocalAhead      bool
-	IsRemoteAhead     bool
-	Raw               json.RawMessage
+	RepositoryID       string
+	BranchID           string
+	BranchName         string
+	Revision           string
+	RevisionNumber     int
+	RevisionStaged     string
+	RevisionMerged     string
+	MergedParentBranch string
+	RevisionLocal      string
+	RevisionRemote     string
+	RemoteAvailable    bool
+	RemoteAuthorized   bool
+	RemoteBranchExist  bool
+	IsLocalAhead       bool
+	IsRemoteAhead      bool
+	Raw                json.RawMessage
 }
 
 // Link is one linkEntry object captured in E5 step M-3.
@@ -88,18 +91,21 @@ func decodeStatus(res loreexec.CommandResult) (Status, bool) {
 		return Status{}, false
 	}
 	var wire struct {
-		Repository        string `json:"repository"`
-		Branch            string `json:"branch"`
-		BranchName        string `json:"branchName"`
-		Revision          string `json:"revision"`
-		RevisionNumber    int    `json:"revisionNumber"`
-		RevisionLocal     string `json:"revisionLocal"`
-		RevisionRemote    string `json:"revisionRemote"`
-		RemoteAvailable   bit    `json:"remoteAvailable"`
-		RemoteAuthorized  bit    `json:"remoteAuthorized"`
-		RemoteBranchExist bit    `json:"remoteBranchExist"`
-		IsLocalAhead      bit    `json:"isLocalAhead"`
-		IsRemoteAhead     bit    `json:"isRemoteAhead"`
+		Repository         string `json:"repository"`
+		Branch             string `json:"branch"`
+		BranchName         string `json:"branchName"`
+		Revision           string `json:"revision"`
+		RevisionNumber     int    `json:"revisionNumber"`
+		RevisionStaged     string `json:"revisionStaged"`
+		RevisionMerged     string `json:"revisionMerged"`
+		MergedParentBranch string `json:"revisionMergedParentBranch"`
+		RevisionLocal      string `json:"revisionLocal"`
+		RevisionRemote     string `json:"revisionRemote"`
+		RemoteAvailable    bit    `json:"remoteAvailable"`
+		RemoteAuthorized   bit    `json:"remoteAuthorized"`
+		RemoteBranchExist  bit    `json:"remoteBranchExist"`
+		IsLocalAhead       bit    `json:"isLocalAhead"`
+		IsRemoteAhead      bit    `json:"isRemoteAhead"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil || wire.Repository == "" || wire.Revision == "" {
 		return Status{}, false
@@ -107,7 +113,9 @@ func decodeStatus(res loreexec.CommandResult) (Status, bool) {
 	return Status{
 		RepositoryID: wire.Repository, BranchID: wire.Branch, BranchName: wire.BranchName,
 		Revision: wire.Revision, RevisionNumber: wire.RevisionNumber,
-		RevisionLocal: wire.RevisionLocal, RevisionRemote: wire.RevisionRemote,
+		RevisionStaged: wire.RevisionStaged, RevisionMerged: wire.RevisionMerged,
+		MergedParentBranch: wire.MergedParentBranch,
+		RevisionLocal:      wire.RevisionLocal, RevisionRemote: wire.RevisionRemote,
 		RemoteAvailable: bool(wire.RemoteAvailable), RemoteAuthorized: bool(wire.RemoteAuthorized),
 		RemoteBranchExist: bool(wire.RemoteBranchExist),
 		IsLocalAhead:      bool(wire.IsLocalAhead), IsRemoteAhead: bool(wire.IsRemoteAhead),

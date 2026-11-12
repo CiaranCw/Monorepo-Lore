@@ -587,6 +587,196 @@ func TestEndToEndBatchGitImportResumePostCommitAndSnapshotPublish(t *testing.T) 
 	}
 }
 
+func TestMergeOperationCheckpointRecovery(t *testing.T) {
+	loreBin := findRealLore(t)
+	gitBin := findRealGit(t)
+	cases := []struct {
+		name       string
+		mergeIndex int
+		phase      string
+	}{
+		{name: "two-parent-after-merge-start", mergeIndex: 0, phase: "after_merge_start"},
+		{name: "two-parent-after-lore-commit", mergeIndex: 0, phase: "after_commit"},
+		{name: "octopus-after-merge-start", mergeIndex: 1, phase: "after_merge_start"},
+		{name: "octopus-bridge-after-lore-commit", mergeIndex: 1, phase: "after_commit"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			source, expectedCommits := buildComplexSyntheticGitRepo(t, gitBin, root)
+			cmd := exec.Command(gitBin, "-C", source, "rev-list", "--merges", "--reverse", "--all")
+			raw, err := cmd.Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			mergeSHAs := strings.Fields(string(raw))
+			if tc.mergeIndex >= len(mergeSHAs) {
+				t.Fatalf("need merge index %d, have %d", tc.mergeIndex, len(mergeSHAs))
+			}
+			targetSHA := mergeSHAs[tc.mergeIndex]
+
+			db, err := database.Open(filepath.Join(root, "manager.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			owner, err := user.Create(ctx, db, "test", "owner", "correct-horse", "user")
+			if err != nil {
+				t.Fatal(err)
+			}
+			proj, err := project.CreateProject(ctx, db, "owner", project.Project{
+				Name: "Recovery", ParentRepositoryID: "00112233445566778899aabbccddeeff",
+				ParentRepositoryURL: "lore://local/recovery-parent", CreatedBy: owner,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := project.AddMember(ctx, db, "owner", proj.ID, owner, project.RoleAdmin); err != nil {
+				t.Fatal(err)
+			}
+			executor := loreexec.Executor{Config: loreexec.Config{Binary: loreBin, Timeout: 2 * time.Minute}}
+			importer := &Importer{
+				DB: db, Lore: &loreadapter.Client{Exec: executor},
+				GitBinary: gitBin, WorkspaceRoot: filepath.Join(root, "workspace"),
+			}
+			injected := false
+			importer.OperationFaultHook = func(_ string, sha, phase string) error {
+				if !injected && sha == targetSHA && phase == tc.phase {
+					injected = true
+					return errors.New("simulated operation interruption")
+				}
+				return nil
+			}
+			manifest := Manifest{
+				JobKey: "recover-" + strings.ReplaceAll(tc.name, "_", "-"), Project: "Recovery",
+				Repositories: []RepoSpec{{
+					SourceURL: source, ModuleName: "Engine", MountPath: "Engine",
+					LFSMode: LFSModePointer,
+				}},
+			}
+			first, err := importer.Run(ctx, "owner", manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.Status != "failed" || !injected {
+				t.Fatalf("first run did not stop at %s: %+v", tc.phase, first)
+			}
+			importer.OperationFaultHook = nil
+			resumed, err := importer.Run(ctx, "owner", manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resumed.Status != "succeeded" || len(resumed.Items) != 1 {
+				t.Fatalf("resume failed: %+v", resumed)
+			}
+			ver := resumed.Items[0].Verification
+			if !ver.Passed || ver.IndexedCommits != expectedCommits ||
+				ver.MergeCommitsVerified != 2 || ver.OctopusMergesVerified != 1 ||
+				ver.SyntheticMergeBridges != 1 {
+				t.Fatalf("verification mismatch: %+v", ver)
+			}
+			var realCount, sourceCount int
+			if err := db.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT source_commit_id)
+				FROM module_commits WHERE module_id=? AND is_synthetic=0`,
+				resumed.Items[0].ModuleID).Scan(&realCount, &sourceCount); err != nil {
+				t.Fatal(err)
+			}
+			if realCount != expectedCommits || sourceCount != expectedCommits {
+				t.Fatalf("duplicate or missing revisions: rows=%d sources=%d want=%d", realCount, sourceCount, expectedCommits)
+			}
+		})
+	}
+}
+
+func TestFirstParentPublishPath(t *testing.T) {
+	z := zeroHash64
+	dag := map[string]loreadapter.HistoryEntry{
+		"a": {Revision: "a", Parent: []string{z, z}},
+		"b": {Revision: "b", Parent: []string{"a", z}},
+		"c": {Revision: "c", Parent: []string{"b", "side"}},
+	}
+	got, err := firstParentPublishPath(dag, "a", "c")
+	if err != nil || strings.Join(got, ",") != "b,c" {
+		t.Fatalf("path=%v err=%v", got, err)
+	}
+	all, err := firstParentPublishPath(dag, z, "c")
+	if err != nil || strings.Join(all, ",") != "a,b,c" {
+		t.Fatalf("root path=%v err=%v", all, err)
+	}
+	dag["c"] = loreadapter.HistoryEntry{Revision: "c", Parent: []string{"other", z}}
+	if _, err := firstParentPublishPath(dag, "a", "c"); err == nil {
+		t.Fatal("diverged remote was accepted")
+	}
+}
+
+func TestMergeCommitContainingConflictMarkers(t *testing.T) {
+	loreBin := findRealLore(t)
+	gitBin := findRealGit(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := gitExecHelper{t: t, bin: gitBin, dir: source}
+	git.run(nil, "init", "-b", "main")
+	_ = os.WriteFile(filepath.Join(source, ".gitignore"), []byte("base\n"), 0o644)
+	git.run(nil, "add", ".gitignore")
+	_ = git.commitAs("Dev", "dev@example.com", "2025-06-01T00:00:00Z", "root", false)
+	git.run(nil, "checkout", "-b", "feature")
+	_ = os.WriteFile(filepath.Join(source, ".gitignore"), []byte("feature\n"), 0o644)
+	git.run(nil, "add", ".gitignore")
+	_ = git.commitAs("Dev", "dev@example.com", "2025-06-02T00:00:00Z", "feature", false)
+	git.run(nil, "checkout", "main")
+	_ = os.WriteFile(filepath.Join(source, ".gitignore"), []byte("main\n"), 0o644)
+	git.run(nil, "add", ".gitignore")
+	_ = git.commitAs("Dev", "dev@example.com", "2025-06-03T00:00:00Z", "main", false)
+	merge := exec.Command(gitBin, "merge", "--no-commit", "feature")
+	merge.Dir = source
+	_ = merge.Run()
+	committedMarkers := "<<<<<<< HEAD\nmain\n=======\nfeature\n>>>>>>> feature\n"
+	_ = os.WriteFile(filepath.Join(source, ".gitignore"), []byte(committedMarkers), 0o644)
+	git.run(nil, "add", ".gitignore")
+	_ = git.commitAs("Dev", "dev@example.com", "2025-06-04T00:00:00Z", "merge markers intentionally", false)
+
+	db, err := database.Open(filepath.Join(root, "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	owner, _ := user.Create(ctx, db, "test", "owner", "correct-horse", "user")
+	proj, err := project.CreateProject(ctx, db, "owner", project.Project{
+		Name: "Markers", ParentRepositoryID: "00112233445566778899aabbccddeeff",
+		ParentRepositoryURL: "lore://local/markers-parent", CreatedBy: owner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = project.AddMember(ctx, db, "owner", proj.ID, owner, project.RoleAdmin)
+	executor := loreexec.Executor{Config: loreexec.Config{Binary: loreBin, Timeout: 2 * time.Minute}}
+	importer := Importer{
+		DB: db, Lore: &loreadapter.Client{Exec: executor}, GitBinary: gitBin,
+		WorkspaceRoot: filepath.Join(root, "workspace"),
+	}
+	result, err := importer.Run(ctx, "owner", Manifest{
+		JobKey: "committed-markers", Project: "Markers",
+		Repositories: []RepoSpec{{SourceURL: source, ModuleName: "Game", MountPath: "Game"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "succeeded" || !result.Items[0].Verification.Passed {
+		t.Fatalf("import failed: %+v", result)
+	}
+	ver := result.Items[0].Verification
+	if ver.SourceCommits != 4 || ver.IndexedCommits != 4 ||
+		ver.MergeCommitsVerified != 1 || ver.SyntheticMergeBridges != 1 ||
+		ver.HeadGitDigest != ver.HeadLoreDigest {
+		t.Fatalf("verification mismatch: %+v", ver)
+	}
+}
+
 type postImportPublishDriver struct {
 	revs  map[string]string
 	links map[string]string

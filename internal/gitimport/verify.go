@@ -775,6 +775,13 @@ func (im *Importer) verifyImportedModule(
 }
 
 func verifyPhysicalLoreParents(le loreadapter.HistoryEntry, wantParentRevs []string, loreDAG map[string]loreadapter.HistoryEntry) bool {
+	if len(le.Parent) > 0 && (len(le.Parent) < 2 || le.Parent[1] == zeroHash64) {
+		if bridge, ok := loreDAG[le.Parent[0]]; ok &&
+			bridge.Metadata["git.synthetic"] == "1" &&
+			bridge.Metadata["git.merge_bridge"] == le.Metadata["git.commit"] {
+			le = bridge
+		}
+	}
 	p0, p1 := "", ""
 	if len(le.Parent) > 0 && le.Parent[0] != zeroHash64 {
 		p0 = le.Parent[0]
