@@ -173,3 +173,29 @@ func makeModule(t *testing.T, db *sql.DB, projectID int64, name, repo, mount str
 	}
 	return m.ID
 }
+
+func TestListAccessibleModulesIncludesRecordedDefaultBranch(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	carol := makeUser(t, db, "carol")
+	alice := makeUser(t, db, "alice")
+	proj := makeProject(t, db, carol, "Alpha", "00112233445566778899aabbccddeeff")
+	if err := project.AddMember(ctx, db, "carol", proj, alice, project.RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	mod := makeModule(t, db, proj, "Engine", "0123456789abcdef0123456789abcdef", "Engine")
+	if err := project.SetModulePermission(ctx, db, "carol", alice, mod, project.PermWrite); err != nil {
+		t.Fatal(err)
+	}
+	rev := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := db.Exec(`INSERT INTO module_refs(module_id, ref_type, ref_name, lore_revision, is_default) VALUES (?, 'branch', 'master', ?, 1)`, mod, rev); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO module_refs(module_id, ref_type, ref_name, lore_revision, is_default) VALUES (?, 'branch', 'main', ?, 0)`, mod, rev); err != nil {
+		t.Fatal(err)
+	}
+	mods, err := (Service{DB: db}).ListAccessibleModules(ctx, alice)
+	if err != nil || len(mods) != 1 || mods[0].DefaultBranch != "master" {
+		t.Fatalf("default branch %+v %v", mods, err)
+	}
+}

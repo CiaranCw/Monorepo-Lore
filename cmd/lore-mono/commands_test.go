@@ -243,3 +243,38 @@ func TestCloneFailureRemovesWorkspace(t *testing.T) {
 		t.Fatal("failed clone left a directory")
 	}
 }
+
+func TestBatchCloneSwitchesToRecordedDefaultBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/auth/me" {
+			_, _ = w.Write([]byte("Token: token-value\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[{"ProjectName":"Alpha","Name":"Engine","MountPath":"Engine","RepositoryURL":"grpc://127.0.0.1:53547/engine","DefaultBranch":"master"}]}`))
+	}))
+	defer srv.Close()
+	root := t.TempDir()
+	cfgPath := filepath.Join(root, "client.toml")
+	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: "lore", Project: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	prev := execRun
+	execRun = func(_ context.Context, _ string, req loreexec.Request) (loreexec.CommandResult, error) {
+		if len(req.Argv) > 0 && req.Argv[0] == "auth" {
+			return loreexec.CommandResult{ExitCode: 0, Stdout: "Token: token-value\n"}, nil
+		}
+		calls = append(calls, strings.Join(req.Argv, " "))
+		return loreexec.CommandResult{ExitCode: 0}, nil
+	}
+	defer func() { execRun = prev }()
+	prevOut := stdout
+	stdout = &bytes.Buffer{}
+	defer func() { stdout = prevOut }()
+	if err := batchAction("clone", []string{"--all-authorized", "--config", cfgPath, "--root", root}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || !strings.HasPrefix(calls[0], "clone ") || !strings.Contains(calls[1], "branch switch") || !strings.Contains(calls[1], "master") {
+		t.Fatalf("clone calls %v", calls)
+	}
+}

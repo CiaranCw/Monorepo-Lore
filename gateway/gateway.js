@@ -300,6 +300,8 @@ function startAuthProxy() {
   proxy.on("stream", (stream, headers) => {
     stream.on("error", () => {});
     if (!guard(stream.session.socket)) return;
+    const rpc = String(headers[":path"] || "");
+    log({ event: "auth_stream", rpc: rpc });
     const out = {};
     for (const key of Object.keys(headers)) {
       if (key === ":authority") out[key] = target.host;
@@ -309,20 +311,28 @@ function startAuthProxy() {
     let up;
     try { up = authUpstreamSession().request(out); }
     catch (err) {
+      log({ event: "auth_request_error", rpc: rpc, message: err.message });
       try { stream.respond({ ":status": 200, "grpc-status": "14", "content-type": "application/grpc" }, { endStream: true }); } catch (_e) {}
       return;
     }
     stream.pipe(up);
     up.on("response", (responseHeaders, flags) => {
+      log({ event: "auth_response", rpc: rpc, status: responseHeaders[":status"], grpc: responseHeaders["grpc-status"] || "" });
       const endStream = Boolean(flags & http2.constants.NGHTTP2_FLAG_END_STREAM);
       try { stream.respond(responseHeaders, { waitForTrailers: !endStream, endStream: endStream }); } catch (_e) {}
     });
     up.on("data", (chunk) => {
       if (!stream.write(chunk)) { up.pause(); stream.once("drain", () => up.resume()); }
     });
-    up.on("trailers", (value) => { stream.on("wantTrailers", () => { try { stream.sendTrailers(value); } catch (_e) {} }); });
+    up.on("trailers", (value) => {
+      log({ event: "auth_trailers", rpc: rpc, grpc: value["grpc-status"] || "" });
+      stream.on("wantTrailers", () => { try { stream.sendTrailers(value); } catch (_e) {} });
+    });
     up.on("end", () => { try { stream.end(); } catch (_e) {} });
-    up.on("error", () => { try { stream.close(http2.constants.NGHTTP2_CANCEL); } catch (_e) {} });
+    up.on("error", (err) => {
+      log({ event: "auth_upstream_error", rpc: rpc, message: err.message });
+      try { stream.close(http2.constants.NGHTTP2_CANCEL); } catch (_e) {}
+    });
     stream.on("aborted", () => { try { up.close(http2.constants.NGHTTP2_CANCEL); } catch (_e) {} });
   });
   proxy.listen(authPort, host, () => {

@@ -24,7 +24,6 @@ const (
 	argonThreads = 2
 	argonKeyLen  = 32
 	saltLen      = 16
-	minPassword  = 10
 )
 
 var (
@@ -45,8 +44,8 @@ type User struct {
 
 // HashPassword returns an Argon2id PHC string.
 func HashPassword(password string) (string, error) {
-	if len(password) < minPassword {
-		return "", fmt.Errorf("password must be at least %d characters", minPassword)
+	if password == "" {
+		return "", fmt.Errorf("password is empty")
 	}
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {

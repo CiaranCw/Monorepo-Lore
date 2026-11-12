@@ -158,7 +158,13 @@ func Login(ctx context.Context, cfg Config, username string, password []byte, ex
 		return err
 	}
 	defer wipe(token)
-	if err := storeIdentity(ctx, cfg, exec, token); err != nil {
+	remote := cfg.RemoteURL
+	if strings.TrimSpace(remote) == "" {
+		if found, findErr := firstRepositoryURL(ctx, cfg, token); findErr == nil {
+			remote = found
+		}
+	}
+	if err := storeIdentity(ctx, cfg, exec, token, remote); err != nil {
 		return err
 	}
 	if err := confirmIdentity(ctx, cfg, exec, subject, name); err != nil {
@@ -218,13 +224,13 @@ func fetchIdentity(ctx context.Context, cfg Config, username string, password []
 	return []byte(parsed.IdentityToken), subject, parsed.Username, nil
 }
 
-func storeIdentity(ctx context.Context, cfg Config, exec loreexec.Executor, token []byte) error {
+func storeIdentity(ctx context.Context, cfg Config, exec loreexec.Executor, token []byte, remote string) error {
 	argv := []string{"login", "--token-type", "lore", "--token", string(token)}
 	if cfg.AuthURL != "" {
 		argv = append(argv, "--auth-url", cfg.AuthURL)
 	}
-	if cfg.RemoteURL != "" {
-		argv = append(argv, cfg.RemoteURL)
+	if strings.TrimSpace(remote) != "" {
+		argv = append(argv, remote)
 	}
 	res, err := exec.Run(ctx, loreexec.Request{Argv: argv, Env: loreEnv(cfg)})
 	if err != nil || !res.ProcessSucceeded() {
@@ -258,10 +264,44 @@ func loreEnv(cfg Config) map[string]string {
 	if cfg.AuthPath != "" {
 		env["LORE_AUTH_PATH"] = cfg.AuthPath
 	}
+	if cfg.CAFile != "" {
+		env["SSL_CERT_FILE"] = cfg.CAFile
+	}
 	if len(env) == 0 {
 		return nil
 	}
 	return env
+}
+
+func firstRepositoryURL(ctx context.Context, cfg Config, token []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(cfg.ManagerURL, "/")+"/api/v1/me/modules", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+	res, err := HTTPClient(cfg).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil || res.StatusCode != http.StatusOK {
+		return "", errors.New("module list failed")
+	}
+	var parsed struct {
+		Modules []struct {
+			RepositoryURL string
+		}
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", err
+	}
+	for _, m := range parsed.Modules {
+		if strings.TrimSpace(m.RepositoryURL) != "" {
+			return m.RepositoryURL, nil
+		}
+	}
+	return "", errors.New("no repository")
 }
 
 func subjectOf(token string) (string, error) {
