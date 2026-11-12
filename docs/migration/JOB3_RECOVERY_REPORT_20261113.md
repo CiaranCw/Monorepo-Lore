@@ -34,6 +34,19 @@ Pre-recovery cold backup:
 The backup was opened on isolated ports 54137/54139. Repository lookup and
 SQLite checks passed. Older backups were retained.
 
+Post-recovery cold backup:
+
+```text
+/data/lore-lab/monorepo-p3b/kubee-formal-20261111T184000Z/backup/post-job3-recovery-20261112T211720Z
+```
+
+- 211,936 files;
+- 125,905,890,417 bytes;
+- Job 3 `succeeded`, 60 modules, 1,944 revisions;
+- isolated restore check PASS;
+- `SHA256SUMS` SHA-256:
+  `137cd0574b79956d0d4db9133479f4b358178e9b5b1dd9abfa3ca8d283f450b3`.
+
 ## Recovery implementation
 
 The migration-only `lore-fragment-repair` tool uses Lore's official
