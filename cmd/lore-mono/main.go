@@ -41,6 +41,12 @@ func run(args []string) int {
 		}
 		fmt.Fprintln(stdout, "logged in")
 		return 0
+	case "password":
+		if err := changePasswordCmd(args[1:]); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 1
+		}
+		return 0
 	case "logout", "project", "module", "clone", "status", "sync", "commit", "push", "publish", "history", "refs", "show", "import":
 		if err := dispatch(args); err != nil {
 			fmt.Fprintln(stderr, err.Error())
@@ -213,6 +219,7 @@ const usage = `lore-mono is the user command for the Lore monorepo Manager.
 
 Usage:
   lore-mono login [--config file] [--manager url] [--username name] [--password-stdin]
+  lore-mono password [--config file] [--password-stdin]
   lore-mono logout [--config file]
   lore-mono project list [--config file]
   lore-mono project use <project> [--config file]

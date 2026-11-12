@@ -157,13 +157,14 @@ func cloneCmd(args []string) error {
 			Name          string
 			MountPath     string
 			RepositoryURL string
+			DefaultBranch string
 		}
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return fmt.Errorf("clone failed")
 	}
 	var chosen *struct {
-		ProjectName, Name, MountPath, RepositoryURL string
+		ProjectName, Name, MountPath, RepositoryURL, DefaultBranch string
 	}
 	for _, m := range parsed.Modules {
 		if cfg.Project != "" && m.ProjectName != cfg.Project {
@@ -172,8 +173,8 @@ func cloneCmd(args []string) error {
 		if m.Name == name {
 			item := m
 			chosen = &struct {
-				ProjectName, Name, MountPath, RepositoryURL string
-			}{item.ProjectName, item.Name, item.MountPath, item.RepositoryURL}
+				ProjectName, Name, MountPath, RepositoryURL, DefaultBranch string
+			}{item.ProjectName, item.Name, item.MountPath, item.RepositoryURL, item.DefaultBranch}
 			break
 		}
 	}
@@ -186,12 +187,16 @@ func cloneCmd(args []string) error {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return fmt.Errorf("clone failed")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{Argv: []string{"clone", chosen.RepositoryURL, dest}, Env: loreEnv(cfg)})
 	if err != nil || res.ExitCode != 0 {
 		_ = os.RemoveAll(dest)
 		return fmt.Errorf("clone failed")
+	}
+	if err := switchDefaultBranch(ctx, cfg, dest, chosen.DefaultBranch); err != nil {
+		_ = os.RemoveAll(dest)
+		return err
 	}
 	fmt.Fprintln(stdout, dest)
 	return nil
@@ -314,6 +319,7 @@ func batchAction(action string, args []string) error {
 			Name          string
 			MountPath     string
 			RepositoryURL string
+			DefaultBranch string
 		}
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
@@ -323,9 +329,12 @@ func batchAction(action string, args []string) error {
 		return fmt.Errorf("module is not accessible")
 	}
 	okN, failN := 0, 0
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	for _, item := range parsed.Results {
+		limit := 2 * time.Minute
+		if action == "clone" {
+			limit = 45 * time.Minute
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), limit)
 		dir := filepath.Join(root, item.MountPath)
 		var argv []string
 		switch action {
@@ -342,10 +351,21 @@ func batchAction(action string, args []string) error {
 		}
 		res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{Argv: argv, Env: loreEnv(cfg)})
 		if err != nil || res.ExitCode != 0 {
+			cancel()
 			failN++
 			fmt.Fprintf(stdout, "%s\t%s\tfailed\n", item.ProjectName, item.Name)
 			continue
 		}
+		if action == "clone" {
+			if err := switchDefaultBranch(ctx, cfg, dir, item.DefaultBranch); err != nil {
+				cancel()
+				_ = os.RemoveAll(dir)
+				failN++
+				fmt.Fprintf(stdout, "%s\t%s\tfailed\n", item.ProjectName, item.Name)
+				continue
+			}
+		}
+		cancel()
 		okN++
 		fmt.Fprintf(stdout, "%s\t%s\tok\n", item.ProjectName, item.Name)
 	}
@@ -366,6 +386,101 @@ func hasAny(args []string, flags ...string) bool {
 		}
 	}
 	return false
+}
+
+func changePasswordCmd(args []string) error {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--password=") || arg == "--password" {
+			return fmt.Errorf("password must not be passed as an argument")
+		}
+	}
+	cfg, err := loadCmd(args)
+	if err != nil {
+		return err
+	}
+	stdinPassword := false
+	for _, arg := range args {
+		if arg == "--password-stdin" {
+			stdinPassword = true
+		}
+	}
+	var password []byte
+	if stdinPassword {
+		line, err := readLine()
+		if err != nil {
+			return fmt.Errorf("password failed")
+		}
+		password = []byte(strings.TrimRight(line, "\r\n"))
+	} else {
+		fmt.Fprint(stderr, "New password: ")
+		password, err = readPassword()
+		fmt.Fprintln(stderr)
+		if err != nil {
+			return fmt.Errorf("password failed")
+		}
+		fmt.Fprint(stderr, "Confirm password: ")
+		again, againErr := readPassword()
+		fmt.Fprintln(stderr)
+		if againErr != nil {
+			wipe(password)
+			return fmt.Errorf("password failed")
+		}
+		if string(password) != string(again) {
+			wipe(password)
+			wipe(again)
+			return fmt.Errorf("password failed")
+		}
+		wipe(again)
+	}
+	defer wipe(password)
+	if len(password) == 0 {
+		return fmt.Errorf("password failed")
+	}
+	payload, err := json.Marshal(map[string]string{"password": string(password)})
+	if err != nil {
+		return fmt.Errorf("password failed")
+	}
+	defer wipe(payload)
+	token, err := identityToken(cfg)
+	if err != nil {
+		return err
+	}
+	defer wipe([]byte(token))
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(cfg.ManagerURL, "/")+"/api/v1/auth/password", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("password failed")
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.HTTPClient(cfg).Do(req)
+	if err != nil {
+		return fmt.Errorf("password failed")
+	}
+	defer res.Body.Close()
+	resp, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("password failed")
+	}
+	if bytes.Contains(resp, password) {
+		return fmt.Errorf("password failed")
+	}
+	fmt.Fprintln(stdout, "password updated")
+	return nil
+}
+
+func switchDefaultBranch(ctx context.Context, cfg client.Config, dir, branch string) error {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return nil
+	}
+	res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{
+		Argv: []string{"branch", "switch", "--reset", "--repository", dir, branch},
+		Env:  loreEnv(cfg),
+	})
+	if err != nil || res.ExitCode != 0 {
+		return fmt.Errorf("clone failed")
+	}
+	return nil
 }
 
 func managerPOST(cfg client.Config, path string, payload []byte) ([]byte, error) {

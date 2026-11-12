@@ -79,6 +79,35 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) changePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	raw := bearerToken(r)
+	session, err := authbridge.AuthenticateIdentity(r.Context(), a.Tokens, authbridge.UserDirectory{Get: a.userByID}, raw)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	password := body.Password
+	body.Password = ""
+	defer func() {
+		password = ""
+	}()
+	if err := user.SetPassword(r.Context(), a.DB, session.User.Username, session.User.Username, password); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
 func (a *App) me(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
