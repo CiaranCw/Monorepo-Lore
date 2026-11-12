@@ -205,6 +205,9 @@ type Importer struct {
 	// OperationFaultHook is invoked at mutation boundaries that FaultHook cannot
 	// observe: merge start and Lore commit before SQLite/checkpoint completion.
 	OperationFaultHook func(moduleName, sourceCommit, phase string) error
+	// ResumeModules limits execution of an existing job to selected modules.
+	// Unselected items retain their stored result and are never mutated.
+	ResumeModules map[string]bool
 
 	// AfterInspectRefs is a test-only hook invoked right after InspectRemoteRefs and
 	// before SyncBareMirror to test upstream repository mutation detection during fetch.
@@ -350,9 +353,13 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			spec := m.Repositories[idx]
+			if len(im.ResumeModules) > 0 && !im.ResumeModules[spec.ModuleName] {
+				results[idx] = storedItemResult(items[idx], spec)
+				return
+			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			spec := m.Repositories[idx]
 			ms := mirrorStates[spec.SourceURL]
 			siblings := siblingSubdirsByURL[spec.SourceURL]
 			mirrorSpec := spec
@@ -419,6 +426,20 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 		SkippedItems:   skipped,
 		Items:          results,
 	}, nil
+}
+
+func storedItemResult(item storedItem, spec RepoSpec) ItemResult {
+	var verification VerificationReport
+	_ = json.Unmarshal([]byte(item.VerifyJSON), &verification)
+	return ItemResult{
+		ItemID: item.ItemID, Ord: item.Ord, ModuleName: spec.ModuleName,
+		MountPath: spec.MountPath, SourceURL: spec.SourceURL,
+		SourceSubdir: spec.SourceSubdir, Platform: spec.Platform,
+		AuthMethod: inferAuthMethodLabel(spec.Auth), Status: item.Status,
+		ModuleID: item.ModuleID, LoreRepositoryID: item.LoreRepoID,
+		LoreRepositoryURL: item.LoreRepoURL, Verification: verification,
+		Error: item.Error,
+	}
 }
 
 type storedItem struct {
