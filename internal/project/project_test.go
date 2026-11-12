@@ -95,6 +95,15 @@ func TestProjectCRUD(t *testing.T) {
 	}
 }
 
+func TestNameAllowsLeadingDigit(t *testing.T) {
+	if err := ValidateName("2199"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateName("-2199"); err == nil {
+		t.Fatal("leading hyphen accepted")
+	}
+}
+
 func TestProjectValidation(t *testing.T) {
 	ctx := context.Background()
 	db, uid := setup(t)

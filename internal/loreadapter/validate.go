@@ -11,7 +11,7 @@ import (
 var (
 	hash32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	hash64 = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	nameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,62}$`)
+	nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 )
 
 func validateHash(v string, n int) error {
