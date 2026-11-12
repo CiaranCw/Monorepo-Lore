@@ -76,21 +76,22 @@ let session = null;
 
 function upstreamSession() {
   if (session && !session.closed && !session.destroyed) return session;
-  session = http2.connect(upstream, {
+  const created = http2.connect(upstream, {
     ca: ca,
     servername: "localhost",
     rejectUnauthorized: true,
   });
-  session.on("error", (err) => {
+  session = created;
+  created.on("error", (err) => {
     log({ event: "upstream_session_error", message: err.message });
-    session = null;
+    if (session === created) session = null;
   });
-  session.on("close", () => {
-    session = null;
+  created.on("close", () => {
+    if (session === created) session = null;
     log({ event: "upstream_session_close" });
   });
-  session.on("connect", () => {
-    const sock = session.socket;
+  created.on("connect", () => {
+    const sock = created.socket;
     log({
       event: "upstream_tls",
       authorized: Boolean(sock && sock.authorized),
@@ -99,7 +100,7 @@ function upstreamSession() {
       alpn: sock && sock.alpnProtocol ? sock.alpnProtocol : "",
     });
   });
-  return session;
+  return created;
 }
 
 function copyHeaders(headers) {

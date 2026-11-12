@@ -339,7 +339,7 @@ func (im *Importer) publishRemoteBranches(ctx context.Context, itemID int64, lor
 	for _, rev := range cp.CommitMap {
 		seeds = append(seeds, rev)
 	}
-	dag, _, err := readActualLoreDAG(ctx, im.Lore, loreWorkDir, seeds)
+	dag, localBranches, err := readActualLoreDAG(ctx, im.Lore, loreWorkDir, seeds)
 	if err != nil {
 		return fmt.Errorf("gitimport: read local Lore DAG before push: %w", err)
 	}
@@ -375,6 +375,38 @@ func (im *Importer) publishRemoteBranches(ctx context.Context, itemID int64, lor
 		path, err := firstParentPublishPath(dag, remote, target)
 		if err != nil {
 			return fmt.Errorf("gitimport: remote branch %s diverged: %w", branch, err)
+		}
+		canIncremental := true
+		branchID := localBranches[branch].ID
+		for _, rev := range path {
+			if branchID == "" || dag[rev].Metadata["branch"] != branchID {
+				canIncremental = false
+				break
+			}
+		}
+		if !canIncremental {
+			if err := im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true); err != nil {
+				return fmt.Errorf("gitimport: position branch %s at %s: %w", branch, short12(target), err)
+			}
+			if err := im.Lore.PushBranch(ctx, loreWorkDir, branch); err != nil {
+				return err
+			}
+			heads, err := im.remoteBranchHeads(ctx, loreWorkDir)
+			if err != nil {
+				return err
+			}
+			if heads[branch] != target {
+				return fmt.Errorf("gitimport: remote branch %s is %s after publishing %s", branch, short12(heads[branch]), short12(target))
+			}
+			cp.PushedBranches[branch] = true
+			cp.PublishedRevisions[branch] = target
+			if err := im.checkpointItemProgress(ctx, itemID, "pushing", *cp); err != nil {
+				return err
+			}
+			if err := im.verifyRemoteRevisionDAG(ctx, loreWorkDir, target, dag, verifiedRemote); err != nil {
+				return fmt.Errorf("gitimport: verify remote branch %s: %w", branch, err)
+			}
+			continue
 		}
 		for _, rev := range path {
 			if err := im.Lore.ResetBranch(ctx, loreWorkDir, branch, rev, true); err != nil {
@@ -1019,12 +1051,16 @@ func (im *Importer) replayGraphIntoLore(
 			currentBranch = lane
 		} else {
 			// Verify `lane` is actually positioned at `P1(c)`! If an earlier interrupted run left `lane` elsewhere, sync/switch cleanly.
-			if currentBranch != lane {
-				if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, "", true, true); err != nil {
+			expectedParent := firstParentRevision(c, cp.CommitMap)
+			if currentBranch != lane || expectedParent != "" && existingBranches[lane] != expectedParent {
+				if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, expectedParent, true, true); err != nil {
 					return err
 				}
 				cachedBlobs = map[string]string{}
 				currentBranch = lane
+				if expectedParent != "" {
+					existingBranches[lane] = expectedParent
+				}
 			}
 		}
 

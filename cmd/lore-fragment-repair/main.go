@@ -115,6 +115,7 @@ func (rawCodec) Unmarshal(data []byte, v any) error {
 
 type storageClient struct {
 	conn         *grpc.ClientConn
+	tokenMu      sync.RWMutex
 	token        string
 	repositoryID []byte
 }
@@ -178,6 +179,24 @@ func run(ctx context.Context, o options) error {
 		return fmt.Errorf("destination: %w", err)
 	}
 	defer dest.close()
+	refreshCtx, stopRefresh := context.WithCancel(ctx)
+	defer stopRefresh()
+	if o.Username != "" {
+		go func() {
+			ticker := time.NewTicker(3 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-refreshCtx.Done():
+					return
+				case <-ticker.C:
+					if refreshed, err := accessToken(refreshCtx, o, repoID); err == nil {
+						dest.setToken(refreshed)
+					}
+				}
+			}
+		}()
+	}
 
 	states, err := dest.query(ctx, addresses)
 	if err != nil {
@@ -220,42 +239,81 @@ func run(ctx context.Context, o options) error {
 	}
 	defer source.close()
 	done := loadProgress(o.Progress)
-	for index, a := range missing {
-		if done[a.String()] {
-			continue
-		}
-		src, err := source.get(ctx, a)
-		if err != nil {
-			return fmt.Errorf("source get %s: %w", a.String(), err)
-		}
-		if src.Address.String() != a.String() || uint32(len(src.Payload)) != src.PayloadSize {
-			return fmt.Errorf("source identity mismatch for %s", a.String())
-		}
-		if err := dest.put(ctx, src); err != nil {
-			return fmt.Errorf("destination put %s flags=%d wire_flags=%d payload=%d declared=%d content=%d sha256=%x: %w",
-				a.String(), src.Flags, src.Flags&^payloadStoredMask, len(src.Payload), src.PayloadSize,
-				src.ContentSize, sha256.Sum256(src.Payload), err)
-		}
-		got, err := dest.get(ctx, a)
-		if err != nil {
-			return fmt.Errorf("destination get %s: %w", a.String(), err)
-		}
-		if err := sameFragment(src, got); err != nil {
-			return fmt.Errorf("destination verification %s: %w", a.String(), err)
-		}
-		done[a.String()] = true
-		rep.Transferred++
-		rep.VerifiedAfter++
-		rep.TransferredAddress = append(rep.TransferredAddress, a.String())
-		if err := saveProgress(o.Progress, done); err != nil {
-			return err
-		}
-		if rep.Transferred%100 == 0 || index+1 == len(missing) {
-			fmt.Printf("transferred=%d/%d\n", rep.Transferred, len(missing))
-			if err := writeReport(o.Report, rep); err != nil {
-				return err
+	transferCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan address)
+	errs := make(chan error, 1)
+	var transferWG sync.WaitGroup
+	var progressMu sync.Mutex
+	for worker := 0; worker < o.Workers; worker++ {
+		transferWG.Add(1)
+		go func() {
+			defer transferWG.Done()
+			for a := range jobs {
+				if transferCtx.Err() != nil {
+					return
+				}
+				src, err := source.get(transferCtx, a)
+				if err == nil && (src.Address.String() != a.String() || uint32(len(src.Payload)) != src.PayloadSize) {
+					err = fmt.Errorf("source identity mismatch")
+				}
+				if err == nil {
+					err = dest.put(transferCtx, src)
+				}
+				var got fragment
+				if err == nil {
+					got, err = dest.get(transferCtx, a)
+				}
+				if err == nil {
+					err = sameFragment(src, got)
+				}
+				if err != nil {
+					select {
+					case errs <- fmt.Errorf("transfer %s flags=%d wire_flags=%d payload=%d declared=%d content=%d sha256=%x: %w",
+						a.String(), src.Flags, src.Flags&^payloadStoredMask, len(src.Payload),
+						src.PayloadSize, src.ContentSize, sha256.Sum256(src.Payload), err):
+					default:
+					}
+					cancel()
+					return
+				}
+				progressMu.Lock()
+				done[a.String()] = true
+				rep.Transferred++
+				rep.VerifiedAfter++
+				rep.TransferredAddress = append(rep.TransferredAddress, a.String())
+				count := rep.Transferred
+				saveErr := saveProgress(o.Progress, done)
+				if saveErr == nil && (count%100 == 0 || count == len(missing)) {
+					fmt.Printf("transferred=%d/%d\n", count, len(missing))
+					saveErr = writeReport(o.Report, rep)
+				}
+				progressMu.Unlock()
+				if saveErr != nil {
+					select {
+					case errs <- saveErr:
+					default:
+					}
+					cancel()
+					return
+				}
 			}
+		}()
+	}
+sendLoop:
+	for _, a := range missing {
+		select {
+		case jobs <- a:
+		case <-transferCtx.Done():
+			break sendLoop
 		}
+	}
+	close(jobs)
+	transferWG.Wait()
+	select {
+	case err := <-errs:
+		return err
+	default:
 	}
 	after, err := dest.query(ctx, addresses)
 	if err != nil {
@@ -531,14 +589,25 @@ func dialStorage(ctx context.Context, target, caFile, serverName, token string, 
 func (c *storageClient) close() { _ = c.conn.Close() }
 
 func (c *storageClient) authContext(ctx context.Context) context.Context {
+	c.tokenMu.RLock()
+	token := c.token
+	c.tokenMu.RUnlock()
 	pairs := []string{
 		"lore-partition-bin", string(c.repositoryID),
 		"urc-repository-id-bin", string(c.repositoryID),
 	}
-	if c.token != "" {
-		pairs = append(pairs, "authorization", "Bearer "+c.token)
+	if token != "" {
+		pairs = append(pairs, "authorization", "Bearer "+token)
 	}
 	return metadata.NewOutgoingContext(ctx, metadata.Pairs(pairs...))
+}
+
+func (c *storageClient) setToken(token string) {
+	c.tokenMu.Lock()
+	old := c.token
+	c.token = token
+	c.tokenMu.Unlock()
+	wipe([]byte(old))
 }
 
 func (c *storageClient) query(ctx context.Context, addresses []address) ([]int32, error) {
@@ -648,12 +717,13 @@ func accessToken(ctx context.Context, o options, repoID string) (string, error) 
 	defer wipe(password)
 	body, _ := json.Marshal(map[string]string{"username": o.Username, "password": string(password)})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(o.ManagerURL, "/")+"/api/v1/auth/login", bytes.NewReader(body))
-	wipe(body)
 	if err != nil {
+		wipe(body)
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	res, err := http.DefaultClient.Do(req)
+	wipe(body)
 	if err != nil {
 		return "", err
 	}

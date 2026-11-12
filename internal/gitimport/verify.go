@@ -750,7 +750,7 @@ func (im *Importer) verifyImportedModule(
 	if projGraph.DefaultBranch != "" && projGraph.Branches[projGraph.DefaultBranch] != "" {
 		headCommit, ok := projGraph.CommitsBySHA[projGraph.Branches[projGraph.DefaultBranch]]
 		if ok {
-			gitFiles, gitDigest, err := ComputeGitTreeContentDigest(ctx, im.GitBinary, mirrorDir, headCommit.TreeSHA, spec.SourceSubdir, spec.LFSMode, reader)
+			gitFiles, gitDigest, err := ComputeMappedGitTreeContentDigest(ctx, im.GitBinary, mirrorDir, headCommit.TreeSHA, spec.EffectiveMappings(), spec.LFSMode, reader)
 			if err != nil {
 				rep.Mismatches = append(rep.Mismatches, err.Error())
 			} else {

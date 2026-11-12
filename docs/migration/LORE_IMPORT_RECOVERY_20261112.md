@@ -217,3 +217,10 @@ manual-review items.
 - Authentication and permissions: unchanged.
 - Parent Snapshot and pins: unchanged.
 - Production deployment/recovery: not run.
+
+## Production follow-up
+
+Production recovery was subsequently completed. The authoritative execution
+record is `JOB3_RECOVERY_REPORT_20261113.md`. Job 3 is now succeeded and the
+previous nine manual-review fragment items were repaired through Lore's
+official StorageService API.
