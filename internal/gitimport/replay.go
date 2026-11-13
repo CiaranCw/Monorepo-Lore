@@ -1,6 +1,7 @@
 package gitimport
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 
 	"lore-monorepo/internal/database"
 	"lore-monorepo/internal/history"
+	"lore-monorepo/internal/loreadapter"
 	"lore-monorepo/internal/loreexec"
 	"lore-monorepo/internal/project"
 	"lore-monorepo/internal/user"
@@ -102,8 +104,14 @@ func (im *Importer) runImportItem(
 	if cp.CommitMap == nil {
 		cp.CommitMap = map[string]string{}
 	}
+	if cp.SyntheticBridges == nil {
+		cp.SyntheticBridges = map[string]string{}
+	}
 	if cp.PushedBranches == nil {
 		cp.PushedBranches = map[string]bool{}
+	}
+	if cp.PublishedRevisions == nil {
+		cp.PublishedRevisions = map[string]string{}
 	}
 	if st.BootstrapRev != "" && cp.BootstrapMainRev == "" {
 		cp.BootstrapMainRev = st.BootstrapRev
@@ -288,29 +296,11 @@ func (im *Importer) runImportItem(
 
 	// Step 5: If targeting a remote Lore Server, push active branches idempotently (checking remote branch head first).
 	if im.RemoteBaseURL != "" {
-		im.updateItemProgress(ctx, st.ItemID, "pushing", cp)
-		remoteHeads := map[string]string{}
-		if rbs, rErr := im.Lore.ListBranchesAt(ctx, st.LoreWorkPath, true); rErr == nil {
-			for _, rb := range rbs {
-				if !rb.Archived {
-					remoteHeads[rb.Name] = rb.Latest
-				}
-			}
-		}
-		for _, bName := range sortedKeys(projGraph.Branches) {
-			wantRev := cp.CommitMap[projGraph.Branches[bName]]
-			if remoteHeads[bName] == wantRev {
-				cp.PushedBranches[bName] = true
-				continue
-			}
-			if err := im.Lore.PushBranch(ctx, st.LoreWorkPath, bName); err != nil {
-				out.Status = "failed"
-				out.Error = err.Error()
-				im.saveItemFinal(ctx, st.ItemID, out)
-				return out
-			}
-			cp.PushedBranches[bName] = true
-			im.updateItemProgress(ctx, st.ItemID, "pushing", cp)
+		if err := im.publishRemoteBranches(ctx, st.ItemID, st.LoreWorkPath, &projGraph, &cp); err != nil {
+			out.Status = "failed"
+			out.Error = err.Error()
+			im.saveItemFinal(ctx, st.ItemID, out)
+			return out
 		}
 	}
 
@@ -339,6 +329,221 @@ func (im *Importer) runImportItem(
 	out.Status = "succeeded"
 	im.saveItemFinal(ctx, st.ItemID, out)
 	return out
+}
+
+func (im *Importer) publishRemoteBranches(ctx context.Context, itemID int64, loreWorkDir string, g *ProjectedGraph, cp *itemCheckpoint) error {
+	if err := im.checkpointItemProgress(ctx, itemID, "pushing", *cp); err != nil {
+		return err
+	}
+	var seeds []string
+	for _, rev := range cp.CommitMap {
+		seeds = append(seeds, rev)
+	}
+	dag, localBranches, err := readActualLoreDAG(ctx, im.Lore, loreWorkDir, seeds)
+	if err != nil {
+		return fmt.Errorf("gitimport: read local Lore DAG before push: %w", err)
+	}
+	verifiedRemote := map[string]bool{}
+	for _, branch := range sortedKeys(g.Branches) {
+		target := cp.CommitMap[g.Branches[branch]]
+		if target == "" {
+			return fmt.Errorf("gitimport: branch %s has no mapped target revision", branch)
+		}
+		remoteHeads, err := im.remoteBranchHeads(ctx, loreWorkDir)
+		if err != nil {
+			return err
+		}
+		remote := remoteHeads[branch]
+		if remote == target {
+			if _, err := im.Lore.RemoteRevisionDetail(ctx, loreWorkDir, target, false); err != nil {
+				return fmt.Errorf("gitimport: remote branch %s names unreadable revision %s: %w", branch, short12(target), err)
+			}
+			cp.PushedBranches[branch] = true
+			cp.PublishedRevisions[branch] = target
+			if err := im.checkpointItemProgress(ctx, itemID, "pushing", *cp); err != nil {
+				return err
+			}
+			if err := im.verifyRemoteRevisionDAG(ctx, loreWorkDir, target, dag, verifiedRemote); err != nil {
+				return fmt.Errorf("gitimport: verify remote branch %s: %w", branch, err)
+			}
+			continue
+		}
+		// Publish one first-parent step at a time. A long Lore 0.10.1 push can
+		// be interrupted after advancing the remote branch but before every
+		// referenced fragment is durable. Short, verified transitions bound
+		// that failure window and make the remote head the durable checkpoint.
+		path, err := firstParentPublishPath(dag, remote, target)
+		if err != nil {
+			return fmt.Errorf("gitimport: remote branch %s diverged: %w", branch, err)
+		}
+		canIncremental := true
+		branchID := localBranches[branch].ID
+		for _, rev := range path {
+			if branchID == "" || dag[rev].Metadata["branch"] != branchID {
+				canIncremental = false
+				break
+			}
+		}
+		if !canIncremental {
+			if err := im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true); err != nil {
+				return fmt.Errorf("gitimport: position branch %s at %s: %w", branch, short12(target), err)
+			}
+			if err := im.Lore.PushBranch(ctx, loreWorkDir, branch); err != nil {
+				return err
+			}
+			heads, err := im.remoteBranchHeads(ctx, loreWorkDir)
+			if err != nil {
+				return err
+			}
+			if heads[branch] != target {
+				return fmt.Errorf("gitimport: remote branch %s is %s after publishing %s", branch, short12(heads[branch]), short12(target))
+			}
+			cp.PushedBranches[branch] = true
+			cp.PublishedRevisions[branch] = target
+			if err := im.checkpointItemProgress(ctx, itemID, "pushing", *cp); err != nil {
+				return err
+			}
+			if err := im.verifyRemoteRevisionDAG(ctx, loreWorkDir, target, dag, verifiedRemote); err != nil {
+				return fmt.Errorf("gitimport: verify remote branch %s: %w", branch, err)
+			}
+			continue
+		}
+		for _, rev := range path {
+			if err := im.Lore.ResetBranch(ctx, loreWorkDir, branch, rev, true); err != nil {
+				return fmt.Errorf("gitimport: position branch %s at %s: %w", branch, short12(rev), err)
+			}
+			if err := im.Lore.PushBranch(ctx, loreWorkDir, branch); err != nil {
+				_ = im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true)
+				return err
+			}
+			heads, err := im.remoteBranchHeads(ctx, loreWorkDir)
+			if err != nil {
+				_ = im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true)
+				return err
+			}
+			if heads[branch] != rev {
+				_ = im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true)
+				return fmt.Errorf("gitimport: remote branch %s is %s after publishing %s", branch, short12(heads[branch]), short12(rev))
+			}
+			if _, err := im.Lore.RemoteRevisionDetail(ctx, loreWorkDir, rev, false); err != nil {
+				_ = im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true)
+				return fmt.Errorf("gitimport: remote revision %s on %s is unreadable: %w", short12(rev), branch, err)
+			}
+			cp.PublishedRevisions[branch] = rev
+			if err := im.checkpointItemProgress(ctx, itemID, "pushing", *cp); err != nil {
+				_ = im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true)
+				return err
+			}
+		}
+		if err := im.Lore.ResetBranch(ctx, loreWorkDir, branch, target, true); err != nil {
+			return err
+		}
+		cp.PushedBranches[branch] = true
+		cp.PublishedRevisions[branch] = target
+		if err := im.checkpointItemProgress(ctx, itemID, "pushing", *cp); err != nil {
+			return err
+		}
+		if err := im.verifyRemoteRevisionDAG(ctx, loreWorkDir, target, dag, verifiedRemote); err != nil {
+			return fmt.Errorf("gitimport: verify remote branch %s: %w", branch, err)
+		}
+	}
+	if g.DefaultBranch != "" {
+		if target := cp.CommitMap[g.Branches[g.DefaultBranch]]; target != "" {
+			if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, g.DefaultBranch, target, true, true); err != nil {
+				return fmt.Errorf("gitimport: restore default branch %s: %w", g.DefaultBranch, err)
+			}
+		}
+	}
+	verifyRoot := loreWorkDir + "-remote-verify"
+	if err := os.RemoveAll(verifyRoot); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(verifyRoot, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(verifyRoot)
+	for _, branch := range sortedKeys(g.Branches) {
+		target := cp.CommitMap[g.Branches[branch]]
+		path := filepath.Join(verifyRoot, strings.ReplaceAll(branch, "/", "_"))
+		if err := im.Lore.Clone(ctx, loreadapter.CloneOptions{
+			URL: cp.LoreRepositoryURL, Path: path, Revision: target, Bare: true,
+			ExpectRepositoryID: cp.LoreRepositoryID,
+		}); err != nil {
+			return fmt.Errorf("gitimport: remote clone verification failed for branch %s at %s: %w", branch, short12(target), err)
+		}
+	}
+	return nil
+}
+
+func (im *Importer) verifyRemoteRevisionDAG(ctx context.Context, loreWorkDir, tip string, local map[string]loreadapter.HistoryEntry, verified map[string]bool) error {
+	queue := []string{tip}
+	for len(queue) > 0 {
+		rev := queue[0]
+		queue = queue[1:]
+		if rev == "" || rev == zeroHash64 || verified[rev] {
+			continue
+		}
+		entry, ok := local[rev]
+		if !ok {
+			return fmt.Errorf("local revision %s is missing", short12(rev))
+		}
+		remote, err := im.Lore.RemoteRevisionDetail(ctx, loreWorkDir, rev, false)
+		if err != nil {
+			return fmt.Errorf("remote revision %s is unreadable: %w", short12(rev), err)
+		}
+		if len(remote.Parent) != len(entry.Parent) {
+			return fmt.Errorf("remote revision %s parent count %d != local %d", short12(rev), len(remote.Parent), len(entry.Parent))
+		}
+		for i := range entry.Parent {
+			if remote.Parent[i] != entry.Parent[i] {
+				return fmt.Errorf("remote revision %s parent %d is %s, want %s", short12(rev), i, short12(remote.Parent[i]), short12(entry.Parent[i]))
+			}
+			queue = append(queue, entry.Parent[i])
+		}
+		verified[rev] = true
+	}
+	return nil
+}
+
+func (im *Importer) remoteBranchHeads(ctx context.Context, loreWorkDir string) (map[string]string, error) {
+	branches, err := im.Lore.ListBranchesAt(ctx, loreWorkDir, true)
+	if err != nil {
+		return nil, fmt.Errorf("gitimport: list remote branches: %w", err)
+	}
+	out := map[string]string{}
+	for _, branch := range branches {
+		if !branch.Archived {
+			out[branch.Name] = branch.Latest
+		}
+	}
+	return out, nil
+}
+
+func firstParentPublishPath(dag map[string]loreadapter.HistoryEntry, remote, target string) ([]string, error) {
+	if target == "" || target == zeroHash64 {
+		return nil, fmt.Errorf("empty target revision")
+	}
+	var reverse []string
+	for current := target; current != "" && current != zeroHash64 && current != remote; {
+		entry, ok := dag[current]
+		if !ok {
+			return nil, fmt.Errorf("local revision %s is missing", short12(current))
+		}
+		reverse = append(reverse, current)
+		if len(entry.Parent) == 0 {
+			current = zeroHash64
+		} else {
+			current = entry.Parent[0]
+		}
+		if current == zeroHash64 && remote != "" && remote != zeroHash64 {
+			return nil, fmt.Errorf("remote revision %s is not a first-parent ancestor of %s", short12(remote), short12(target))
+		}
+	}
+	path := make([]string, len(reverse))
+	for i := range reverse {
+		path[len(reverse)-1-i] = reverse[i]
+	}
+	return path, nil
 }
 
 func (im *Importer) registerRemoteModuleForClone(ctx context.Context, actor string, projectID int64, spec RepoSpec, cp *itemCheckpoint) error {
@@ -449,9 +654,12 @@ func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 
 	if !dotLoreExists {
 		cp.CommitMap = map[string]string{}
+		cp.SyntheticBridges = map[string]string{}
 		cp.HelperBranches = nil
 		cp.SyntheticCount = 0
 		cp.PushedBranches = map[string]bool{}
+		cp.PublishedRevisions = map[string]string{}
+		cp.Pending = nil
 		if err := os.RemoveAll(loreWorkPath); err != nil {
 			return err
 		}
@@ -573,10 +781,17 @@ func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 	physicalDAG, _, err := readActualLoreDAG(ctx, im.Lore, loreWorkPath, seedRevs)
 	if err == nil {
 		reconciled := map[string]string{}
+		bridges := map[string]string{}
 		synthCount := 0
 		for rev, e := range physicalDAG {
 			if e.Metadata["git.synthetic"] == "1" {
 				synthCount++
+				if sha, step := e.Metadata["git.octopus"], e.Metadata["git.octopus_step"]; sha != "" && step != "" {
+					bridges[sha+":"+step] = rev
+				}
+				if sha := e.Metadata["git.merge_bridge"]; sha != "" {
+					bridges[sha+":conflict"] = rev
+				}
 				continue
 			}
 			if sha := e.Metadata["git.commit"]; sha != "" {
@@ -584,6 +799,7 @@ func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 			}
 		}
 		cp.CommitMap = reconciled
+		cp.SyntheticBridges = bridges
 		cp.SyntheticCount = synthCount
 	}
 	return nil
@@ -797,6 +1013,12 @@ func (im *Importer) replayGraphIntoLore(
 			if err := im.recordPathProjection(ctx, cp.ModuleID, existingRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
 				return err
 			}
+			if cp.Pending != nil && cp.Pending.SourceCommit == c.SHA {
+				cp.Pending = nil
+				if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 
@@ -829,12 +1051,16 @@ func (im *Importer) replayGraphIntoLore(
 			currentBranch = lane
 		} else {
 			// Verify `lane` is actually positioned at `P1(c)`! If an earlier interrupted run left `lane` elsewhere, sync/switch cleanly.
-			if currentBranch != lane {
-				if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, "", true, true); err != nil {
+			expectedParent := firstParentRevision(c, cp.CommitMap)
+			if currentBranch != lane || expectedParent != "" && existingBranches[lane] != expectedParent {
+				if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, expectedParent, true, true); err != nil {
 					return err
 				}
 				cachedBlobs = map[string]string{}
 				currentBranch = lane
+				if expectedParent != "" {
+					existingBranches[lane] = expectedParent
+				}
 			}
 		}
 
@@ -865,34 +1091,75 @@ func (im *Importer) replayGraphIntoLore(
 					return fmt.Errorf("gitimport: missing merge parent %s for %s", pSHA, c.SHA)
 				}
 				isFinalStep := mIdx == len(c.Parents)-1
-
-				mergeSourceBranch := ""
-				for bName, bLatest := range existingBranches {
-					if bName != lane && bLatest == pRev {
-						mergeSourceBranch = bName
-						break
+				bridgeKey := fmt.Sprintf("%s:%d", c.SHA, mIdx)
+				if !isFinalStep {
+					if bridgeRev := cp.SyntheticBridges[bridgeKey]; bridgeRev != "" {
+						if err := im.indexSyntheticBridge(ctx, cp.ModuleID, bridgeRev, spec.SourceSubdir, c, "octopus merge bridge"); err != nil {
+							return err
+						}
+						existingBranches[lane] = bridgeRev
+						if cp.Pending != nil && cp.Pending.SourceCommit == c.SHA && cp.Pending.ParentIndex == mIdx {
+							cp.Pending = nil
+							if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+								return err
+							}
+						}
+						continue
 					}
 				}
-				if mergeSourceBranch == "" {
-					mpSeq++
-					mergeSourceBranch = fmt.Sprintf("_import_mp_%d", mpSeq)
-					if err := im.Lore.SyncOffline(ctx, loreWorkDir, pRev); err != nil {
-						return err
-					}
-					if err := im.Lore.CreateBranchSlash(ctx, loreWorkDir, mergeSourceBranch, true); err != nil {
-						return err
-					}
-					existingBranches[mergeSourceBranch] = pRev
-					helperSet[mergeSourceBranch] = true
-					if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, "", true, true); err != nil {
-						return err
-					}
-					currentBranch = lane
-				}
 
-				hasConflicts, err := im.Lore.MergeStartNoCommit(ctx, loreWorkDir, mergeSourceBranch, true)
-				if err != nil {
-					return err
+				conflictBridgeKey := c.SHA + ":conflict"
+				conflictBridgeRev := ""
+				if isFinalStep {
+					conflictBridgeRev = cp.SyntheticBridges[conflictBridgeKey]
+				}
+				hasConflicts := false
+				if conflictBridgeRev != "" {
+					existingBranches[lane] = conflictBridgeRev
+					if err := im.indexSyntheticBridge(ctx, cp.ModuleID, conflictBridgeRev, spec.SourceSubdir, c, "conflict-marker merge bridge"); err != nil {
+						return err
+					}
+					cp.Pending = &pendingReplay{
+						SourceCommit: c.SHA, Lane: lane, Kind: "commit",
+						ParentIndex: mIdx, Parent1Revision: conflictBridgeRev,
+						ExpectedTree: c.TreeSHA, Phase: "commit_ready",
+					}
+					if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+						return err
+					}
+				} else {
+					mergeSourceBranch := ""
+					for bName, bLatest := range existingBranches {
+						if bName != lane && bLatest == pRev {
+							mergeSourceBranch = bName
+							break
+						}
+					}
+					if mergeSourceBranch == "" {
+						mpSeq++
+						mergeSourceBranch = fmt.Sprintf("_import_mp_%d", mpSeq)
+						if err := im.Lore.SyncOffline(ctx, loreWorkDir, pRev); err != nil {
+							return err
+						}
+						if err := im.Lore.CreateBranchSlash(ctx, loreWorkDir, mergeSourceBranch, true); err != nil {
+							return err
+						}
+						existingBranches[mergeSourceBranch] = pRev
+						helperSet[mergeSourceBranch] = true
+						if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, "", true, true); err != nil {
+							return err
+						}
+						currentBranch = lane
+					}
+
+					parent1Rev := existingBranches[lane]
+					if parent1Rev == "" && len(c.Parents) > 0 {
+						parent1Rev = cp.CommitMap[c.Parents[0]]
+					}
+					hasConflicts, err = im.beginOrResumeMerge(ctx, itemID, spec.ModuleName, loreWorkDir, c, lane, mergeSourceBranch, parent1Rev, pRev, mIdx, isFinalStep, cp)
+					if err != nil {
+						return err
+					}
 				}
 				cachedBlobs = map[string]string{}
 
@@ -901,7 +1168,22 @@ func (im *Importer) replayGraphIntoLore(
 						if _, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, nil); err != nil {
 							return err
 						}
-						if err := im.Lore.MergeResolve(ctx, loreWorkDir, true); err != nil {
+						if unresolved, err := im.Lore.UnresolvedMergePaths(ctx, loreWorkDir, true); err != nil {
+							return err
+						} else if len(unresolved) > 0 {
+							return fmt.Errorf("gitimport: unresolved merge paths remain: %s", strings.Join(unresolved, ", "))
+						}
+						conflicts, err := im.Lore.UnresolvedMergePaths(ctx, loreWorkDir, true)
+						if err != nil {
+							return err
+						}
+						if err := im.Lore.MergeResolveMine(ctx, loreWorkDir, conflicts, true); err != nil {
+							return err
+						}
+						// ResolveMine clears Lore's merge state but may replace the
+						// file. Reapply the exact Git tree, including intentional
+						// conflict-marker text committed in the source repository.
+						if _, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, nil); err != nil {
 							return err
 						}
 					}
@@ -909,8 +1191,9 @@ func (im *Importer) replayGraphIntoLore(
 						return err
 					}
 					synthMeta := map[string]string{
-						"git.synthetic": "1",
-						"git.octopus":   c.SHA,
+						"git.synthetic":    "1",
+						"git.octopus":      c.SHA,
+						"git.octopus_step": strconv.Itoa(mIdx),
 					}
 					if spec.SourceSubdir != "" {
 						synthMeta["git.subdir"] = spec.SourceSubdir
@@ -922,26 +1205,22 @@ func (im *Importer) replayGraphIntoLore(
 					if err != nil {
 						return err
 					}
+					cp.Pending.Phase = "lore_committed"
+					cp.Pending.LoreRevision = synthRev
+					if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+						return err
+					}
+					if err := im.operationFault(spec.ModuleName, c.SHA, "after_commit"); err != nil {
+						return err
+					}
 					existingBranches[lane] = synthRev
 					cp.SyntheticCount++
-					if err := database.Tx(ctx, im.DB, func(tx *sql.Tx) error {
-						return history.UpsertCommit(ctx, tx, history.CommitInput{
-							ModuleID:        cp.ModuleID,
-							LoreRevision:    synthRev,
-							SourceSubdir:    spec.SourceSubdir,
-							OriginKind:      history.OriginGitImport,
-							IsSynthetic:     true,
-							AuthorName:      c.AuthorName,
-							AuthorEmail:     c.AuthorEmail,
-							AuthoredAt:      c.AuthoredAt,
-							AuthoredUnixMS:  c.AuthoredUnixMS,
-							CommitterName:   c.CommitterName,
-							CommitterEmail:  c.CommitterEmail,
-							CommittedAt:     c.CommittedAt,
-							CommittedUnixMS: c.CommittedUnixMS,
-							Message:         "octopus merge bridge",
-						})
-					}); err != nil {
+					cp.SyntheticBridges[bridgeKey] = synthRev
+					if err := im.indexSyntheticBridge(ctx, cp.ModuleID, synthRev, spec.SourceSubdir, c, "octopus merge bridge"); err != nil {
+						return err
+					}
+					cp.Pending = nil
+					if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
 						return err
 					}
 				} else {
@@ -950,12 +1229,82 @@ func (im *Importer) replayGraphIntoLore(
 						return err
 					}
 					if hasConflicts {
-						if err := im.Lore.MergeResolve(ctx, loreWorkDir, true); err != nil {
+						conflicts, cErr := im.Lore.UnresolvedMergePaths(ctx, loreWorkDir, true)
+						if cErr != nil {
+							return cErr
+						}
+						hasCommittedMarkers, cErr := conflictPathsContainMarkers(allEntries, spec.EffectiveMappings(), conflicts, reader)
+						if cErr != nil {
+							return cErr
+						}
+						if err := im.Lore.MergeResolveMine(ctx, loreWorkDir, conflicts, true); err != nil {
 							return err
 						}
+						if hasCommittedMarkers {
+							if err := im.Lore.StageScan(ctx, loreWorkDir, true); err != nil {
+								return err
+							}
+							bridgeMeta := map[string]string{
+								"git.synthetic":    "1",
+								"git.merge_bridge": c.SHA,
+							}
+							if spec.SourceSubdir != "" {
+								bridgeMeta["git.subdir"] = spec.SourceSubdir
+							}
+							if err := im.Lore.SetStagedMetadata(ctx, loreWorkDir, bridgeMeta, true); err != nil {
+								return err
+							}
+							bridgeRev, err := im.Lore.CommitFull(ctx, loreWorkDir, "merge bridge for committed conflict markers "+c.SHA[:12], true, true)
+							if err != nil {
+								return err
+							}
+							cp.Pending.Kind = "bridge"
+							cp.Pending.Phase = "lore_committed"
+							cp.Pending.LoreRevision = bridgeRev
+							if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+								return err
+							}
+							if err := im.operationFault(spec.ModuleName, c.SHA, "after_commit"); err != nil {
+								return err
+							}
+							if err := im.indexSyntheticBridge(ctx, cp.ModuleID, bridgeRev, spec.SourceSubdir, c, "conflict-marker merge bridge"); err != nil {
+								return err
+							}
+							cp.SyntheticCount++
+							cp.SyntheticBridges[conflictBridgeKey] = bridgeRev
+							existingBranches[lane] = bridgeRev
+							cp.Pending = &pendingReplay{
+								SourceCommit: c.SHA, Lane: lane, Kind: "commit",
+								ParentIndex: mIdx, Parent1Revision: bridgeRev,
+								ExpectedTree: c.TreeSHA, Phase: "commit_ready",
+							}
+							if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+								return err
+							}
+						}
+						mat, err = materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, nil)
+						if err != nil {
+							return err
+						}
+						if unresolved, err := im.Lore.UnresolvedMergePaths(ctx, loreWorkDir, true); err != nil {
+							return err
+						} else if len(unresolved) > 0 {
+							return fmt.Errorf("gitimport: unresolved merge paths remain: %s", strings.Join(unresolved, ", "))
+						}
 					}
-					loreRev, err := im.commitAndIndexGitCommit(ctx, loreWorkDir, cp.ModuleID, spec.SourceSubdir, c, mat, cp.CommitMap, extraMeta)
+					loreRev, err := im.commitGitCommitToLore(ctx, loreWorkDir, spec.SourceSubdir, c, extraMeta)
 					if err != nil {
+						return err
+					}
+					cp.Pending.Phase = "lore_committed"
+					cp.Pending.LoreRevision = loreRev
+					if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+						return err
+					}
+					if err := im.operationFault(spec.ModuleName, c.SHA, "after_commit"); err != nil {
+						return err
+					}
+					if err := im.indexProjectedCommitInDB(ctx, cp.ModuleID, loreRev, spec.SourceSubdir, c, mat.Specials, cp.CommitMap, extraMeta); err != nil {
 						return err
 					}
 					if err := im.recordPathProjection(ctx, cp.ModuleID, loreRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
@@ -963,6 +1312,10 @@ func (im *Importer) replayGraphIntoLore(
 					}
 					existingBranches[lane] = loreRev
 					cp.CommitMap[c.SHA] = loreRev
+					cp.Pending = nil
+					if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+						return err
+					}
 				}
 			}
 		} else {
@@ -970,8 +1323,27 @@ func (im *Importer) replayGraphIntoLore(
 			if err != nil {
 				return err
 			}
-			loreRev, err := im.commitAndIndexGitCommit(ctx, loreWorkDir, cp.ModuleID, spec.SourceSubdir, c, mat, cp.CommitMap, extraMeta)
+			cp.Pending = &pendingReplay{
+				SourceCommit: c.SHA, Lane: lane, Kind: "commit",
+				Parent1Revision: firstParentRevision(c, cp.CommitMap),
+				ExpectedTree:    c.TreeSHA, Phase: "commit_ready",
+			}
+			if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+				return err
+			}
+			loreRev, err := im.commitGitCommitToLore(ctx, loreWorkDir, spec.SourceSubdir, c, extraMeta)
 			if err != nil {
+				return err
+			}
+			cp.Pending.Phase = "lore_committed"
+			cp.Pending.LoreRevision = loreRev
+			if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+				return err
+			}
+			if err := im.operationFault(spec.ModuleName, c.SHA, "after_commit"); err != nil {
+				return err
+			}
+			if err := im.indexProjectedCommitInDB(ctx, cp.ModuleID, loreRev, spec.SourceSubdir, c, mat.Specials, cp.CommitMap, extraMeta); err != nil {
 				return err
 			}
 			if err := im.recordPathProjection(ctx, cp.ModuleID, loreRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
@@ -979,11 +1351,15 @@ func (im *Importer) replayGraphIntoLore(
 			}
 			existingBranches[lane] = loreRev
 			cp.CommitMap[c.SHA] = loreRev
+			cp.Pending = nil
 			if firstRootLoreRev == "" {
 				firstRootLoreRev = loreRev
 			}
 			if plan.UsesBootstrap && lane == "main" {
 				cp.BootstrapMainRev = loreRev
+			}
+			if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+				return err
 			}
 		}
 
@@ -1043,14 +1419,133 @@ func (im *Importer) replayGraphIntoLore(
 	return nil
 }
 
-func (im *Importer) commitAndIndexGitCommit(
+func firstParentRevision(c GitCommit, commitMap map[string]string) string {
+	if len(c.Parents) == 0 {
+		return ""
+	}
+	return commitMap[c.Parents[0]]
+}
+
+func conflictPathsContainMarkers(allEntries []treeEntry, mappings []PathMapping, conflicts []string, reader *BatchBlobReader) (bool, error) {
+	if len(conflicts) == 0 {
+		return false, nil
+	}
+	mapped, _, err := ApplyPathMappings(allEntries, mappings)
+	if err != nil {
+		return false, err
+	}
+	want := map[string]bool{}
+	for _, path := range conflicts {
+		want[filepath.ToSlash(path)] = true
+	}
+	for _, entry := range mapped {
+		if !want[entry.Path] || entry.Type == "commit" || entry.Mode == "160000" {
+			continue
+		}
+		raw, err := reader.ReadBlob(entry.OID)
+		if err != nil {
+			return false, err
+		}
+		if bytes.Contains(raw, []byte("<<<<<<<")) && bytes.Contains(raw, []byte("=======")) && bytes.Contains(raw, []byte(">>>>>>>")) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (im *Importer) operationFault(module, sourceCommit, phase string) error {
+	if im.OperationFaultHook == nil {
+		return nil
+	}
+	return im.OperationFaultHook(module, sourceCommit, phase)
+}
+
+func (im *Importer) beginOrResumeMerge(
+	ctx context.Context,
+	itemID int64,
+	moduleName, loreWorkDir string,
+	c GitCommit,
+	lane, mergeSourceBranch, parent1Rev, parent2Rev string,
+	parentIndex int,
+	final bool,
+	cp *itemCheckpoint,
+) (bool, error) {
+	status, err := im.Lore.Status(ctx, loreWorkDir)
+	if err != nil {
+		return false, err
+	}
+	staged := status.RevisionStaged != "" && status.RevisionStaged != zeroHash64
+	if staged {
+		if status.BranchName != lane || status.Revision != parent1Rev || status.RevisionMerged != parent2Rev {
+			return false, fmt.Errorf(
+				"gitimport: staged merge does not match checkpoint: branch=%s want=%s head=%s want=%s merged=%s want=%s",
+				status.BranchName, lane, status.Revision, parent1Rev, status.RevisionMerged, parent2Rev,
+			)
+		}
+		cp.Pending = &pendingReplay{
+			SourceCommit: c.SHA, Lane: lane, Kind: map[bool]string{true: "commit", false: "bridge"}[final],
+			ParentIndex: parentIndex, Parent1Revision: parent1Rev, Parent2Revision: parent2Rev,
+			MergeSourceBranch: mergeSourceBranch, ExpectedTree: c.TreeSHA, Phase: "merge_open",
+		}
+		if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+			return false, err
+		}
+		// Re-materialization plus merge resolve is safe and deterministic.
+		return true, nil
+	}
+	if status.BranchName != lane || status.Revision != parent1Rev {
+		if err := im.Lore.SwitchBranchRevision(ctx, loreWorkDir, lane, parent1Rev, true, true); err != nil {
+			return false, err
+		}
+	}
+	kind := "bridge"
+	if final {
+		kind = "commit"
+	}
+	cp.Pending = &pendingReplay{
+		SourceCommit: c.SHA, Lane: lane, Kind: kind, ParentIndex: parentIndex,
+		Parent1Revision: parent1Rev, Parent2Revision: parent2Rev,
+		MergeSourceBranch: mergeSourceBranch, ExpectedTree: c.TreeSHA, Phase: "merge_start",
+	}
+	if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+		return false, err
+	}
+	if err := im.operationFault(moduleName, c.SHA, "before_merge_start"); err != nil {
+		return false, err
+	}
+	hasConflicts, err := im.Lore.MergeStartNoCommit(ctx, loreWorkDir, mergeSourceBranch, true)
+	if err != nil {
+		return false, err
+	}
+	cp.Pending.Phase = "merge_open"
+	if err := im.checkpointItemProgress(ctx, itemID, "replaying", *cp); err != nil {
+		return false, err
+	}
+	if err := im.operationFault(moduleName, c.SHA, "after_merge_start"); err != nil {
+		return false, err
+	}
+	return hasConflicts, nil
+}
+
+func (im *Importer) indexSyntheticBridge(ctx context.Context, moduleID int64, loreRev, sourceSubdir string, c GitCommit, message string) error {
+	return database.Tx(ctx, im.DB, func(tx *sql.Tx) error {
+		return history.UpsertCommit(ctx, tx, history.CommitInput{
+			ModuleID: moduleID, LoreRevision: loreRev, SourceSubdir: sourceSubdir,
+			OriginKind: history.OriginGitImport, IsSynthetic: true,
+			AuthorName: c.AuthorName, AuthorEmail: c.AuthorEmail,
+			AuthoredAt: c.AuthoredAt, AuthoredUnixMS: c.AuthoredUnixMS,
+			CommitterName: c.CommitterName, CommitterEmail: c.CommitterEmail,
+			CommittedAt: c.CommittedAt, CommittedUnixMS: c.CommittedUnixMS,
+			Message: message,
+		})
+	})
+}
+
+func (im *Importer) commitGitCommitToLore(
 	ctx context.Context,
 	loreWorkDir string,
-	moduleID int64,
 	sourceSubdir string,
 	c GitCommit,
-	mat TreeMaterializeResult,
-	commitMap map[string]string,
 	extraMeta map[string]string,
 ) (string, error) {
 	if err := im.Lore.StageScan(ctx, loreWorkDir, true); err != nil {
@@ -1090,9 +1585,6 @@ func (im *Importer) commitAndIndexGitCommit(
 	}
 	loreRev, err := im.Lore.CommitFull(ctx, loreWorkDir, c.Message, true, true)
 	if err != nil {
-		return "", err
-	}
-	if err := im.indexProjectedCommitInDB(ctx, moduleID, loreRev, sourceSubdir, c, mat.Specials, commitMap, extraMeta); err != nil {
 		return "", err
 	}
 	return loreRev, nil
@@ -1296,14 +1788,19 @@ func (im *Importer) persistAliasesAndRefs(
 }
 
 func (im *Importer) updateItemProgress(ctx context.Context, itemID int64, status string, cp itemCheckpoint) {
+	_ = im.checkpointItemProgress(ctx, itemID, status, cp)
+}
+
+func (im *Importer) checkpointItemProgress(ctx context.Context, itemID int64, status string, cp itemCheckpoint) error {
 	b, _ := json.Marshal(cp)
-	_, _ = im.DB.ExecContext(ctx, `
+	_, err := im.DB.ExecContext(ctx, `
 		UPDATE import_job_items
 		SET status=?, module_id=NULLIF(?,0), lore_repository_id=?, lore_repository_url=?,
 		    bootstrap_main_rev=?, checkpoint_json=?,
 		    started_at=COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 		WHERE item_id=?
 	`, status, cp.ModuleID, cp.LoreRepositoryID, cp.LoreRepositoryURL, cp.BootstrapMainRev, string(b), itemID)
+	return err
 }
 
 func (im *Importer) saveItemFinal(ctx context.Context, itemID int64, res ItemResult) {

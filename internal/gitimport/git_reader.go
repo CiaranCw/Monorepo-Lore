@@ -1202,17 +1202,27 @@ func ComputeWorkdirDigest(loreWorkDir string) (int, string, error) {
 // ComputeGitTreeContentDigest computes the mode-agnostic file content digest of treeSHA
 // (scoped to sourceSubdir when non-empty) matching ComputeWorkdirDigest.
 func ComputeGitTreeContentDigest(ctx context.Context, gitBin, mirrorDir, treeSHA, sourceSubdir, lfsMode string, reader *BatchBlobReader) (int, string, error) {
+	return ComputeMappedGitTreeContentDigest(ctx, gitBin, mirrorDir, treeSHA, MappingsForSubdir(sourceSubdir), lfsMode, reader)
+}
+
+// ComputeMappedGitTreeContentDigest applies the same current and historical
+// path mappings used by materialization before hashing the expected worktree.
+func ComputeMappedGitTreeContentDigest(ctx context.Context, gitBin, mirrorDir, treeSHA string, mappings []PathMapping, lfsMode string, reader *BatchBlobReader) (int, string, error) {
 	allEntries, err := readGitTreeEntries(ctx, gitBin, mirrorDir, treeSHA)
 	if err != nil {
 		return 0, "", err
 	}
-	entries, _ := filterEntriesForSubdir(allEntries, sourceSubdir, nil)
+	mapped, _, err := ApplyPathMappings(allEntries, mappings)
+	if err != nil {
+		return 0, "", err
+	}
 	type fileDigest struct {
 		rel string
 		sum string
 	}
 	var list []fileDigest
-	for _, e := range entries {
+	for _, mappedEntry := range mapped {
+		e := mappedEntry.treeEntry
 		if e.Mode == "160000" || e.Type == "commit" {
 			continue
 		}

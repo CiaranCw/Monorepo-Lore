@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -220,6 +221,52 @@ func TestSeedConfiguredLFSCacheLinksObjects(t *testing.T) {
 	body, err := os.ReadFile(dst)
 	if err != nil || string(body) != "lfs-bytes" {
 		t.Fatalf("seeded object missing: %v %q", err, body)
+	}
+}
+
+func TestMappedHeadDigestIncludesAdditionalMappings(t *testing.T) {
+	ctx := context.Background()
+	gitBin := findRealGit(t)
+	root := t.TempDir()
+	repo := filepath.Join(root, "source")
+	if err := os.MkdirAll(filepath.Join(repo, "Current"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "Extra"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(repo, "Current", "a.txt"), []byte("a"), 0o644)
+	_ = os.WriteFile(filepath.Join(repo, "Extra", "b.txt"), []byte("b"), 0o644)
+	git := gitExecHelper{t: t, bin: gitBin, dir: repo}
+	git.run(nil, "init", "-b", "main")
+	git.run(nil, "add", ".")
+	sha := git.commitAs("Dev", "dev@example.com", "2025-01-01T00:00:00Z", "mapped", false)
+	bare := filepath.Join(root, "mirror.git")
+	git.run(nil, "clone", "--bare", repo, bare)
+	tree := strings.TrimSpace(git.run(nil, "rev-parse", sha+"^{tree}"))
+	reader, err := NewBatchBlobReader(ctx, gitBin, bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	mappings := []PathMapping{
+		{ID: "current", SourcePrefix: "Current", Kind: MappingTree},
+		{ID: "extra", SourcePrefix: "Extra", TargetPrefix: "Debut", Kind: MappingTree},
+	}
+	count, digest, err := ComputeMappedGitTreeContentDigest(ctx, gitBin, bare, tree, mappings, LFSModePointer, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(root, "work")
+	_ = os.MkdirAll(filepath.Join(work, "Debut"), 0o755)
+	_ = os.WriteFile(filepath.Join(work, "a.txt"), []byte("a"), 0o644)
+	_ = os.WriteFile(filepath.Join(work, "Debut", "b.txt"), []byte("b"), 0o644)
+	workCount, workDigest, err := ComputeWorkdirDigest(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || count != workCount || digest != workDigest {
+		t.Fatalf("mapped digest %d:%s work %d:%s", count, digest, workCount, workDigest)
 	}
 }
 

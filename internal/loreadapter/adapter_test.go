@@ -97,6 +97,51 @@ func TestStatusAndHistoryUseCapturedCommands(t *testing.T) {
 	}
 }
 
+func TestStatusDecodesInterruptedMergeState(t *testing.T) {
+	body := `{"tagName":"repositoryStatusRevision","data":{"repository":"` + repoID +
+		`","branch":"e726318bbc3fd75ac8733a7e030cc35b","branchName":"lane","revision":"` + revA +
+		`","revisionNumber":22,"revisionStaged":"` + revB + `","revisionMerged":"` + revA +
+		`","revisionMergedParentBranch":"cccccccccccccccccccccccccccccccc","revisionLocal":"` + revA +
+		`","revisionRemote":"` + strings.Repeat("0", 64) + `","remoteAvailable":1,"remoteAuthorized":1,"remoteBranchExist":0,"isLocalAhead":0,"isRemoteAhead":0}}` + "\n" + completeOK()
+	f := &fake{reply: func([]string) loreexec.CommandResult {
+		return loreexec.CommandResult{ExitCode: 0, Stdout: body}
+	}}
+	st, err := (&Client{Exec: f}).Status(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.RevisionStaged != revB || st.RevisionMerged != revA ||
+		st.MergedParentBranch != "cccccccccccccccccccccccccccccccc" {
+		t.Fatalf("merge state not decoded: %+v", st)
+	}
+}
+
+func TestMergeConflictInspectionAndForcedResolution(t *testing.T) {
+	f := &fake{reply: func(argv []string) loreexec.CommandResult {
+		joined := strings.Join(argv, " ")
+		if strings.Contains(joined, "status") {
+			return loreexec.CommandResult{ExitCode: 0, Stdout: `{"tagName":"repositoryStatusRevision","data":{"repository":"` + repoID + `","branch":"e726318bbc3fd75ac8733a7e030cc35b","branchName":"main","revision":"` + revA + `","revisionNumber":2,"revisionLocal":"` + revA + `","revisionRemote":"` + revA + `","remoteAvailable":1,"remoteAuthorized":1,"remoteBranchExist":1,"isLocalAhead":0,"isRemoteAhead":0}}` + "\n" +
+				`{"tagName":"repositoryStatusFile","data":{"path":".gitignore","flagConflictUnresolved":true}}` + "\n" + completeOK()}
+		}
+		if strings.Contains(joined, "branch merge resolve mine") {
+			if !hasArg(argv, "-f") || !hasArg(argv, ".gitignore") {
+				t.Fatalf("resolution must force the ignored conflict path: %v", argv)
+			}
+			return loreexec.CommandResult{ExitCode: 0, Stdout: completeOK()}
+		}
+		t.Fatalf("unexpected argv %v", argv)
+		return loreexec.CommandResult{}
+	}}
+	client := Client{Exec: f}
+	paths, err := client.UnresolvedMergePaths(context.Background(), t.TempDir(), true)
+	if err != nil || len(paths) != 1 || paths[0] != ".gitignore" {
+		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+	if err := client.MergeResolveMine(context.Background(), t.TempDir(), paths, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCloneVerifiesDirectoryAndRepositoryID(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "alpha")
 	f := &fake{reply: func(argv []string) loreexec.CommandResult {

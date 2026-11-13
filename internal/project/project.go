@@ -22,7 +22,7 @@ var (
 	ErrConflict = errors.New("conflict")
 	ErrInvalid  = errors.New("invalid argument")
 
-	nameRe    = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,62}$`)
+	nameRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 	repoIDRe  = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	segmentRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 )

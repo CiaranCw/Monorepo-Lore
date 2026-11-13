@@ -64,6 +64,16 @@ func (c *Client) ListBranchesAt(ctx context.Context, dir string, remote bool) ([
 // RevisionDetail runs `lore revision info [--delta] [revision]` and decodes
 // its revision summary, metadata map, and optional file deltas.
 func (c *Client) RevisionDetail(ctx context.Context, dir, revision string, withDelta bool) (RevisionDetail, error) {
+	return c.revisionDetailAt(ctx, dir, revision, withDelta, false)
+}
+
+// RemoteRevisionDetail proves that a revision object is readable from the
+// remote store rather than merely present in the local clone.
+func (c *Client) RemoteRevisionDetail(ctx context.Context, dir, revision string, withDelta bool) (RevisionDetail, error) {
+	return c.revisionDetailAt(ctx, dir, revision, withDelta, true)
+}
+
+func (c *Client) revisionDetailAt(ctx context.Context, dir, revision string, withDelta, remote bool) (RevisionDetail, error) {
 	if err := requireDir(dir); err != nil {
 		return RevisionDetail{}, err
 	}
@@ -77,7 +87,7 @@ func (c *Client) RevisionDetail(ctx context.Context, dir, revision string, withD
 		}
 		args = append(args, revision)
 	}
-	res, err := c.run(ctx, dir, args...)
+	res, err := c.runMode(ctx, dir, false, remote, true, args...)
 	if err != nil {
 		return RevisionDetail{}, err
 	}
@@ -352,6 +362,59 @@ func (c *Client) MergeResolve(ctx context.Context, dir string, offline bool) err
 	// callers invoke MergeResolve when conflicts exist, or ignore "No conflicts" benignly.
 	if res.ExitCode != 0 && !strings.Contains(res.Stdout+res.Stderr, "No conflicts") {
 		return failOutput("branch merge resolve", res)
+	}
+	return nil
+}
+
+// UnresolvedMergePaths returns exactly the paths Lore still marks conflicted.
+func (c *Client) UnresolvedMergePaths(ctx context.Context, dir string, offline bool) ([]string, error) {
+	if err := requireDir(dir); err != nil {
+		return nil, err
+	}
+	res, err := c.runMode(ctx, dir, offline, false, true, "status", "--repository", dir)
+	if err != nil {
+		return nil, err
+	}
+	if !accepted(res) && !res.OutputSucceeded() {
+		return nil, failOutput("status conflicts", res)
+	}
+	var out []string
+	for _, raw := range allData(res, "repositoryStatusFile") {
+		var wire struct {
+			Path                   string `json:"path"`
+			FlagConflictUnresolved bool   `json:"flagConflictUnresolved"`
+		}
+		if json.Unmarshal(raw, &wire) == nil && wire.Path != "" && wire.FlagConflictUnresolved {
+			out = append(out, wire.Path)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// MergeResolveMine clears Lore's conflict state for selected paths. Import
+// replay writes the exact Git merge tree again afterwards, so "mine" is only a
+// state transition and never the final imported content.
+func (c *Client) MergeResolveMine(ctx context.Context, dir string, paths []string, offline bool) error {
+	if err := requireDir(dir); err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	args := []string{"branch", "merge", "resolve", "mine", "--repository", dir}
+	for _, path := range paths {
+		if path == "" || strings.HasPrefix(path, "-") {
+			return fmt.Errorf("%w: conflict path %q", ErrInvalid, path)
+		}
+		args = append(args, path)
+	}
+	res, err := c.runMode(ctx, dir, offline, true, false, args...)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return failOutput("branch merge resolve mine", res)
 	}
 	return nil
 }

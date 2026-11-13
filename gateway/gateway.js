@@ -76,21 +76,22 @@ let session = null;
 
 function upstreamSession() {
   if (session && !session.closed && !session.destroyed) return session;
-  session = http2.connect(upstream, {
+  const created = http2.connect(upstream, {
     ca: ca,
     servername: "localhost",
     rejectUnauthorized: true,
   });
-  session.on("error", (err) => {
+  session = created;
+  created.on("error", (err) => {
     log({ event: "upstream_session_error", message: err.message });
-    session = null;
+    if (session === created) session = null;
   });
-  session.on("close", () => {
-    session = null;
+  created.on("close", () => {
+    if (session === created) session = null;
     log({ event: "upstream_session_close" });
   });
-  session.on("connect", () => {
-    const sock = session.socket;
+  created.on("connect", () => {
+    const sock = created.socket;
     log({
       event: "upstream_tls",
       authorized: Boolean(sock && sock.authorized),
@@ -99,7 +100,7 @@ function upstreamSession() {
       alpn: sock && sock.alpnProtocol ? sock.alpnProtocol : "",
     });
   });
-  return session;
+  return created;
 }
 
 function copyHeaders(headers) {
@@ -248,10 +249,11 @@ server.on("secureConnection", (socket) => {
   guard(socket);
 });
 server.on("session", (httpSession) => {
-  const socket = httpSession.socket;
-  if (!guard(socket)) return;
   sessions += 1;
-  log({ event: "client_session_open", address: ipv4(socket.remoteAddress), sessions: sessions, authorized: socket.authorized });
+  // The connection was already checked in secureConnection. Node wraps an
+  // HTTP/2 session socket and deliberately rejects direct socket property
+  // access with ERR_HTTP2_NO_SOCKET_MANIPULATION.
+  log({ event: "client_session_open", sessions: sessions });
   httpSession.on("error", (err) => log({ event: "client_session_error", message: err.message }));
   httpSession.on("close", () => {
     sessions = Math.max(0, sessions - 1);
@@ -260,7 +262,6 @@ server.on("session", (httpSession) => {
 });
 server.on("stream", (stream, headers) => {
   stream.on("error", () => {});
-  if (!guard(stream.session.socket)) return;
   log({ event: "client_stream", rpc: String(headers[":path"] || ""), scheme: String(headers[":scheme"] || "") });
   forward(stream, headers);
 });

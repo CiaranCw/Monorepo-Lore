@@ -157,14 +157,33 @@ type JobResult struct {
 }
 
 type itemCheckpoint struct {
-	LoreRepositoryID  string            `json:"lore_repository_id,omitempty"`
-	LoreRepositoryURL string            `json:"lore_repository_url,omitempty"`
-	ModuleID          int64             `json:"module_id,omitempty"`
-	BootstrapMainRev  string            `json:"bootstrap_main_rev,omitempty"`
-	CommitMap         map[string]string `json:"commit_map,omitempty"` // projected git sha -> lore 64-hex revision
-	SyntheticCount    int               `json:"synthetic_count,omitempty"`
-	HelperBranches    []string          `json:"helper_branches,omitempty"`
-	PushedBranches    map[string]bool   `json:"pushed_branches,omitempty"`
+	LoreRepositoryID   string            `json:"lore_repository_id,omitempty"`
+	LoreRepositoryURL  string            `json:"lore_repository_url,omitempty"`
+	ModuleID           int64             `json:"module_id,omitempty"`
+	BootstrapMainRev   string            `json:"bootstrap_main_rev,omitempty"`
+	CommitMap          map[string]string `json:"commit_map,omitempty"`        // projected git sha -> lore 64-hex revision
+	SyntheticBridges   map[string]string `json:"synthetic_bridges,omitempty"` // source SHA:parent index -> Lore revision
+	SyntheticCount     int               `json:"synthetic_count,omitempty"`
+	HelperBranches     []string          `json:"helper_branches,omitempty"`
+	PushedBranches     map[string]bool   `json:"pushed_branches,omitempty"`
+	PublishedRevisions map[string]string `json:"published_revisions,omitempty"`
+	Pending            *pendingReplay    `json:"pending,omitempty"`
+}
+
+// pendingReplay makes a local Lore mutation restartable without adding a new
+// database table. Physical Lore metadata remains authoritative; this record
+// only identifies which operation may have been interrupted.
+type pendingReplay struct {
+	SourceCommit      string `json:"source_commit"`
+	Lane              string `json:"lane"`
+	Kind              string `json:"kind"` // commit or bridge
+	ParentIndex       int    `json:"parent_index,omitempty"`
+	Parent1Revision   string `json:"parent1_revision,omitempty"`
+	Parent2Revision   string `json:"parent2_revision,omitempty"`
+	MergeSourceBranch string `json:"merge_source_branch,omitempty"`
+	ExpectedTree      string `json:"expected_tree,omitempty"`
+	Phase             string `json:"phase"` // merge_start, merge_open, lore_committed
+	LoreRevision      string `json:"lore_revision,omitempty"`
 }
 
 // Importer orchestrates single and batch external Git imports into Monorepo-Lore.
@@ -183,6 +202,12 @@ type Importer struct {
 	// FaultHook is a test-only hook invoked after replayCommitIndex (0-based) for
 	// deterministic crash/interruption and checkpoint-resume testing.
 	FaultHook func(moduleName string, replayCommitIndex int) error
+	// OperationFaultHook is invoked at mutation boundaries that FaultHook cannot
+	// observe: merge start and Lore commit before SQLite/checkpoint completion.
+	OperationFaultHook func(moduleName, sourceCommit, phase string) error
+	// ResumeModules limits execution of an existing job to selected modules.
+	// Unselected items retain their stored result and are never mutated.
+	ResumeModules map[string]bool
 
 	// AfterInspectRefs is a test-only hook invoked right after InspectRemoteRefs and
 	// before SyncBareMirror to test upstream repository mutation detection during fetch.
@@ -328,9 +353,13 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			spec := m.Repositories[idx]
+			if len(im.ResumeModules) > 0 && !im.ResumeModules[spec.ModuleName] {
+				results[idx] = storedItemResult(items[idx], spec)
+				return
+			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			spec := m.Repositories[idx]
 			ms := mirrorStates[spec.SourceURL]
 			siblings := siblingSubdirsByURL[spec.SourceURL]
 			mirrorSpec := spec
@@ -397,6 +426,20 @@ func (im *Importer) Run(ctx context.Context, actor string, m Manifest) (JobResul
 		SkippedItems:   skipped,
 		Items:          results,
 	}, nil
+}
+
+func storedItemResult(item storedItem, spec RepoSpec) ItemResult {
+	var verification VerificationReport
+	_ = json.Unmarshal([]byte(item.VerifyJSON), &verification)
+	return ItemResult{
+		ItemID: item.ItemID, Ord: item.Ord, ModuleName: spec.ModuleName,
+		MountPath: spec.MountPath, SourceURL: spec.SourceURL,
+		SourceSubdir: spec.SourceSubdir, Platform: spec.Platform,
+		AuthMethod: inferAuthMethodLabel(spec.Auth), Status: item.Status,
+		ModuleID: item.ModuleID, LoreRepositoryID: item.LoreRepoID,
+		LoreRepositoryURL: item.LoreRepoURL, Verification: verification,
+		Error: item.Error,
+	}
 }
 
 type storedItem struct {
