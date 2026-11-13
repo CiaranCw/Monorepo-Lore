@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"lore-monorepo/internal/loreexec"
@@ -175,6 +177,7 @@ type fileSnapshot struct {
 type authDirSnapshot struct {
 	dir     string
 	existed bool
+	dirs    []string
 	files   map[string][]byte
 }
 
@@ -207,32 +210,57 @@ func snapshotAuthDir(dir string) (authDirSnapshot, error) {
 	if strings.TrimSpace(dir) == "" {
 		return snap, nil
 	}
-	info, err := os.Stat(dir)
+	info, err := os.Lstat(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return snap, nil
 		}
 		return snap, fmt.Errorf("stat auth dir %s: %w", dir, err)
 	}
-	if !info.IsDir() {
-		return snap, fmt.Errorf("auth path %s is not a directory", dir)
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return snap, fmt.Errorf("auth path %s must be a real directory", dir)
 	}
 	snap.existed = true
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return snap, fmt.Errorf("read auth dir %s: %w", dir, err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	dirSet := map[string]struct{}{}
+	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		p := filepath.Join(dir, e.Name())
+		if p == dir {
+			return nil
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("unsupported symlink in auth dir: %s", p)
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if _, seen := dirSet[rel]; !seen {
+				dirSet[rel] = struct{}{}
+				snap.dirs = append(snap.dirs, rel)
+			}
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("unsupported non-regular file in auth dir: %s", p)
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return snap, fmt.Errorf("snapshot auth file %s: %w", p, err)
+			return fmt.Errorf("snapshot auth file %s: %w", p, err)
 		}
-		snap.files[e.Name()] = data
+		snap.files[rel] = data
+		return nil
+	})
+	if err != nil {
+		return snap, fmt.Errorf("snapshot auth dir %s: %w", dir, err)
 	}
+	sort.Strings(snap.dirs)
 	return snap, nil
 }
 
@@ -265,27 +293,58 @@ func restoreAuthDir(snap authDirSnapshot) error {
 		}
 		return nil
 	}
+	origDirs := make(map[string]struct{}, len(snap.dirs))
+	for _, d := range snap.dirs {
+		origDirs[d] = struct{}{}
+	}
 	var errs []string
-	entries, err := os.ReadDir(snap.dir)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("read auth dir %s: %w", snap.dir, err)
-		}
-	} else {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
+	var curDirs []string
+	walkErr := filepath.WalkDir(snap.dir, func(p string, d fs.DirEntry, wErr error) error {
+		if wErr != nil {
+			if errors.Is(wErr, os.ErrNotExist) {
+				return nil
 			}
-			if _, existed := snap.files[e.Name()]; !existed {
-				p := filepath.Join(snap.dir, e.Name())
-				if err := rollbackRemove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-					errs = append(errs, fmt.Sprintf("remove new auth file %s: %v", p, err))
-				}
+			return wErr
+		}
+		if p == snap.dir {
+			return nil
+		}
+		rel, err := filepath.Rel(snap.dir, p)
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			curDirs = append(curDirs, rel)
+			return nil
+		}
+		if _, existed := snap.files[rel]; !existed {
+			if err := rollbackRemove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Sprintf("remove new auth file %s: %v", p, err))
+			}
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) {
+		errs = append(errs, fmt.Sprintf("walk auth dir %s: %v", snap.dir, walkErr))
+	}
+	sort.Slice(curDirs, func(i, j int) bool {
+		return len(curDirs[i]) > len(curDirs[j])
+	})
+	for _, rel := range curDirs {
+		if _, existed := origDirs[rel]; !existed {
+			p := filepath.Join(snap.dir, rel)
+			if err := rollbackRemove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Sprintf("remove new auth subdir %s: %v", p, err))
 			}
 		}
 	}
-	for name, data := range snap.files {
-		p := filepath.Join(snap.dir, name)
+	for _, rel := range snap.dirs {
+		if err := os.MkdirAll(filepath.Join(snap.dir, rel), 0o700); err != nil {
+			errs = append(errs, fmt.Sprintf("restore auth subdir %s: %v", rel, err))
+		}
+	}
+	for rel, data := range snap.files {
+		p := filepath.Join(snap.dir, rel)
 		if err := rollbackWriteFile(p, data); err != nil {
 			errs = append(errs, fmt.Sprintf("restore auth file %s: %v", p, err))
 		}
@@ -360,6 +419,21 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		hostPinPath = HostPinPath(baseDir, managerURL)
 		hostCAPath = HostCAPath(baseDir, managerURL)
 	}
+
+	lockPath := connectLockPath(baseDir, managerURL, opts.ExplicitConfigPath)
+	unlock, err := acquireConnectLock(ctx, lockPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	defer func() {
+		if uErr := unlock(); uErr != nil {
+			if retErr != nil {
+				retErr = fmt.Errorf("%w; %v", retErr, uErr)
+			} else {
+				retErr = uErr
+			}
+		}
+	}()
 
 	profileInfo, profileDirErr := os.Stat(profileDir)
 	profileDirExisted := false

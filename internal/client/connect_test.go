@@ -16,11 +16,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"lore-monorepo/internal/loreexec"
 )
 
 type testCA struct {
@@ -1161,5 +1165,375 @@ func TestConnectCleansUpNewAuthCredentialsOnDiscoveryFailureAndPreservesExisting
 	gotUser, err := os.ReadFile(userFile)
 	if err != nil || string(gotUser) != "keep-me" {
 		t.Fatalf("pre-existing user file was modified or deleted: got=%q err=%v", gotUser, err)
+	}
+}
+
+func TestLockHelperProcess(t *testing.T) {
+	if os.Getenv("LORE_MONO_LOCK_HELPER") != "1" {
+		return
+	}
+	lockPath := os.Getenv("LORE_MONO_LOCK_PATH")
+	unlock, err := acquireConnectLock(context.Background(), lockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lock failed: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Println("LOCKED")
+	if os.Getenv("LORE_MONO_LOCK_CRASH") == "1" {
+		// Exit without calling unlock() to verify OS kernel releases file lock on crash.
+		os.Exit(0)
+	}
+	// Hold lock until killed by parent.
+	time.Sleep(30 * time.Second)
+	_ = unlock()
+}
+
+func TestConnectHelperProcess(t *testing.T) {
+	if os.Getenv("LORE_MONO_CONNECT_HELPER") != "1" {
+		return
+	}
+	managerURL := os.Getenv("LORE_MONO_MANAGER_URL")
+	username := os.Getenv("LORE_MONO_USERNAME")
+	project := os.Getenv("LORE_MONO_PROJECT")
+	execRunner := loreexec.Executor{Config: loreexec.Config{
+		Binary:      os.Args[0],
+		LeadingArgs: []string{"-test.run=^TestHelperProcess$", "--"},
+		Env:         map[string]string{"LORE_MONO_HELPER": "1"},
+		Timeout:     5 * time.Second,
+	}}
+	_, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: managerURL,
+		Username:   username,
+		Password:   []byte("pw"),
+		Project:    project,
+	}, execRunner)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+}
+
+func TestAcquireConnectLockCrossProcessAndCrashRecovery(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "locks", "manager.lock")
+
+	// 1. Subprocess holds OS file lock -> parent cannot acquire until released/killed.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLockHelperProcess$")
+	cmd.Env = append(os.Environ(), "LORE_MONO_LOCK_HELPER=1", "LORE_MONO_LOCK_PATH="+lockPath)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+
+	buf := make([]byte, 32)
+	n, err := stdoutPipe.Read(buf)
+	if err != nil || !strings.Contains(string(buf[:n]), "LOCKED") {
+		t.Fatalf("helper failed to acquire lock: n=%d out=%q err=%v", n, string(buf[:n]), err)
+	}
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	if _, err := acquireConnectLock(shortCtx, lockPath); err == nil {
+		t.Fatal("expected acquireConnectLock to block while another process holds the lock")
+	}
+
+	// 2. Kill child process without unlocking -> kernel releases lock -> parent acquires immediately!
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	unlock, err := acquireConnectLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatalf("failed to recover lock after process crash: %v", err)
+	}
+	if err := unlock(); err != nil {
+		t.Fatalf("unlock failed: %v", err)
+	}
+}
+
+func TestConnectConcurrentTwoUsersAndSameUserFailureSafety(t *testing.T) {
+	cfgRoot := setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	var activeInProjects int32
+	var maxConcurrent int32
+	var loginSeq int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health/live":
+			_, _ = w.Write([]byte(`{"status":"live"}`))
+		case "/api/v1/client/info":
+			_ = json.NewEncoder(w).Encode(ClientInfo{CAPEM: string(ca.caPEM)})
+		case "/api/v1/auth/login":
+			var body struct {
+				Username string `json:"username"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			n := atomic.AddInt32(&loginSeq, 1)
+			tok := fakeIdentity(fmt.Sprintf("%s-%d", body.Username, n))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"identity_token": tok,
+				"lore_token":     tok,
+				"token_type":     "Bearer",
+				"username":       body.Username,
+			})
+		case "/api/v1/projects":
+			cur := atomic.AddInt32(&activeInProjects, 1)
+			for {
+				prev := atomic.LoadInt32(&maxConcurrent)
+				if cur <= prev || atomic.CompareAndSwapInt32(&maxConcurrent, prev, cur) {
+					break
+				}
+			}
+			time.Sleep(60 * time.Millisecond)
+			atomic.AddInt32(&activeInProjects, -1)
+			_, _ = w.Write([]byte(`{"projects":[{"Name":"Kubee"},{"Name":"Sandbox"}]}`))
+		case "/api/v1/me/modules":
+			_, _ = w.Write([]byte(`{"modules":[{"ProjectName":"Kubee","Name":"Pandora","MountPath":"Pandora","RepositoryURL":"grpcs://127.0.0.1:57047/repo1","Permission":"write"}]}`))
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.tlsCert}, MinVersion: tls.VersionTLS12}
+	srv.StartTLS()
+	defer srv.Close()
+
+	execRunner := testLore(t)
+
+	// 1. Two users connect concurrently to the same Manager -> serialized by Manager lock, both succeed, host pin consistent.
+	var wg sync.WaitGroup
+	var resA, resB ConnectResult
+	var errA, errB error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		resA, errA = Connect(context.Background(), ConnectOptions{
+			ManagerURL: srv.URL,
+			Username:   "alice",
+			Password:   []byte("pw"),
+			Project:    "Kubee",
+		}, execRunner)
+	}()
+	go func() {
+		defer wg.Done()
+		resB, errB = Connect(context.Background(), ConnectOptions{
+			ManagerURL: srv.URL,
+			Username:   "bob",
+			Password:   []byte("pw"),
+			Project:    "Sandbox",
+		}, execRunner)
+	}()
+	wg.Wait()
+	if errA != nil || errB != nil {
+		t.Fatalf("concurrent two-user connect failed: errA=%v errB=%v", errA, errB)
+	}
+	if resA.ProfileDir == resB.ProfileDir || resA.AuthPath == resB.AuthPath || resA.CASHA256 != resB.CASHA256 {
+		t.Fatalf("concurrent two-user connect isolation/pin mismatch: A=%+v B=%+v", resA, resB)
+	}
+	if atomic.LoadInt32(&maxConcurrent) > 1 {
+		t.Fatalf("expected Manager lock to serialize concurrent Connects, maxConcurrent=%d", maxConcurrent)
+	}
+
+	normURL, _ := NormalizeManagerURL(srv.URL)
+	baseDir := filepath.Join(cfgRoot, "lore-mono")
+	hostPin := HostPinPath(baseDir, normURL)
+	if _, err := os.Stat(hostPin); err != nil {
+		t.Fatalf("missing shared host pin: %v", err)
+	}
+
+	// 2. Same user in two terminals simultaneously: one succeeds, one fails at project discovery.
+	// Neither order may delete/corrupt the succeeding Connect's auth credentials, profile pin, or host pin.
+	for i := 0; i < 2; i++ {
+		var okRes ConnectResult
+		var okErr, failErr error
+		wg.Add(2)
+		if i == 0 {
+			go func() {
+				defer wg.Done()
+				okRes, okErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL: srv.URL,
+					Username:   "carol",
+					Password:   []byte("pw"),
+					Project:    "Kubee",
+				}, execRunner)
+			}()
+			go func() {
+				defer wg.Done()
+				time.Sleep(15 * time.Millisecond)
+				_, failErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL: srv.URL,
+					Username:   "carol",
+					Password:   []byte("pw"),
+					Project:    "MissingProject",
+				}, execRunner)
+			}()
+		} else {
+			// Reverse staggered start so failing Connect is likely first and succeeding Connect second.
+			go func() {
+				defer wg.Done()
+				_, failErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL: srv.URL,
+					Username:   "dave",
+					Password:   []byte("pw"),
+					Project:    "MissingProject",
+				}, execRunner)
+			}()
+			go func() {
+				defer wg.Done()
+				time.Sleep(15 * time.Millisecond)
+				okRes, okErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL: srv.URL,
+					Username:   "dave",
+					Password:   []byte("pw"),
+					Project:    "Kubee",
+				}, execRunner)
+			}()
+		}
+		wg.Wait()
+		if okErr != nil {
+			t.Fatalf("round %d succeeding Connect failed: %v", i, okErr)
+		}
+		if failErr == nil {
+			t.Fatalf("round %d failing Connect unexpectedly succeeded", i)
+		}
+		if _, err := os.Stat(filepath.Join(okRes.AuthPath, "lore-mono-session.tok")); err != nil {
+			t.Fatalf("round %d auth session missing: %v", i, err)
+		}
+		if _, err := os.Stat(filepath.Join(okRes.AuthPath, "identity")); err != nil {
+			t.Fatalf("round %d lore identity missing: %v", i, err)
+		}
+		if _, err := os.Stat(PinPathForCA(okRes.CAFile)); err != nil {
+			t.Fatalf("round %d profile pin missing: %v", i, err)
+		}
+		if _, err := os.Stat(hostPin); err != nil {
+			t.Fatalf("round %d host pin missing: %v", i, err)
+		}
+	}
+
+	// 3. Cross-process concurrent Connect: child process fails at project discovery while parent succeeds.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestConnectHelperProcess$")
+	cmd.Env = append(os.Environ(),
+		"LORE_MONO_CONNECT_HELPER=1",
+		"LORE_MONO_MANAGER_URL="+srv.URL,
+		"LORE_MONO_USERNAME=alice",
+		"LORE_MONO_PROJECT=MissingProject",
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	parentRes, parentErr := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "Kubee",
+	}, execRunner)
+	childErr := cmd.Wait()
+	if parentErr != nil {
+		t.Fatalf("parent Connect failed during cross-process race: %v", parentErr)
+	}
+	if childErr == nil {
+		t.Fatal("child failing Connect unexpectedly exited 0")
+	}
+	if _, err := os.Stat(filepath.Join(parentRes.AuthPath, "lore-mono-session.tok")); err != nil {
+		t.Fatalf("cross-process failure deleted parent session: %v", err)
+	}
+	if _, err := os.Stat(PinPathForCA(parentRes.CAFile)); err != nil {
+		t.Fatalf("cross-process failure deleted profile pin: %v", err)
+	}
+	if _, err := os.Stat(hostPin); err != nil {
+		t.Fatalf("cross-process failure deleted host pin: %v", err)
+	}
+
+	// 4. After locks are released, re-connecting works cleanly.
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "Kubee",
+	}, execRunner); err != nil {
+		t.Fatalf("reconnect after concurrent tests failed: %v", err)
+	}
+}
+
+func TestConnectNestedAuthDirSnapshotAndRollback(t *testing.T) {
+	cfgRoot := setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	srv := startTLSManagerMock(t, ca.tlsCert, ca.caPEM, "", true)
+
+	normURL, _ := NormalizeManagerURL(srv.URL)
+	baseDir := filepath.Join(cfgRoot, "lore-mono")
+	profDir := ProfileDir(baseDir, normURL, "alice")
+	authDir := filepath.Join(profDir, "auth")
+
+	// Pre-existing nested user directory + file inside auth/.
+	existingSub := filepath.Join(authDir, "nested", "keep")
+	if err := os.MkdirAll(existingSub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existingFile := filepath.Join(existingSub, "user.dat")
+	if err := os.WriteFile(existingFile, []byte("keep-nested"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Custom executor that writes both a flat credential and a nested subdir/file during login.
+	nestedExec := loreexec.Executor{Config: loreexec.Config{
+		Binary:      os.Args[0],
+		LeadingArgs: []string{"-test.run=^TestHelperProcess$", "--"},
+		Env:         map[string]string{"LORE_MONO_HELPER": "1"},
+		Timeout:     5 * time.Second,
+	}}
+	// Also simulate a new nested directory appearing in auth/ before Connect fails at project discovery.
+	newSub := filepath.Join(authDir, "new-sub")
+	if err := os.MkdirAll(newSub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// First connect succeeds and records only existingSub; then create newSub during a failing Connect.
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "Kubee",
+	}, nestedExec); err != nil {
+		t.Fatal(err)
+	}
+	// Remove newSub before testing rollback with injected nested file inside a failing Connect.
+	_ = os.RemoveAll(newSub)
+
+	// Run failing Connect where pre-existing auth/ has existingFile, and manually ensure restoreAuthDir removes newly created nested subdirs/files.
+	snap, err := snapshotAuthDir(authDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(authDir, "ephemeral", "deep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, "ephemeral", "deep", "cred.tok"), []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreAuthDir(snap); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(authDir, "ephemeral")); !os.IsNotExist(err) {
+		t.Fatalf("expected newly created nested auth subdir to be removed on rollback")
+	}
+	got, err := os.ReadFile(existingFile)
+	if err != nil || string(got) != "keep-nested" {
+		t.Fatalf("expected pre-existing nested file to be preserved: got=%q err=%v", got, err)
+	}
+
+	// Verify symlink inside authDir fails closed instead of silently skipping.
+	linkPath := filepath.Join(authDir, "sym")
+	if symErr := os.Symlink(existingFile, linkPath); symErr == nil {
+		if _, err := snapshotAuthDir(authDir); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("expected symlink in auth dir to fail closed, got %v", err)
+		}
+		_ = os.Remove(linkPath)
 	}
 }
