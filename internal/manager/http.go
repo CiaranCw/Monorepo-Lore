@@ -1,10 +1,14 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"os"
 	"runtime"
@@ -23,6 +27,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/health/live", a.live)
 	mux.HandleFunc("/health/ready", a.ready)
 	mux.HandleFunc("/version", a.version)
+	mux.HandleFunc("/api/v1/client/info", a.clientInfo)
 	mux.HandleFunc("/api/v1/auth/login", a.login)
 	mux.HandleFunc("/api/v1/auth/lore-token", a.issueLoreToken)
 	mux.HandleFunc("/api/v1/auth/password", a.changePassword)
@@ -88,6 +93,61 @@ func (a *App) version(w http.ResponseWriter, r *http.Request) {
 		"commit":   Commit,
 		"lore_cli": a.loreVersion(r.Context()),
 	})
+}
+
+func (a *App) clientInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	caPEM, caSHA256 := a.publicCAPEM()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"manager_version": Version,
+		"auth_url":        strings.TrimSpace(a.Config.Client.AuthURL),
+		"remote_base_url": strings.TrimSpace(a.Config.Import.RemoteBaseURL),
+		"ca_pem":          caPEM,
+		"ca_sha256":       caSHA256,
+	})
+}
+
+func (a *App) publicCAPEM() (string, string) {
+	caPath := strings.TrimSpace(a.Config.Client.CAFile)
+	if caPath == "" {
+		caPath = strings.TrimSpace(a.Config.Publish.CAFile)
+	}
+	if caPath == "" {
+		return "", ""
+	}
+	raw, err := os.ReadFile(caPath)
+	if err != nil {
+		return "", ""
+	}
+	var out bytes.Buffer
+	var firstSHA string
+	rest := raw
+	for len(rest) > 0 {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(blk.Bytes)
+		if err != nil {
+			continue
+		}
+		if firstSHA == "" {
+			sum := sha256.Sum256(cert.Raw)
+			firstSHA = hex.EncodeToString(sum[:])
+		}
+		_ = pem.Encode(&out, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	}
+	if out.Len() == 0 {
+		return "", ""
+	}
+	return out.String(), firstSHA
 }
 
 func (a *App) reserved(w http.ResponseWriter, _ *http.Request) {

@@ -614,6 +614,14 @@ func loadCmd(args []string) (client.Config, error) {
 			return client.Config{}, fmt.Errorf("client config")
 		}
 		cfg = loaded
+	} else if flags.managerURL == "" {
+		if activePath, activeErr := client.ActiveConfigPath(); activeErr == nil && activePath != "" {
+			loaded, err := client.Load(activePath)
+			if err != nil {
+				return client.Config{}, fmt.Errorf("client config")
+			}
+			cfg = loaded
+		}
 	}
 	if flags.managerURL != "" {
 		cfg.ManagerURL = flags.managerURL

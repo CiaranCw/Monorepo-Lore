@@ -47,6 +47,14 @@ type Config struct {
 	Auth            Auth
 	Publish         Publish
 	Import          Import
+	Client          ClientBootstrap
+}
+
+// ClientBootstrap holds optional public client discovery settings returned by
+// Manager's unauthenticated bootstrap endpoint. It never contains secrets.
+type ClientBootstrap struct {
+	AuthURL string
+	CAFile  string
 }
 
 // Import configures external Git repository batch importing and server-side
@@ -126,6 +134,10 @@ type fileConfig struct {
 		AllowedLocalDirs []string `toml:"allowed_local_dirs"`
 		AllowedSSHDirs   []string `toml:"allowed_ssh_dirs"`
 	} `toml:"import"`
+	Client struct {
+		AuthURL string `toml:"auth_url"`
+		CAFile  string `toml:"ca_file"`
+	} `toml:"client"`
 }
 
 // Load reads path and validates it. Missing files and malformed TOML are errors.
@@ -177,6 +189,10 @@ func Load(path string) (Config, error) {
 			RemoteBaseURL:    strings.TrimSpace(raw.Import.RemoteBaseURL),
 			AllowedLocalDirs: append([]string(nil), raw.Import.AllowedLocalDirs...),
 			AllowedSSHDirs:   append([]string(nil), raw.Import.AllowedSSHDirs...),
+		},
+		Client: ClientBootstrap{
+			AuthURL: strings.TrimSpace(raw.Client.AuthURL),
+			CAFile:  strings.TrimSpace(raw.Client.CAFile),
 		},
 	}
 	if cfg.Listen == "" {
@@ -236,6 +252,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Import.Workspace != "" {
 		cfg.Import.Workspace = resolve(base, cfg.Import.Workspace)
+	}
+	if cfg.Client.CAFile != "" {
+		cfg.Client.CAFile = resolve(base, cfg.Client.CAFile)
 	}
 	for i, d := range cfg.Import.AllowedLocalDirs {
 		cfg.Import.AllowedLocalDirs[i] = resolve(base, strings.TrimSpace(d))

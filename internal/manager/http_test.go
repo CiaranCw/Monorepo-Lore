@@ -234,6 +234,29 @@ func TestTokenServiceLoadsWithoutAffectingHealth(t *testing.T) {
 	}
 }
 
+func TestClientInfoEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.pem")
+	// Write a certificate PEM alongside an unrelated private key block to verify private keys are never leaked.
+	if err := os.WriteFile(caPath, []byte("-----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := testApp(t, fakeLore(t))
+	app.Config.Client.AuthURL = "https://auth.example.internal:57049"
+	app.Config.Import.RemoteBaseURL = "grpcs://gw.example.internal:57047"
+	app.Config.Client.CAFile = caPath
+	srv := httptestServer(t, app)
+
+	// Private-key-only file yields empty ca_pem/ca_sha256.
+	info := getJSON(t, srv+"/api/v1/client/info")
+	if info["auth_url"] != "https://auth.example.internal:57049" || info["remote_base_url"] != "grpcs://gw.example.internal:57047" {
+		t.Fatalf("unexpected client info: %v", info)
+	}
+	if info["ca_pem"] != "" || info["ca_sha256"] != "" {
+		t.Fatalf("non-cert block leaked: %v", info)
+	}
+}
+
 func httptestServer(t *testing.T, app *App) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

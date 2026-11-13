@@ -28,7 +28,7 @@ The gateway forwards HTTP/2. It does not decide repository access. AuthBridge do
 ## Quick Entry Points
 
 - **Human developers**: see [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for daily login, clone, sync, batch stage/commit/push, and history inspection.
-- **AI Agents & CLI quick discovery**: run `lore-mono --help` for categorized commands, `lore-mono guide` for the complete Agent onboarding guide, or `lore-mono guide --json` for a structured capability inventory.
+- **AI Agents & CLI quick discovery**: run `lore-mono --help` for categorized commands, `lore-mono guide` for the complete Agent onboarding guide, `lore-mono guide --json` for a structured capability inventory, or `lore-mono connect --manager <url>` for zero-config onboarding.
 
 ## Core features
 

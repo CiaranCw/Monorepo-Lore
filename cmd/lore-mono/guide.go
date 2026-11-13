@@ -97,8 +97,8 @@ func buildGuidePayload() guidePayload {
 			AccessControl:      "Ordinary project members only see and operate on Modules explicitly granted to them. Unauthorized or missing repositories both return not found.",
 		},
 		Auth: guideAuth{
-			CheckStatus:       "Run `lore-mono project list --config <client.toml>` (or `lore-mono module list --config <client.toml>`). A zero exit confirms an active Manager session; `not logged in` or `request failed` means login or re-authentication is required.",
-			FirstLogin:        "Run `lore-mono login --config <client.toml> --username <name>` (interactive hidden prompt) or pipe password via `--password-stdin`. Never pass passwords on command-line flags.",
+			CheckStatus:       "Run `lore-mono project list` (or pass `--config <client.toml>`). A zero exit confirms an active Manager session; `manager url is required`, `not logged in`, or `request failed` means `lore-mono connect` or `login` is required.",
+			FirstLogin:        "Prefer `lore-mono connect --manager <url> --username <name> --password-stdin` (or interactive prompt) for zero-config onboarding: it validates/TOFU-pins the internal CA, creates an isolated per-user profile in the standard user config directory, and stores credentials. Manual `--config <file>` with `lore-mono login` remains supported.",
 			PersistentSession: "Manager issues an exp-free session token stored privately in `lore-mono-session.tok` (outside `client.toml`). Closing terminals or restarting Manager does not require re-login.",
 			LoreRefresh:       "Lore 0.10.1 CLI requires short-lived exp-bearing tokens in its local store. Running any `lore-mono` workspace command silently refreshes the Lore credential when missing or expiring.",
 			Revocation:        "Changing password (`lore-mono password`), disabling an account, or revoking module grants takes effect immediately via `auth_version` and server-side permission checks.",
@@ -106,12 +106,12 @@ func buildGuidePayload() guidePayload {
 		},
 		DiscoveryFlow: guideDiscovery{
 			Steps: []string{
-				"Login (`lore-mono login --config <file> --username <name>`)",
-				"Project List (`lore-mono project list --config <file>`)",
-				"Select Project (`lore-mono project use <project> --config <file>`)",
-				"Module List (`lore-mono module list --config <file>`)",
+				"Connect (`lore-mono connect --manager <url> --username <name> [--password-stdin] [--project <P>]`) or Login (`lore-mono login --config <file> --username <name>`)",
+				"Project List (`lore-mono project list`)",
+				"Select Project (`lore-mono project use <project>`, or pass `--project` during connect)",
+				"Module List (`lore-mono module list`)",
 				"Select Authorized Module from server-returned list",
-				"Clone (`lore-mono clone <module> --config <file> --dest <dir>` or `lore-mono clone --all-authorized --config <file> --root <dir>`)",
+				"Clone (`lore-mono clone <module> --dest <dir>` or `lore-mono clone --all-authorized --root <dir>`)",
 			},
 			Rules: []string{
 				"Never guess Repository IDs.",
@@ -135,6 +135,13 @@ func buildGuidePayload() guidePayload {
 				RequiresLogin: false, OperationType: "read_only",
 				Arguments: "[-h|--help|help]",
 				Example:   "lore-mono --help",
+			},
+			{
+				Name: "connect", Category: "Authentication",
+				Purpose:       "Zero-config onboarding: discover Manager/CA/Auth metadata (TOFU + SHA-256 pin), initialize an isolated per-user profile in the user config dir, and log in.",
+				RequiresLogin: false, OperationType: "local_write",
+				Arguments: "--manager <url> [--username name] [--password-stdin] [--project name] [--ca-file pem] [--auth-url url] [--lore-binary path] [--config file] [--json]",
+				Example:   "lore-mono connect --manager https://manager.example:57048 --username dev1 --password-stdin",
 			},
 			{
 				Name: "login", Category: "Authentication",
@@ -349,7 +356,15 @@ B. Authentication & Session
   Succeeds if your persistent session is valid; fails with ` + "`not logged in`" + `
   or ` + "`request failed`" + ` otherwise. You may also inspect Lore's store via
   ` + "`lore auth list`" + ` (using ` + "`LORE_AUTH_STORE`" + `/` + "`LORE_AUTH_PATH`" + ` from ` + "`client.toml`" + `).
-- First login:
+- First connect (zero-config, recommended for AI Agents):
+  ` + "`lore-mono connect --manager <url> --username <user> --password-stdin`" + `
+  Initializes an isolated profile under the OS user config directory
+  (` + "`os.UserConfigDir()/lore-mono/profiles/<manager-user-hash>/`" + `), establishes
+  explicit TOFU + SHA-256 pinned CA trust (` + "`ca.pem`" + ` + ` + "`ca.pin`" + `) for internal CAs
+  (refusing future fingerprint changes, expired certs, or hostname mismatches),
+  discovers Auth/Gateway endpoints from Manager and Lore, activates that profile
+  for subsequent commands without needing ` + "`--config`" + `, and logs in.
+- Manual login (when using an explicit ` + "`--config`" + ` file):
   ` + "`lore-mono login --config client.toml --username <user>`" + ` (hidden prompt)
   or ` + "`--password-stdin`" + `. Never pass passwords on CLI arguments.
 - Persistent Login & Silent Lore Refresh:
@@ -370,12 +385,12 @@ C. Repository Discovery Flow
 ========================================================================
 Follow this exact sequence:
 
-  Login -> Project List -> Select Project -> Module List -> Select Module -> Clone
+  Connect/Login -> Project List -> Select Project -> Module List -> Select Module -> Clone
 
 Rules for AI Agents:
-1. Never guess Repository IDs.
-2. Never guess module names.
-3. Treat ` + "`lore-mono module list --config <file>`" + ` as the authoritative list.
+1. Never guess Repository IDs or module names, and never scan unrelated directories for old ` + "`client.toml`" + ` files.
+2. When starting with only a Manager URL, username, and password, run ` + "`lore-mono connect --manager <url> --username <user> --password-stdin`" + ` first; subsequent commands automatically use your isolated profile unless ` + "`--config`" + ` is given.
+3. Treat ` + "`lore-mono module list`" + ` as the authoritative list.
 4. Clone only the modules needed for the current task (or use
    ` + "`--all-authorized`" + ` when the task explicitly requires the full workspace).
 5. ` + "`lore-mono clone`" + ` automatically switches each cloned directory to the
@@ -393,6 +408,8 @@ Discovery & Help:
   lore-mono guide [--json]
 
 Authentication:
+  lore-mono connect --manager <url> [--username name] [--password-stdin] [--project P] [--ca-file pem] [--json]
+    Zero-config connect: discover service metadata, TOFU-pin CA, init isolated profile, and login.
   lore-mono login [--config file] [--manager url] [--username name] [--password-stdin]
     Authenticate and persist Manager session + Lore credential.
   lore-mono password [--config file] [--password-stdin]
