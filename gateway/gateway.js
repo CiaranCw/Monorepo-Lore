@@ -249,10 +249,11 @@ server.on("secureConnection", (socket) => {
   guard(socket);
 });
 server.on("session", (httpSession) => {
-  const socket = httpSession.socket;
-  if (!guard(socket)) return;
   sessions += 1;
-  log({ event: "client_session_open", address: ipv4(socket.remoteAddress), sessions: sessions, authorized: socket.authorized });
+  // The connection was already checked in secureConnection. Node wraps an
+  // HTTP/2 session socket and deliberately rejects direct socket property
+  // access with ERR_HTTP2_NO_SOCKET_MANIPULATION.
+  log({ event: "client_session_open", sessions: sessions });
   httpSession.on("error", (err) => log({ event: "client_session_error", message: err.message }));
   httpSession.on("close", () => {
     sessions = Math.max(0, sessions - 1);
@@ -261,7 +262,6 @@ server.on("session", (httpSession) => {
 });
 server.on("stream", (stream, headers) => {
   stream.on("error", () => {});
-  if (!guard(stream.session.socket)) return;
   log({ event: "client_stream", rpc: String(headers[":path"] || ""), scheme: String(headers[":scheme"] || "") });
   forward(stream, headers);
 });

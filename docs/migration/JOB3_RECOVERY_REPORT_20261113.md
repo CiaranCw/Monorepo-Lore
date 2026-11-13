@@ -127,7 +127,7 @@ Manager SHA-256:
 8d8a4527dc2e6c334983a4a565fa1e88a0ed6a4eeaf7a845b4828918f11110f6
 
 Gateway source SHA-256:
-013acc6f3651e27e8c9606e4c27cbfd9de97842cedba08f7f01396d98a8d9027
+d80ea1e68627287be8ce4d83ebedf60b5d15f7cb830cec49cf2e6589242c9c2a
 
 Fragment repair tool SHA-256:
 74815356fbbd8c5a5cd2b6e2a14fa51e384b0e613149a9354a6dabcfd04de60b
@@ -135,6 +135,16 @@ Fragment repair tool SHA-256:
 
 Only the Kubee Manager and Kubee Gateway were restarted. Lore Store and the
 original production authentication platform were not restarted or modified.
+
+### Gateway post-recovery follow-up
+
+A later read-only acceptance check found the Kubee Gateway had exited because
+the Node.js HTTP/2 session socket wrapper rejects direct socket property access
+with `ERR_HTTP2_NO_SOCKET_MANIPULATION`. The allowlist check already runs on
+the underlying TLS socket in `secureConnection`; duplicate checks in `session`
+and `stream` were removed. An isolated TLS HTTP/2 session test on port 54247
+passed before the Kubee-only Gateway restart. The allowlist values and all
+upstreams remained unchanged.
 
 ## Evidence
 
