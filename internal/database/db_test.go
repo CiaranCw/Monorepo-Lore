@@ -26,8 +26,8 @@ func TestMigrationIdempotentAndWAL(t *testing.T) {
 	db.QueryRow(`PRAGMA journal_mode`).Scan(&mode)
 	db.QueryRow(`PRAGMA foreign_keys`).Scan(&fk)
 	db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table'`).Scan(&tables)
-	if v != 5 || mode != "wal" || tables != 17 || fk != 1 {
-		t.Fatalf("user_version=%d journal_mode=%s tables=%d foreign_keys=%d (want 5, wal, 17, 1)", v, mode, tables, fk)
+	if v != 6 || mode != "wal" || tables != 18 || fk != 1 {
+		t.Fatalf("user_version=%d journal_mode=%s tables=%d foreign_keys=%d (want 6, wal, 18, 1)", v, mode, tables, fk)
 	}
 }
 

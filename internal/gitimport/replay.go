@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"lore-monorepo/internal/history"
 	"lore-monorepo/internal/loreexec"
 	"lore-monorepo/internal/project"
+	"lore-monorepo/internal/user"
 )
 
 type sharedMirrorState struct {
@@ -43,6 +45,7 @@ func (im *Importer) runImportItem(
 	st storedItem,
 	spec RepoSpec,
 	siblingSubdirs []string,
+	foreignMappings []PathMapping,
 	pathRules []PathRule,
 	manifestModNames map[string]bool,
 	getMirror func() (string, RemoteRefSummary, MirrorGraph, *TreeCache, error),
@@ -124,6 +127,16 @@ func (im *Importer) runImportItem(
 		switch state {
 		case "complete":
 			if spec.ConflictPolicy == ConflictSkipIfImported {
+				ver, sourceJob := im.priorPassedVerification(ctx, existing.ID)
+				if !ver.Passed || sourceJob == 0 {
+					out.Status = "conflict"
+					out.Error = "skip refused: the previous import has no passed verification"
+					out.ConflictReason = detail
+					im.saveItemFinal(ctx, st.ItemID, out)
+					return out
+				}
+				ver.ReusedFromJobID = sourceJob
+				out.Verification = ver
 				out.Status = "skipped"
 				out.ConflictReason = detail
 				im.saveItemFinal(ctx, st.ItemID, out)
@@ -206,7 +219,7 @@ func (im *Importer) runImportItem(
 	}
 
 	// Step 2: Project MirrorGraph onto this module's independent DAG (`source_subdir` or whole repo).
-	projGraph, pErr := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache)
+	projGraph, pErr := ProjectMirrorGraph(ctx, im.GitBinary, st.GitMirrorPath, rawGraph, spec.SourceSubdir, siblingSubdirs, pathRules, treeCache, spec.EffectiveMappings(), foreignMappings)
 	if pErr != nil {
 		out.Status = "failed"
 		out.Error = pErr.Error()
@@ -328,6 +341,75 @@ func (im *Importer) runImportItem(
 	return out
 }
 
+func (im *Importer) registerRemoteModuleForClone(ctx context.Context, actor string, projectID int64, spec RepoSpec, cp *itemCheckpoint) error {
+	if cp.LoreRepositoryID == "" {
+		return nil
+	}
+	account, _, err := user.Get(ctx, im.DB, actor)
+	if err != nil {
+		return err
+	}
+	if cp.ModuleID != 0 {
+		mod, gErr := project.GetModuleByID(ctx, im.DB, cp.ModuleID)
+		if gErr != nil {
+			return gErr
+		}
+		if mod.RepositoryID != cp.LoreRepositoryID {
+			return fmt.Errorf("gitimport: module %s is bound to repository %s", spec.ModuleName, mod.RepositoryID)
+		}
+		if mod.Archived() {
+			if err := project.ReactivateModule(ctx, im.DB, actor, mod.ID, spec.MountPath); err != nil {
+				return err
+			}
+		}
+	} else if existing, gErr := project.GetModule(ctx, im.DB, projectID, spec.ModuleName); gErr == nil {
+		if existing.RepositoryID != cp.LoreRepositoryID {
+			return fmt.Errorf("gitimport: module %s is bound to repository %s", spec.ModuleName, existing.RepositoryID)
+		}
+		cp.ModuleID = existing.ID
+		if existing.Archived() {
+			if err := project.ReactivateModule(ctx, im.DB, actor, existing.ID, spec.MountPath); err != nil {
+				return err
+			}
+		}
+	} else {
+		mod, cErr := project.CreateModule(ctx, im.DB, actor, project.Module{
+			ProjectID: projectID, Name: spec.ModuleName, RepositoryID: cp.LoreRepositoryID,
+			RepositoryURL: cp.LoreRepositoryURL, MountPath: spec.MountPath,
+		})
+		if cErr != nil {
+			return cErr
+		}
+		cp.ModuleID = mod.ID
+	}
+	err = project.GrantModule(ctx, im.DB, actor, account.ID, cp.ModuleID)
+	if errors.Is(err, project.ErrConflict) {
+		return nil
+	}
+	if err != nil && cp.ModuleID != 0 {
+		im.concealEmptyImportModule(ctx, actor, cp.ModuleID)
+	}
+	return err
+}
+
+// concealEmptyImportModule removes a module that has no imported commits from
+// human listings. The Lore repository id stays reserved so a retry adopts it
+// instead of creating a second repository. A module that already has commits
+// is left in place.
+func (im *Importer) concealEmptyImportModule(ctx context.Context, actor string, moduleID int64) {
+	if moduleID == 0 || im.DB == nil {
+		return
+	}
+	var n int
+	if err := im.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM module_commits WHERE module_id=?`, moduleID).Scan(&n); err != nil || n > 0 {
+		return
+	}
+	if account, _, err := user.Get(ctx, im.DB, actor); err == nil {
+		_ = project.RevokeModulePermission(ctx, im.DB, actor, account.ID, moduleID)
+	}
+	_ = project.ArchiveModule(ctx, im.DB, actor, moduleID)
+}
+
 func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 	ctx context.Context,
 	itemID int64,
@@ -394,12 +476,29 @@ func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 					return err
 				}
 				ids := repoID32Re.FindAllString(res.Stdout+"\n"+res.Stderr, -1)
-				if res.ExitCode != 0 || len(ids) == 0 {
+				if res.ExitCode != 0 {
+					ids = nil
+					info, infoErr := im.Lore.Exec.Run(ctx, loreexec.Request{
+						Argv: []string{"--non-interactive", "--json", "repository", "info", remoteURL},
+						Dir:  seedDir,
+						Env:  im.Lore.Env,
+					})
+					if infoErr == nil && info.ExitCode == 0 {
+						ids = repoID32Re.FindAllString(info.Stdout+"\n"+info.Stderr, -1)
+					}
+				}
+				if len(ids) == 0 {
 					return fmt.Errorf("gitimport: remote lore repository create failed (exit %d)", res.ExitCode)
 				}
 				cp.LoreRepositoryID = ids[len(ids)-1]
-				cp.LoreRepositoryURL = remoteURL
+				cp.LoreRepositoryURL = strings.TrimRight(im.RemoteBaseURL, "/") + "/" + cp.LoreRepositoryID
 			}
+			im.updateItemProgress(ctx, itemID, "cloning", *cp)
+			if err := im.registerRemoteModuleForClone(ctx, actor, projectID, spec, cp); err != nil {
+				im.updateItemProgress(ctx, itemID, "cloning", *cp)
+				return err
+			}
+			im.updateItemProgress(ctx, itemID, "cloning", *cp)
 			_ = os.RemoveAll(loreWorkPath)
 			res, err := im.Lore.Exec.Run(ctx, loreexec.Request{
 				Argv: []string{"--non-interactive", "clone", cp.LoreRepositoryURL, loreWorkPath},
@@ -407,7 +506,16 @@ func (im *Importer) ensureLoreRepoAndReconcileCheckpoint(
 				Env:  im.Lore.Env,
 			})
 			if err != nil || res.ExitCode != 0 {
-				return fmt.Errorf("gitimport: clone target lore repository failed")
+				im.concealEmptyImportModule(ctx, actor, cp.ModuleID)
+				im.updateItemProgress(ctx, itemID, "cloning", *cp)
+				detail := ""
+				if res.Stderr != "" || res.Stdout != "" {
+					detail = strings.TrimSpace(res.Stderr + " " + res.Stdout)
+					if len(detail) > 300 {
+						detail = detail[:300]
+					}
+				}
+				return fmt.Errorf("gitimport: clone target lore repository failed: %s", detail)
 			}
 		} else {
 			repoID, err := im.Lore.CreateOfflineRepository(ctx, loreWorkPath, spec.ModuleName)
@@ -675,7 +783,7 @@ func (im *Importer) replayGraphIntoLore(
 			if tErr != nil {
 				return tErr
 			}
-			specs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader)
+			specs, sErr := InspectExpectedSpecialObjects(mirrorDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, spec.EffectiveMappings())
 			if sErr != nil {
 				return sErr
 			}
@@ -684,6 +792,9 @@ func (im *Importer) replayGraphIntoLore(
 				extraMeta = map[string]string{"lore.orphan_anchor": firstRootLoreRev}
 			}
 			if err := im.indexProjectedCommitInDB(ctx, cp.ModuleID, existingRev, spec.SourceSubdir, c, specs, cp.CommitMap, extraMeta); err != nil {
+				return err
+			}
+			if err := im.recordPathProjection(ctx, cp.ModuleID, existingRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
 				return err
 			}
 			continue
@@ -787,7 +898,7 @@ func (im *Importer) replayGraphIntoLore(
 
 				if !isFinalStep {
 					if hasConflicts {
-						if _, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, nil); err != nil {
+						if _, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, nil); err != nil {
 							return err
 						}
 						if err := im.Lore.MergeResolve(ctx, loreWorkDir, true); err != nil {
@@ -834,7 +945,7 @@ func (im *Importer) replayGraphIntoLore(
 						return err
 					}
 				} else {
-					mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, cachedBlobs)
+					mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, cachedBlobs)
 					if err != nil {
 						return err
 					}
@@ -847,17 +958,23 @@ func (im *Importer) replayGraphIntoLore(
 					if err != nil {
 						return err
 					}
+					if err := im.recordPathProjection(ctx, cp.ModuleID, loreRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
+						return err
+					}
 					existingBranches[lane] = loreRev
 					cp.CommitMap[c.SHA] = loreRev
 				}
 			}
 		} else {
-			mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.LFSMode, allEntries, reader, cachedBlobs)
+			mat, err := materializeScopedEntries(mirrorDir, loreWorkDir, spec.SourceSubdir, spec.EffectiveMappings(), spec.LFSMode, allEntries, reader, cachedBlobs)
 			if err != nil {
 				return err
 			}
 			loreRev, err := im.commitAndIndexGitCommit(ctx, loreWorkDir, cp.ModuleID, spec.SourceSubdir, c, mat, cp.CommitMap, extraMeta)
 			if err != nil {
+				return err
+			}
+			if err := im.recordPathProjection(ctx, cp.ModuleID, loreRev, c.SHA, allEntries, spec.EffectiveMappings()); err != nil {
 				return err
 			}
 			existingBranches[lane] = loreRev
@@ -1037,6 +1154,30 @@ func (im *Importer) indexProjectedCommitInDB(
 			sp.LoreRevision = loreRev
 			sp.SourceCommitID = c.SHA
 			if err := history.UpsertSpecialObject(ctx, tx, moduleID, sp); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (im *Importer) recordPathProjection(ctx context.Context, moduleID int64, loreRev, sourceSHA string, entries []treeEntry, mappings []PathMapping) error {
+	mapped, _, err := ApplyPathMappings(entries, mappings)
+	if err != nil {
+		return err
+	}
+	return database.Tx(ctx, im.DB, func(tx *sql.Tx) error {
+		for _, e := range mapped {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO module_path_projections(
+					module_id, source_commit_id, lore_revision, source_path, mapped_path, path_rule_id, projection_type
+				) VALUES (?,?,?,?,?,?,?)
+				ON CONFLICT(module_id, source_commit_id, source_path) DO UPDATE SET
+					lore_revision=excluded.lore_revision,
+					mapped_path=excluded.mapped_path,
+					path_rule_id=excluded.path_rule_id,
+					projection_type=excluded.projection_type
+			`, moduleID, sourceSHA, loreRev, e.SourcePath, e.Path, e.RuleID, e.ProjectionType); err != nil {
 				return err
 			}
 		}

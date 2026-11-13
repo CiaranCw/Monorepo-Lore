@@ -232,3 +232,26 @@ func TestModuleCRUDAndAssociation(t *testing.T) {
 		t.Fatal("module audit counts wrong")
 	}
 }
+
+func TestReactivateArchivedModuleRestoresMount(t *testing.T) {
+	ctx := context.Background()
+	db, uid := setup(t)
+	p := mustProject(t, db, uid)
+	mod, err := CreateModule(ctx, db, "test", Module{ProjectID: p.ID, Name: "Engine", RepositoryID: alphaID, RepositoryURL: base + "alpha", MountPath: "Engine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ArchiveModule(ctx, db, "test", mod.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReactivateModule(ctx, db, "test", mod.ID, "Engine"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetModuleByID(ctx, db, mod.ID)
+	if err != nil || got.Archived() || got.MountPath != "Engine" {
+		t.Fatalf("reactivated module %+v err=%v", got, err)
+	}
+	if _, err := CreateModule(ctx, db, "test", Module{ProjectID: p.ID, Name: "Other", RepositoryID: betaID, RepositoryURL: base + "beta", MountPath: "Engine"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reactivated mount must be reserved, got %v", err)
+	}
+}

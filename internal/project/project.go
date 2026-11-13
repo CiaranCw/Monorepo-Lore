@@ -486,6 +486,49 @@ func ArchiveModule(ctx context.Context, db *sql.DB, actor string, id int64) erro
 	})
 }
 
+// ReactivateModule restores an archived module to mount. It refuses a mount
+// that another module already holds. Callers use this to retry an import whose
+// empty module was archived after a failed clone.
+func ReactivateModule(ctx context.Context, db *sql.DB, actor string, id int64, mount string) error {
+	if actor == "" {
+		return invalid("actor is required")
+	}
+	mount, err := NormalizeMountPath(mount)
+	if err != nil {
+		return err
+	}
+	return database.Tx(ctx, db, func(tx *sql.Tx) error {
+		var projectID int64
+		var archived sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT project_id, archived_at FROM modules WHERE module_id=?`, id).Scan(&projectID, &archived)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: module %d", ErrNotFound, id)
+		}
+		if err != nil {
+			return err
+		}
+		if !archived.Valid || archived.String == "" {
+			return nil
+		}
+		var holder int64
+		err = tx.QueryRowContext(ctx, `SELECT module_id FROM modules WHERE project_id=? AND mount_path=? AND module_id<>?`, projectID, mount, id).Scan(&holder)
+		if err == nil {
+			return fmt.Errorf("%w: mount path %q is in use", ErrConflict, mount)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE modules SET archived_at=NULL, mount_path=? WHERE module_id=? AND archived_at IS NOT NULL`, mount, id)
+		if err != nil {
+			return mapConstraint(err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("%w: archived module %d", ErrNotFound, id)
+		}
+		return database.Audit(ctx, tx, actor, "module_reactivate", fmt.Sprint(id), "mount="+mount)
+	})
+}
+
 // ResolveRepository tells what a Lore repository id is: a project root, an active module,
 // or unknown (archived modules resolve to RoleUnknown so they grant nothing).
 func ResolveRepository(ctx context.Context, db *sql.DB, repoID string) (RepositoryRole, *Project, *Module, error) {

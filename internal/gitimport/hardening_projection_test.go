@@ -373,7 +373,7 @@ func TestSkipIfImportedFourStatesShallowAndTamperedDAGVerification(t *testing.T)
 	refs, _ := InspectRemoteRefs(ctx, gitBin, octoSrc, nil, nil)
 	rawG, _ := ReadMirrorGraph(ctx, gitBin, mirrorDir, refs.DefaultBranch)
 	tc := NewTreeCache()
-	projG, _ := ProjectMirrorGraph(ctx, gitBin, mirrorDir, rawG, "", nil, nil, tc)
+	projG, _ := ProjectMirrorGraph(ctx, gitBin, mirrorDir, rawG, "", nil, nil, tc, nil, nil)
 	_, gitMap, _ := loadExistingGitCommits(ctx, db, octoModID)
 
 	tamperedVer, err := imp.verifyImportedModule(ctx, proj.ID, octoModID, mirrorDir, loreDir, RepoSpec{
@@ -800,6 +800,11 @@ func TestTeamGamesMonorepoSplitProjectionAndIsolation(t *testing.T) {
 	})
 	if err != nil || rerunSkip.SkippedItems != 3 {
 		t.Fatalf("re-import with skip_if_imported expected 3 skipped, got %+v err=%v", rerunSkip, err)
+	}
+	for _, it := range rerunSkip.Items {
+		if it.Status != "skipped" || !it.Verification.Passed || it.Verification.ReusedFromJobID == 0 {
+			t.Fatalf("skipped item must reuse a passed verification, got %+v", it)
+		}
 	}
 
 	// Verify Snapshot Publisher pins each of the 3 independent module revisions cleanly without merging module commits!

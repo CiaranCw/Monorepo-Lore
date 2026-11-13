@@ -64,6 +64,7 @@ type RepoSpec struct {
 	ExpectedDefaultBranch string            `json:"expected_default_branch,omitempty" toml:"expected_default_branch"`
 	ExpectedBranches      map[string]string `json:"expected_branches,omitempty" toml:"expected_branches"`
 	ExpectedTags          map[string]string `json:"expected_tags,omitempty" toml:"expected_tags"`
+	PathMappings          []PathMapping     `json:"path_mappings,omitempty" toml:"path_mappings"`
 	Auth                  AuthConfig        `json:"auth,omitempty" toml:"auth"`
 }
 
@@ -245,6 +246,43 @@ func NormalizeAndValidateManifest(m *Manifest) error {
 			}
 		}
 		sourceSubdirsByURL[r.SourceURL] = append(sourceSubdirsByURL[r.SourceURL], r.SourceSubdir)
+		for mi := range r.PathMappings {
+			pm := &r.PathMappings[mi]
+			pm.SourcePrefix = strings.Trim(strings.TrimSpace(strings.ReplaceAll(pm.SourcePrefix, "\\", "/")), "/")
+			pm.TargetPrefix = strings.Trim(strings.TrimSpace(strings.ReplaceAll(pm.TargetPrefix, "\\", "/")), "/")
+			pm.Kind = strings.ToLower(strings.TrimSpace(pm.Kind))
+			if pm.Kind == "" {
+				pm.Kind = MappingTree
+			}
+			if pm.ID == "" {
+				pm.ID = fmt.Sprintf("map-%d-%d", i, mi)
+			}
+			if err := validateMapping(*pm); err != nil {
+				return fmt.Errorf("repository[%d]: %w", i, err)
+			}
+		}
+		seenIDs := map[string]bool{}
+		for _, pm := range r.PathMappings {
+			if seenIDs[pm.ID] {
+				return fmt.Errorf("repository[%d]: duplicate path mapping id %q", i, pm.ID)
+			}
+			seenIDs[pm.ID] = true
+		}
+	}
+	for i := range m.Repositories {
+		mine := m.Repositories[i].EffectiveMappings()
+		for j := i + 1; j < len(m.Repositories); j++ {
+			if m.Repositories[j].SourceURL != m.Repositories[i].SourceURL {
+				continue
+			}
+			for _, a := range mine {
+				for _, b := range m.Repositories[j].EffectiveMappings() {
+					if mappingsClaimOverlap(a, b) {
+						return fmt.Errorf("repository[%d] and repository[%d]: path mappings overlap at %q and %q", i, j, a.SourcePrefix, b.SourcePrefix)
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -294,6 +332,7 @@ func HashManifest(m Manifest) string {
 		ExpectedDefaultBranch string            `json:"expected_default_branch,omitempty"`
 		ExpectedBranches      map[string]string `json:"expected_branches,omitempty"`
 		ExpectedTags          map[string]string `json:"expected_tags,omitempty"`
+		PathMappings          []PathMapping     `json:"path_mappings,omitempty"`
 	}
 	items := make([]cleanItem, len(m.Repositories))
 	for i, r := range m.Repositories {
@@ -306,6 +345,7 @@ func HashManifest(m Manifest) string {
 			ExpectedDefaultBranch: r.ExpectedDefaultBranch,
 			ExpectedBranches:      r.ExpectedBranches,
 			ExpectedTags:          r.ExpectedTags,
+			PathMappings:          r.PathMappings,
 		}
 	}
 	b, _ := json.Marshal(struct {
