@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1536,4 +1537,278 @@ func TestConnectNestedAuthDirSnapshotAndRollback(t *testing.T) {
 		}
 		_ = os.Remove(linkPath)
 	}
+}
+
+func makeDirSymlinkOrJunction(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err == nil {
+		return
+	} else if runtime.GOOS != "windows" {
+		t.Fatalf("os.Symlink(%s, %s) failed: %v", target, link, err)
+	}
+	cmd := exec.Command("cmd", "/c", "mklink", "/J", link, target)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J %s %s failed: %v (%s)", link, target, err, string(out))
+	}
+}
+
+func TestConnectExplicitConfigSharedAuthConcurrencyAndIsolation(t *testing.T) {
+	setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	var activeInProjects int32
+	var maxConcurrent int32
+	var loginSeq int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health/live":
+			_, _ = w.Write([]byte(`{"status":"live"}`))
+		case "/api/v1/client/info":
+			_ = json.NewEncoder(w).Encode(ClientInfo{CAPEM: string(ca.caPEM)})
+		case "/api/v1/auth/login":
+			n := atomic.AddInt32(&loginSeq, 1)
+			tok := fakeIdentity(fmt.Sprintf("shared-%d", n))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"identity_token": tok,
+				"lore_token":     tok,
+				"token_type":     "Bearer",
+				"username":       "alice",
+			})
+		case "/api/v1/projects":
+			cur := atomic.AddInt32(&activeInProjects, 1)
+			for {
+				prev := atomic.LoadInt32(&maxConcurrent)
+				if cur <= prev || atomic.CompareAndSwapInt32(&maxConcurrent, prev, cur) {
+					break
+				}
+			}
+			time.Sleep(60 * time.Millisecond)
+			atomic.AddInt32(&activeInProjects, -1)
+			_, _ = w.Write([]byte(`{"projects":[{"Name":"Kubee"}]}`))
+		case "/api/v1/me/modules":
+			_, _ = w.Write([]byte(`{"modules":[{"ProjectName":"Kubee","Name":"Pandora","MountPath":"Pandora","RepositoryURL":"grpcs://127.0.0.1:57047/repo1","Permission":"write"}]}`))
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.tlsCert}, MinVersion: tls.VersionTLS12}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// Verify lock target ordering and default-mode Manager lock preservation.
+	baseDir := t.TempDir()
+	defTargets, err := connectLockTargets(baseDir, srv.URL, "", filepath.Join(baseDir, "p", "auth"), "")
+	if err != nil || len(defTargets) != 1 {
+		t.Fatalf("default mode should keep single Manager-level lock, got %+v err=%v", defTargets, err)
+	}
+	root := t.TempDir()
+	cfgA := filepath.Join(root, "z-dir", "a.toml")
+	cfgB := filepath.Join(root, "a-dir", "b.toml")
+	sharedAuth := filepath.Join(root, "m-shared", "auth")
+	sharedAuthAlt := filepath.ToSlash(sharedAuth) + "/."
+	if runtime.GOOS == "windows" {
+		sharedAuthAlt = strings.ToUpper(sharedAuth)
+	}
+	tA, err := connectLockTargets(baseDir, srv.URL, cfgA, sharedAuth, sharedAuth)
+	if err != nil || len(tA) != 2 || tA[0].key >= tA[1].key {
+		t.Fatalf("expected sorted 2 lock targets for explicit config+auth, got %+v err=%v", tA, err)
+	}
+	tB, err := connectLockTargets(baseDir, srv.URL, cfgB, sharedAuthAlt, sharedAuthAlt)
+	if err != nil || len(tB) != 2 || tB[0].key >= tB[1].key {
+		t.Fatalf("expected sorted 2 lock targets for cfgB+sharedAuthAlt, got %+v err=%v", tB, err)
+	}
+	if tA[0].key != tB[1].key {
+		t.Fatalf("normalized shared auth lock keys did not match: %q vs %q", tA[0].key, tB[1].key)
+	}
+
+	execRunner := testLore(t)
+
+	// Two different explicit Config paths sharing the same Auth dir run concurrently:
+	// Run 1: failing Connect starts slightly after succeeding Connect.
+	// Run 2: failing Connect starts slightly before succeeding Connect.
+	for round := 0; round < 2; round++ {
+		_ = os.RemoveAll(sharedAuth)
+		_ = os.Remove(cfgA)
+		_ = os.Remove(cfgB)
+		_ = os.Remove(PinPathForCA(filepath.Join(filepath.Dir(cfgA), "ca.pem")))
+		_ = os.Remove(PinPathForCA(filepath.Join(filepath.Dir(cfgB), "ca.pem")))
+		_ = os.Remove(filepath.Join(filepath.Dir(cfgA), "ca.pem"))
+		_ = os.Remove(filepath.Join(filepath.Dir(cfgB), "ca.pem"))
+
+		var wg sync.WaitGroup
+		var okRes ConnectResult
+		var okErr, failErr error
+		wg.Add(2)
+		if round == 0 {
+			go func() {
+				defer wg.Done()
+				okRes, okErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL:         srv.URL,
+					Username:           "alice",
+					Password:           []byte("pw"),
+					Project:            "Kubee",
+					ExplicitConfigPath: cfgA,
+					ExplicitAuthPath:   sharedAuth,
+				}, execRunner)
+			}()
+			go func() {
+				defer wg.Done()
+				time.Sleep(15 * time.Millisecond)
+				_, failErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL:         srv.URL,
+					Username:           "alice",
+					Password:           []byte("pw"),
+					Project:            "MissingProject",
+					ExplicitConfigPath: cfgB,
+					ExplicitAuthPath:   sharedAuthAlt,
+				}, execRunner)
+			}()
+		} else {
+			go func() {
+				defer wg.Done()
+				_, failErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL:         srv.URL,
+					Username:           "alice",
+					Password:           []byte("pw"),
+					Project:            "MissingProject",
+					ExplicitConfigPath: cfgB,
+					ExplicitAuthPath:   sharedAuthAlt,
+				}, execRunner)
+			}()
+			go func() {
+				defer wg.Done()
+				time.Sleep(15 * time.Millisecond)
+				okRes, okErr = Connect(context.Background(), ConnectOptions{
+					ManagerURL:         srv.URL,
+					Username:           "alice",
+					Password:           []byte("pw"),
+					Project:            "Kubee",
+					ExplicitConfigPath: cfgA,
+					ExplicitAuthPath:   sharedAuth,
+				}, execRunner)
+			}()
+		}
+		wg.Wait()
+		if okErr != nil {
+			t.Fatalf("round %d succeeding Connect failed: %v", round, okErr)
+		}
+		if failErr == nil {
+			t.Fatalf("round %d failing Connect unexpectedly succeeded", round)
+		}
+		if atomic.LoadInt32(&maxConcurrent) > 1 {
+			t.Fatalf("round %d shared auth dir was NOT serialized: maxConcurrent=%d", round, maxConcurrent)
+		}
+		sessBytes, err := os.ReadFile(filepath.Join(sharedAuth, "lore-mono-session.tok"))
+		if err != nil || len(sessBytes) == 0 {
+			t.Fatalf("round %d shared session missing/corrupted: err=%v", round, err)
+		}
+		idBytes, err := os.ReadFile(filepath.Join(sharedAuth, "identity"))
+		if err != nil || len(idBytes) == 0 {
+			t.Fatalf("round %d shared lore identity missing/corrupted: err=%v", round, err)
+		}
+		if _, err := Load(okRes.ConfigPath); err != nil {
+			t.Fatalf("round %d succeeding config unreadable: %v", round, err)
+		}
+	}
+}
+
+func TestRestoreAuthDirRejectsReplacedRootSymlinkAndProtectsExternalDir(t *testing.T) {
+	root := t.TempDir()
+	authDir := filepath.Join(root, "auth")
+	subDir := filepath.Join(authDir, "sub")
+	if err := os.MkdirAll(subDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir, "lore-mono-session.tok"), []byte("tok-orig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "cred.tok"), []byte("nested-orig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Snapshot normal authDir, then replace authDir root with symlink/junction to externalDir.
+	snap, err := snapshotAuthDir(authDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(authDir); err != nil {
+		t.Fatal(err)
+	}
+	externalDir := t.TempDir()
+	makeDirSymlinkOrJunction(t, externalDir, authDir)
+
+	if err := restoreAuthDir(snap); err == nil {
+		t.Fatal("expected restoreAuthDir to fail closed when auth root was replaced with symlink/junction")
+	}
+	entries, err := os.ReadDir(externalDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("restoreAuthDir wrote into external symlink target: %v", entries)
+	}
+
+	// 2. Also verify !snap.existed fails closed if authDir becomes a symlink/junction before rollback.
+	externalSeed := filepath.Join(externalDir, "keep.txt")
+	if err := os.WriteFile(externalSeed, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreAuthDir(authDirSnapshot{dir: authDir, existed: false}); err == nil {
+		t.Fatal("expected restoreAuthDir(!existed) to fail closed when auth root is symlink/junction")
+	}
+	if got, err := os.ReadFile(externalSeed); err != nil || string(got) != "untouched" {
+		t.Fatalf("external target file modified during failed rollback: got=%q err=%v", got, err)
+	}
+	_ = os.Remove(authDir)
+
+	// 3. End-to-end Connect propagation: replace authDir with symlink/junction mid-Connect -> Connect fails AND propagates rollback error without touching externalDir2.
+	setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	externalDir2 := t.TempDir()
+	cfgPath := filepath.Join(t.TempDir(), "client.toml")
+	authDir2 := filepath.Join(t.TempDir(), "auth2")
+	if err := os.MkdirAll(authDir2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(authDir2, "keep.tok"), []byte("orig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health/live":
+			_, _ = w.Write([]byte(`{"status":"live"}`))
+		case "/api/v1/client/info":
+			_ = json.NewEncoder(w).Encode(ClientInfo{CAPEM: string(ca.caPEM)})
+		case "/api/v1/auth/login":
+			tok := fakeIdentity("10")
+			_ = json.NewEncoder(w).Encode(map[string]any{"identity_token": tok, "lore_token": tok, "token_type": "Bearer", "username": "alice"})
+		case "/api/v1/projects":
+			// Simulate external path swap of authDir2 right before Connect fails on MissingProject!
+			_ = os.RemoveAll(authDir2)
+			makeDirSymlinkOrJunction(t, externalDir2, authDir2)
+			_, _ = w.Write([]byte(`{"projects":[{"Name":"Kubee"}]}`))
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.tlsCert}, MinVersion: tls.VersionTLS12}
+	srv.StartTLS()
+	defer srv.Close()
+
+	_, connErr := Connect(context.Background(), ConnectOptions{
+		ManagerURL:         srv.URL,
+		Username:           "alice",
+		Password:           []byte("pw"),
+		Project:            "MissingProject",
+		ExplicitConfigPath: cfgPath,
+		ExplicitAuthPath:   authDir2,
+	}, testLore(t))
+	if connErr == nil || !strings.Contains(connErr.Error(), "rollback failed") {
+		t.Fatalf("expected Connect to propagate rollback failure on symlinked auth root, got %v", connErr)
+	}
+	entries2, err := os.ReadDir(externalDir2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries2) != 0 {
+		t.Fatalf("Connect rollback wrote into external symlink target: %v", entries2)
+	}
+	_ = os.Remove(authDir2)
 }

@@ -184,7 +184,6 @@ type authDirSnapshot struct {
 var (
 	rollbackWriteFile = writeFile
 	rollbackRemove    = os.Remove
-	rollbackRemoveAll = os.RemoveAll
 )
 
 func snapshotFiles(paths ...string) ([]fileSnapshot, error) {
@@ -220,23 +219,32 @@ func snapshotAuthDir(dir string) (authDirSnapshot, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return snap, fmt.Errorf("auth path %s must be a real directory", dir)
 	}
+	if err := verifyRealDirNoFollow(dir); err != nil {
+		return snap, fmt.Errorf("auth path %s must be a real directory: %w", dir, err)
+	}
 	snap.existed = true
 	dirSet := map[string]struct{}{}
 	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if p == dir {
-			return nil
-		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			return fmt.Errorf("unsupported symlink in auth dir: %s", p)
+		}
+		if p == dir {
+			if !d.IsDir() {
+				return fmt.Errorf("auth path %s is not a directory", p)
+			}
+			return verifyRealDirNoFollow(p)
 		}
 		rel, err := filepath.Rel(dir, p)
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			if err := verifyRealDirNoFollow(p); err != nil {
+				return fmt.Errorf("unsupported auth subdir %s: %w", p, err)
+			}
 			if _, seen := dirSet[rel]; !seen {
 				dirSet[rel] = struct{}{}
 				snap.dirs = append(snap.dirs, rel)
@@ -288,71 +296,9 @@ func restoreAuthDir(snap authDirSnapshot) error {
 		return nil
 	}
 	if !snap.existed {
-		if err := rollbackRemoveAll(snap.dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove new auth dir %s: %w", snap.dir, err)
-		}
-		return nil
+		return removeNewAuthDirSafe(snap.dir)
 	}
-	origDirs := make(map[string]struct{}, len(snap.dirs))
-	for _, d := range snap.dirs {
-		origDirs[d] = struct{}{}
-	}
-	var errs []string
-	var curDirs []string
-	walkErr := filepath.WalkDir(snap.dir, func(p string, d fs.DirEntry, wErr error) error {
-		if wErr != nil {
-			if errors.Is(wErr, os.ErrNotExist) {
-				return nil
-			}
-			return wErr
-		}
-		if p == snap.dir {
-			return nil
-		}
-		rel, err := filepath.Rel(snap.dir, p)
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			curDirs = append(curDirs, rel)
-			return nil
-		}
-		if _, existed := snap.files[rel]; !existed {
-			if err := rollbackRemove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-				errs = append(errs, fmt.Sprintf("remove new auth file %s: %v", p, err))
-			}
-		}
-		return nil
-	})
-	if walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) {
-		errs = append(errs, fmt.Sprintf("walk auth dir %s: %v", snap.dir, walkErr))
-	}
-	sort.Slice(curDirs, func(i, j int) bool {
-		return len(curDirs[i]) > len(curDirs[j])
-	})
-	for _, rel := range curDirs {
-		if _, existed := origDirs[rel]; !existed {
-			p := filepath.Join(snap.dir, rel)
-			if err := rollbackRemove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-				errs = append(errs, fmt.Sprintf("remove new auth subdir %s: %v", p, err))
-			}
-		}
-	}
-	for _, rel := range snap.dirs {
-		if err := os.MkdirAll(filepath.Join(snap.dir, rel), 0o700); err != nil {
-			errs = append(errs, fmt.Sprintf("restore auth subdir %s: %v", rel, err))
-		}
-	}
-	for rel, data := range snap.files {
-		p := filepath.Join(snap.dir, rel)
-		if err := rollbackWriteFile(p, data); err != nil {
-			errs = append(errs, fmt.Sprintf("restore auth file %s: %v", p, err))
-		}
-	}
-	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
-	}
-	return nil
+	return restoreExistingAuthDirSafe(snap)
 }
 
 func cleanupEmptyDir(dir string) error {
@@ -420,8 +366,11 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		hostCAPath = HostCAPath(baseDir, managerURL)
 	}
 
-	lockPath := connectLockPath(baseDir, managerURL, opts.ExplicitConfigPath)
-	unlock, err := acquireConnectLock(ctx, lockPath)
+	lockTargets, err := connectLockTargets(baseDir, managerURL, opts.ExplicitConfigPath, authPath, opts.ExplicitAuthPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	unlock, err := acquireConnectLocks(ctx, lockTargets)
 	if err != nil {
 		return ConnectResult{}, err
 	}
