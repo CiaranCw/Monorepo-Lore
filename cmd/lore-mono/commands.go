@@ -248,6 +248,9 @@ func publishCmd(args []string) error {
 	req.Header.Set("Content-Type", "application/json")
 	res, err := client.HTTPClient(cfg).Do(req)
 	if err != nil {
+		if client.IsTrustError(err) {
+			return err
+		}
 		return fmt.Errorf("publish failed")
 	}
 	defer res.Body.Close()
@@ -490,6 +493,9 @@ func changePasswordCmd(args []string) error {
 	req.Header.Set("Content-Type", "application/json")
 	res, err := client.HTTPClient(cfg).Do(req)
 	if err != nil {
+		if client.IsTrustError(err) {
+			return err
+		}
 		return fmt.Errorf("password failed")
 	}
 	defer res.Body.Close()
@@ -533,6 +539,9 @@ func managerPOST(cfg client.Config, path string, payload []byte) ([]byte, error)
 	req.Header.Set("Content-Type", "application/json")
 	res, err := client.HTTPClient(cfg).Do(req)
 	if err != nil {
+		if client.IsTrustError(err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("request failed")
 	}
 	defer res.Body.Close()
@@ -560,6 +569,9 @@ func managerGET(args []string, path string) ([]byte, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := client.HTTPClient(cfg).Do(req)
 	if err != nil {
+		if client.IsTrustError(err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("request failed")
 	}
 	defer res.Body.Close()
@@ -614,6 +626,14 @@ func loadCmd(args []string) (client.Config, error) {
 			return client.Config{}, fmt.Errorf("client config")
 		}
 		cfg = loaded
+	} else if flags.managerURL == "" {
+		if activePath, activeErr := client.ActiveConfigPath(); activeErr == nil && activePath != "" {
+			loaded, err := client.Load(activePath)
+			if err != nil {
+				return client.Config{}, fmt.Errorf("client config")
+			}
+			cfg = loaded
+		}
 	}
 	if flags.managerURL != "" {
 		cfg.ManagerURL = flags.managerURL
@@ -631,6 +651,9 @@ func loadCmd(args []string) (client.Config, error) {
 		return client.Config{}, fmt.Errorf("manager url is required")
 	}
 	if err := client.CheckCA(cfg.CAFile, time.Now()); err != nil {
+		return client.Config{}, err
+	}
+	if err := client.ValidateHTTPTrust(cfg); err != nil {
 		return client.Config{}, err
 	}
 	return cfg, nil

@@ -2,7 +2,19 @@
 
 本指南面向项目组日常开发人员，介绍如何通过 `lore-mono` 登录、同步和提交你有权限的游戏仓库。
 
-## 1. 首次登录
+## 1. 首次接入与登录
+
+### 方式 A：零配置自动接入（推荐）
+
+只需知道 Manager 地址、用户名和密码，即可自动完成 CA 首次信任（TOFU + 指纹固定）、配置目录初始化和登录：
+
+```powershell
+lore-mono connect --manager https://<manager-host>:<port> --username <你的用户名>
+```
+
+完成后可直接运行 `lore-mono project list`、`lore-mono module list`、`lore-mono clone` 等命令，无需手动指定 `--config`。
+
+### 方式 B：手动指定配置文件登录
 
 ```powershell
 lore-mono login --config client.toml --username <你的用户名>
@@ -111,3 +123,9 @@ lore-mono show <模块名> <Commit或Revision> --config client.toml
 - **新增授权**：运行 `lore-mono module list` 即可看到新模块，随后可单独 `lore-mono clone <新模块>` 或重新运行 `lore-mono clone --all-authorized`。
 - **撤销授权**：服务端即时生效；后续执行 `module list`、`stage --all`、`history --all` 等命令会自动排除已撤权模块，本地旧目录不会再被访问或误提交。
 - **修改密码或账号重新启用**：旧登录会话立即失效，需重新运行一次 `lore-mono login`。
+
+## 8. 命令行快速发现与 AI Agent 指引
+
+- 日常命令行参数速查：`lore-mono --help`
+- 面向 AI Agent 的完整能力与约束指引：`lore-mono guide`（机器可读清单：`lore-mono guide --json`）
+
