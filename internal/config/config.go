@@ -62,11 +62,12 @@ type Import struct {
 // Publish is the server-side snapshot publisher. Empty Workspace leaves it unmounted.
 // The auth path belongs to the publisher service account and is never returned to users.
 type Publish struct {
-	ParentURL string
-	Workspace string
-	AuthStore string
-	AuthPath  string
-	CAFile    string
+	ParentURL   string
+	Workspace   string
+	AuthStore   string
+	AuthPath    string
+	CAFile      string
+	ServiceUser string
 }
 
 // Auth is the Token Service configuration. Paths are files, not key material.
@@ -111,11 +112,12 @@ type fileConfig struct {
 		JWKS        string   `toml:"jwks"`
 	} `toml:"auth"`
 	Publish struct {
-		ParentURL string `toml:"parent_url"`
-		Workspace string `toml:"workspace"`
-		AuthStore string `toml:"auth_store"`
-		AuthPath  string `toml:"auth_path"`
-		CAFile    string `toml:"ca_file"`
+		ParentURL   string `toml:"parent_url"`
+		Workspace   string `toml:"workspace"`
+		AuthStore   string `toml:"auth_store"`
+		AuthPath    string `toml:"auth_path"`
+		CAFile      string `toml:"ca_file"`
+		ServiceUser string `toml:"service_user"`
 	} `toml:"publish"`
 	Import struct {
 		Workspace        string   `toml:"workspace"`
@@ -162,11 +164,12 @@ func Load(path string) (Config, error) {
 			JWKS:       raw.Auth.JWKS,
 		},
 		Publish: Publish{
-			ParentURL: strings.TrimSpace(raw.Publish.ParentURL),
-			Workspace: strings.TrimSpace(raw.Publish.Workspace),
-			AuthStore: strings.TrimSpace(raw.Publish.AuthStore),
-			AuthPath:  strings.TrimSpace(raw.Publish.AuthPath),
-			CAFile:    strings.TrimSpace(raw.Publish.CAFile),
+			ParentURL:   strings.TrimSpace(raw.Publish.ParentURL),
+			Workspace:   strings.TrimSpace(raw.Publish.Workspace),
+			AuthStore:   strings.TrimSpace(raw.Publish.AuthStore),
+			AuthPath:    strings.TrimSpace(raw.Publish.AuthPath),
+			CAFile:      strings.TrimSpace(raw.Publish.CAFile),
+			ServiceUser: strings.TrimSpace(raw.Publish.ServiceUser),
 		},
 		Import: Import{
 			Workspace:        strings.TrimSpace(raw.Import.Workspace),

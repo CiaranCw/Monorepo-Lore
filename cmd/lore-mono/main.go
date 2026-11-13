@@ -47,7 +47,7 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
-	case "logout", "project", "module", "clone", "status", "sync", "commit", "push", "publish", "history", "refs", "show", "import":
+	case "logout", "project", "module", "clone", "status", "sync", "stage", "commit", "push", "publish", "history", "refs", "show", "import":
 		if err := dispatch(args); err != nil {
 			fmt.Fprintln(stderr, err.Error())
 			return 1
@@ -231,6 +231,8 @@ Usage:
   lore-mono status <module> [--config file] [--root dir]
   lore-mono sync --all [--config file] [--root dir]
   lore-mono sync <module> [--config file] [--root dir]
+  lore-mono stage --all [--config file] [--root dir]
+  lore-mono stage <module> [--config file] [--root dir]
   lore-mono commit --all --message text [--config file] [--root dir]
   lore-mono commit <module> --message text [--config file] [--root dir]
   lore-mono push --all [--config file] [--root dir]

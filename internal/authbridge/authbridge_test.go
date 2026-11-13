@@ -256,6 +256,71 @@ func makeModule(t *testing.T, db *sql.DB, owner int64, projectName, module, repo
 	return m.ID
 }
 
+func TestPersistentIdentityAcrossAllAuthBridgeRPCs(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	tokens := openTokens(t)
+	aliceID := makeUser(t, db, "alice", "correct-horse")
+	allowed := "01a1cbf3e61b7e12a5d5ab1ee239dfb8"
+	modID := makeModule(t, db, aliceID, "alpha", "Engine", allowed, "Engine")
+	if err := project.GrantModule(ctx, db, "test", aliceID, modID); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(UserDirectory{Get: func(ctx context.Context, id int64) (*user.User, error) {
+		return user.GetByID(ctx, db, id)
+	}}, tokens, tokens, NewStoreResolver(db))
+	conn := grpcClient(t, svc)
+	client := epic_urc.NewUrcAuthApiClient(conn)
+	rebac := ucs_auth.NewRebacApiClient(conn)
+
+	raw, err := tokens.IssuePersistentIdentity(itoa(aliceID), "alice", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens.SetClock(func() time.Time { return time.Now().Add(400 * 24 * time.Hour) })
+	defer tokens.SetClock(time.Now)
+
+	mdCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer "+raw))
+	if _, err := client.CheckUserPermission(mdCtx, &epic_urc.CheckUserPermissionRequest{ResourceId: []string{"urc-" + allowed}}); err != nil {
+		t.Fatalf("CheckUserPermission persistent: %v", err)
+	}
+	if resp, err := client.LookupUserPermissions(mdCtx, &epic_urc.LookupUserPermissionsRequest{}); err != nil || len(resp.GetResourcePermission()) != 1 {
+		t.Fatalf("LookupUserPermissions persistent: %+v %v", resp, err)
+	}
+	if resp, err := client.GetUserInfo(mdCtx, &epic_urc.GetUserInfoRequest{UserId: []string{itoa(aliceID)}}); err != nil || len(resp.GetUserInfo()) != 1 {
+		t.Fatalf("GetUserInfo persistent: %+v %v", resp, err)
+	}
+	if _, err := client.ExchangeUserTokenForMultiresourceToken(mdCtx, &epic_urc.ExchangeUserTokenForMultiresourceTokenRequest{ResourceId: []string{"urc-" + allowed}}); err != nil {
+		t.Fatalf("ExchangeUserTokenForMultiresourceToken persistent: %v", err)
+	}
+	if _, err := rebac.CreateResource(mdCtx, &ucs_auth.CreateResourceRequest{ResourceId: "urc-" + allowed, ResourceName: "Engine"}); err != nil {
+		t.Fatalf("CreateResource persistent: %v", err)
+	}
+
+	// Disabling and re-enabling bumps auth_version and invalidates old persistent token across all RPCs.
+	if err := user.SetStatus(ctx, db, "test", "alice", "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := user.SetStatus(ctx, db, "test", "alice", "active"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CheckUserPermission(mdCtx, &epic_urc.CheckUserPermissionRequest{ResourceId: []string{"urc-" + allowed}}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected Unauthenticated after disable/re-enable on CheckUserPermission, got %v", err)
+	}
+	if _, err := client.LookupUserPermissions(mdCtx, &epic_urc.LookupUserPermissionsRequest{}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected Unauthenticated on LookupUserPermissions, got %v", err)
+	}
+	if _, err := client.GetUserInfo(mdCtx, &epic_urc.GetUserInfoRequest{UserId: []string{itoa(aliceID)}}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected Unauthenticated on GetUserInfo, got %v", err)
+	}
+	if _, err := client.ExchangeUserTokenForMultiresourceToken(mdCtx, &epic_urc.ExchangeUserTokenForMultiresourceTokenRequest{ResourceId: []string{"urc-" + allowed}}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected Unauthenticated on ExchangeUserTokenForMultiresourceToken, got %v", err)
+	}
+	if _, err := rebac.CreateResource(mdCtx, &ucs_auth.CreateResourceRequest{ResourceId: "urc-" + allowed, ResourceName: "Engine"}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected Unauthenticated on CreateResource, got %v", err)
+	}
+}
+
 func mustIdentity(t *testing.T, tokens *token.Service, id int64, name string, version int64) string {
 	t.Helper()
 	raw, err := tokens.IssueIdentity(itoa(id), name, version)

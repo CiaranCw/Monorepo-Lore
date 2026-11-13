@@ -30,6 +30,8 @@ func dispatch(args []string) error {
 		return statusCmd(args[1:])
 	case "sync":
 		return batchAction("sync", args[1:])
+	case "stage":
+		return batchAction("stage", args[1:])
 	case "commit":
 		return batchAction("commit", args[1:])
 	case "push":
@@ -54,6 +56,7 @@ func logout(args []string) error {
 	if err != nil {
 		return err
 	}
+	_ = client.DeleteSession(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{Argv: []string{"auth", "logout"}, Env: loreEnv(cfg)})
@@ -183,6 +186,9 @@ func cloneCmd(args []string) error {
 	}
 	if dest == "" {
 		dest = chosen.MountPath
+	}
+	if err := ensureLoreCredential(cfg); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return fmt.Errorf("clone failed")
@@ -328,7 +334,10 @@ func batchAction(action string, args []string) error {
 	if !all && len(parsed.Results) == 0 {
 		return fmt.Errorf("module is not accessible")
 	}
-	okN, failN := 0, 0
+	if err := ensureLoreCredential(cfg); err != nil {
+		return err
+	}
+	okN, skipN, failN := 0, 0, 0
 	for _, item := range parsed.Results {
 		limit := 2 * time.Minute
 		if action == "clone" {
@@ -337,6 +346,7 @@ func batchAction(action string, args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), limit)
 		dir := filepath.Join(root, item.MountPath)
 		var argv []string
+		runDir := ""
 		switch action {
 		case "clone":
 			argv = []string{"clone", item.RepositoryURL, dir}
@@ -344,16 +354,29 @@ func batchAction(action string, args []string) error {
 			argv = []string{"status", "--revision-only", "--repository", dir}
 		case "sync":
 			argv = []string{"sync", "--repository", dir}
+		case "stage":
+			if !isClonedLoreDir(dir) {
+				cancel()
+				skipN++
+				fmt.Fprintf(stdout, "[SKIP] %s (not cloned)\n", item.Name)
+				continue
+			}
+			runDir = dir
+			argv = []string{"stage", "--scan", "--repository", dir, "."}
 		case "commit":
 			argv = []string{"commit", "--repository", dir, message}
 		case "push":
 			argv = []string{"push", "--repository", dir}
 		}
-		res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{Argv: argv, Env: loreEnv(cfg)})
+		res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{Argv: argv, Dir: runDir, Env: loreEnv(cfg)})
 		if err != nil || res.ExitCode != 0 {
 			cancel()
 			failN++
-			fmt.Fprintf(stdout, "%s\t%s\tfailed\n", item.ProjectName, item.Name)
+			if action == "stage" {
+				fmt.Fprintf(stdout, "[FAIL] %s\n", item.Name)
+			} else {
+				fmt.Fprintf(stdout, "%s\t%s\tfailed\n", item.ProjectName, item.Name)
+			}
 			continue
 		}
 		if action == "clone" {
@@ -367,13 +390,26 @@ func batchAction(action string, args []string) error {
 		}
 		cancel()
 		okN++
-		fmt.Fprintf(stdout, "%s\t%s\tok\n", item.ProjectName, item.Name)
+		if action == "stage" {
+			fmt.Fprintf(stdout, "[OK] %s\n", item.Name)
+		} else {
+			fmt.Fprintf(stdout, "%s\t%s\tok\n", item.ProjectName, item.Name)
+		}
 	}
-	fmt.Fprintf(stdout, "summary ok=%d failed=%d\n", okN, failN)
+	if action == "stage" {
+		fmt.Fprintf(stdout, "summary ok=%d skipped=%d failed=%d\n", okN, skipN, failN)
+	} else {
+		fmt.Fprintf(stdout, "summary ok=%d failed=%d\n", okN, failN)
+	}
 	if failN > 0 {
 		return fmt.Errorf("%s failed", action)
 	}
 	return nil
+}
+
+func isClonedLoreDir(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, ".lore"))
+	return err == nil && info.IsDir()
 }
 
 func hasAny(args []string, flags ...string) bool {
@@ -535,6 +571,11 @@ func managerGET(args []string, path string) ([]byte, error) {
 }
 
 func identityToken(cfg client.Config) (string, error) {
+	if tok, err := client.LoadSession(cfg); err == nil && len(tok) > 0 {
+		s := string(tok)
+		wipe(tok)
+		return s, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	res, err := execRun(ctx, cfg.LoreBinary, loreexec.Request{Argv: []string{"auth", "list", "--with-token"}, Env: loreEnv(cfg)})
@@ -548,6 +589,17 @@ func identityToken(cfg client.Config) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("not logged in")
+}
+
+func ensureLoreCredential(cfg client.Config) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if execRun == nil {
+		return client.EnsureLoreCredential(ctx, cfg, newExecutor(cfg.LoreBinary))
+	}
+	return client.EnsureLoreCredentialWith(ctx, cfg, func(c context.Context, req loreexec.Request) (loreexec.CommandResult, error) {
+		return execRun(c, cfg.LoreBinary, req)
+	})
 }
 
 func loadCmd(args []string) (client.Config, error) {

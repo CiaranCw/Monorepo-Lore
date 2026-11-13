@@ -60,6 +60,9 @@ type Client struct {
 	// Env is copied into every Lore process. It is not applied unless set.
 	// LORE_AUTH_STORE is left unset unless the deployment puts it here.
 	Env map[string]string
+	// Identity, when non-empty, passes `--identity <id>` so a background
+	// service operation does not inherit an incompatible repo-local identity.
+	Identity string
 	// Delete removes a directory this call created. Tests can force a failure.
 	// Nil uses os.RemoveAll. It is never used on a path that already existed.
 	Delete func(path string) error
@@ -69,8 +72,11 @@ func (c *Client) run(ctx context.Context, dir string, args ...string) (loreexec.
 	if c.Exec == nil {
 		return loreexec.CommandResult{}, errors.New("loreadapter: executor is nil")
 	}
-	argv := make([]string, 0, len(args)+2)
+	argv := make([]string, 0, len(args)+4)
 	argv = append(argv, "--non-interactive", "--json")
+	if c.Identity != "" {
+		argv = append(argv, "--identity", c.Identity)
+	}
 	argv = append(argv, args...)
 	res, err := c.Exec.Run(ctx, loreexec.Request{Argv: argv, Dir: dir, Env: c.Env})
 	if err != nil {

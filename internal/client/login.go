@@ -8,6 +8,9 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +19,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -147,27 +152,34 @@ func Save(cfg Config) error {
 	return writeFile(cfg.Path, buf.Bytes())
 }
 
-// Login exchanges a password for an identity token and stores it with Lore.
+// Login exchanges a password for a persistent Manager identity token (no exp)
+// and a Lore-compatible exp-bearing identity token stored with the Lore CLI.
 // password is wiped by the caller. A Lore failure is not reported as success.
 func Login(ctx context.Context, cfg Config, username string, password []byte, exec loreexec.Executor) error {
 	if err := CheckManagerURL(cfg.ManagerURL); err != nil {
 		return err
 	}
-	token, subject, name, err := fetchIdentity(ctx, cfg, username, password)
+	persistent, loreTok, subject, name, err := fetchIdentity(ctx, cfg, username, password)
 	if err != nil {
 		return err
 	}
-	defer wipe(token)
+	defer wipe(persistent)
+	defer wipe(loreTok)
+	if err := SaveSession(cfg, persistent); err != nil {
+		return err
+	}
 	remote := cfg.RemoteURL
 	if strings.TrimSpace(remote) == "" {
-		if found, findErr := firstRepositoryURL(ctx, cfg, token); findErr == nil {
+		if found, findErr := firstRepositoryURL(ctx, cfg, persistent); findErr == nil {
 			remote = found
 		}
 	}
-	if err := storeIdentity(ctx, cfg, exec, token, remote); err != nil {
+	if err := storeIdentity(ctx, cfg, exec, loreTok, remote); err != nil {
+		_ = DeleteSession(cfg)
 		return err
 	}
 	if err := confirmIdentity(ctx, cfg, exec, subject, name); err != nil {
+		_ = DeleteSession(cfg)
 		return err
 	}
 	return nil
@@ -175,56 +187,67 @@ func Login(ctx context.Context, cfg Config, username string, password []byte, ex
 
 type loginResponse struct {
 	IdentityToken string `json:"identity_token"`
+	LoreToken     string `json:"lore_token"`
 	TokenType     string `json:"token_type"`
 	Username      string `json:"username"`
 	Error         string `json:"error"`
 }
 
-func fetchIdentity(ctx context.Context, cfg Config, username string, password []byte) ([]byte, string, string, error) {
+func fetchIdentity(ctx context.Context, cfg Config, username string, password []byte) ([]byte, []byte, string, string, error) {
 	payload, err := json.Marshal(struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}{Username: username, Password: string(password)})
 	if err != nil {
-		return nil, "", "", errors.New("login failed")
+		return nil, nil, "", "", errors.New("login failed")
 	}
 	defer wipe(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.ManagerURL, "/")+"/api/v1/auth/login", bytes.NewReader(payload))
 	if err != nil {
-		return nil, "", "", errors.New("login failed")
+		return nil, nil, "", "", errors.New("login failed")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	res, err := HTTPClient(cfg).Do(req)
 	if err != nil {
-		return nil, "", "", errors.New("manager unavailable")
+		return nil, nil, "", "", errors.New("manager unavailable")
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
-		return nil, "", "", errors.New("login failed")
+		return nil, nil, "", "", errors.New("login failed")
 	}
 	defer wipe(body)
 	var parsed loginResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, "", "", errors.New("login failed")
+		return nil, nil, "", "", errors.New("login failed")
 	}
 	if res.StatusCode == http.StatusUnauthorized {
-		return nil, "", "", errors.New("invalid username or password")
+		return nil, nil, "", "", errors.New("invalid username or password")
 	}
 	if res.StatusCode == http.StatusForbidden {
-		return nil, "", "", errors.New("account disabled")
+		return nil, nil, "", "", errors.New("account disabled")
 	}
 	if res.StatusCode != http.StatusOK || parsed.IdentityToken == "" || parsed.TokenType != "Bearer" {
-		return nil, "", "", errors.New("login failed")
+		return nil, nil, "", "", errors.New("login failed")
 	}
 	subject, err := subjectOf(parsed.IdentityToken)
 	if err != nil {
-		return nil, "", "", errors.New("login failed")
+		return nil, nil, "", "", errors.New("login failed")
 	}
-	return []byte(parsed.IdentityToken), subject, parsed.Username, nil
+	loreTok := parsed.LoreToken
+	if loreTok == "" {
+		loreTok = parsed.IdentityToken
+	}
+	return []byte(parsed.IdentityToken), []byte(loreTok), subject, parsed.Username, nil
 }
 
 func storeIdentity(ctx context.Context, cfg Config, exec loreexec.Executor, token []byte, remote string) error {
+	return storeIdentityWith(ctx, cfg, func(c context.Context, req loreexec.Request) (loreexec.CommandResult, error) {
+		return exec.Run(c, req)
+	}, token, remote)
+}
+
+func storeIdentityWith(ctx context.Context, cfg Config, run func(context.Context, loreexec.Request) (loreexec.CommandResult, error), token []byte, remote string) error {
 	argv := []string{"login", "--token-type", "lore", "--token", string(token)}
 	if cfg.AuthURL != "" {
 		argv = append(argv, "--auth-url", cfg.AuthURL)
@@ -232,7 +255,7 @@ func storeIdentity(ctx context.Context, cfg Config, exec loreexec.Executor, toke
 	if strings.TrimSpace(remote) != "" {
 		argv = append(argv, remote)
 	}
-	res, err := exec.Run(ctx, loreexec.Request{Argv: argv, Env: loreEnv(cfg)})
+	res, err := run(ctx, loreexec.Request{Argv: argv, Env: loreEnv(cfg)})
 	if err != nil || !res.ProcessSucceeded() {
 		return fmt.Errorf("lore login failed exit=%d detail=%s", res.ExitCode, publicText(res.Stderr+" "+res.Stdout))
 	}
@@ -240,7 +263,13 @@ func storeIdentity(ctx context.Context, cfg Config, exec loreexec.Executor, toke
 }
 
 func confirmIdentity(ctx context.Context, cfg Config, exec loreexec.Executor, subject, username string) error {
-	res, err := exec.Run(ctx, loreexec.Request{Argv: []string{"auth", "list"}, Env: loreEnv(cfg)})
+	return confirmIdentityWith(ctx, cfg, func(c context.Context, req loreexec.Request) (loreexec.CommandResult, error) {
+		return exec.Run(c, req)
+	}, subject, username)
+}
+
+func confirmIdentityWith(ctx context.Context, cfg Config, run func(context.Context, loreexec.Request) (loreexec.CommandResult, error), subject, username string) error {
+	res, err := run(ctx, loreexec.Request{Argv: []string{"auth", "list"}, Env: loreEnv(cfg)})
 	if err != nil || !res.ProcessSucceeded() {
 		return fmt.Errorf("credential list failed exit=%d", res.ExitCode)
 	}
@@ -339,4 +368,164 @@ func wipe(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+// SessionPath returns the private file where lore-mono persists the long-lived
+// Manager session token (without exp). It stays out of client.toml and out of git.
+func SessionPath(cfg Config) (string, error) {
+	if strings.TrimSpace(cfg.AuthPath) != "" {
+		return filepath.Join(cfg.AuthPath, "lore-mono-session.tok"), nil
+	}
+	if strings.TrimSpace(cfg.Path) != "" {
+		return filepath.Join(filepath.Dir(cfg.Path), ".lore-mono-session.tok"), nil
+	}
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimRight(cfg.ManagerURL, "/")))
+	return filepath.Join(base, "lore-mono", "session-"+hex.EncodeToString(sum[:8])+".tok"), nil
+}
+
+// SaveSession writes the persistent Manager session token with 0600 permissions.
+func SaveSession(cfg Config, token []byte) error {
+	if len(bytes.TrimSpace(token)) == 0 {
+		return nil
+	}
+	path, err := SessionPath(cfg)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeFile(path, bytes.TrimSpace(token))
+}
+
+// LoadSession reads the persistent Manager session token if present.
+func LoadSession(cfg Config) ([]byte, error) {
+	path, err := SessionPath(cfg)
+	if err != nil {
+		return nil, err
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil, errors.New("empty session")
+	}
+	return trimmed, nil
+}
+
+// DeleteSession removes the stored persistent Manager session token.
+func DeleteSession(cfg Config) error {
+	path, err := SessionPath(cfg)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// EnsureLoreCredential checks whether the Lore credential store already holds a
+// non-expired identity token; if missing or near expiry, it silently refreshes
+// one from Manager using the persistent session token without prompting.
+func EnsureLoreCredential(ctx context.Context, cfg Config, exec loreexec.Executor) error {
+	return EnsureLoreCredentialWith(ctx, cfg, func(c context.Context, req loreexec.Request) (loreexec.CommandResult, error) {
+		return exec.Run(c, req)
+	})
+}
+
+// EnsureLoreCredentialWith runs Lore credential inspection/storage through a custom runner.
+func EnsureLoreCredentialWith(ctx context.Context, cfg Config, run func(context.Context, loreexec.Request) (loreexec.CommandResult, error)) error {
+	sessionTok, err := LoadSession(cfg)
+	if err != nil {
+		return nil // fall back to whatever Lore credential store already holds
+	}
+	defer wipe(sessionTok)
+
+	res, runErr := run(ctx, loreexec.Request{Argv: []string{"auth", "list", "--with-token"}, Env: loreEnv(cfg)})
+	if runErr == nil && res.ExitCode == 0 {
+		if loreTok := extractListedToken(res.Stdout); loreTok != "" {
+			if !jwtExpiresSoon(loreTok, 2*time.Minute) {
+				return nil
+			}
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.ManagerURL, "/")+"/api/v1/auth/lore-token", nil)
+	if err != nil {
+		return errors.New("session refresh failed")
+	}
+	req.Header.Set("Authorization", "Bearer "+string(sessionTok))
+	resp, err := HTTPClient(cfg).Do(req)
+	if err != nil {
+		return errors.New("manager unavailable")
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return errors.New("session refresh failed")
+	}
+	defer wipe(body)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return errors.New("session expired or revoked; please run lore-mono login")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("session refresh failed")
+	}
+	var parsed struct {
+		LoreToken string `json:"lore_token"`
+		Username  string `json:"username"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.LoreToken == "" {
+		return errors.New("session refresh failed")
+	}
+	subject, err := subjectOf(parsed.LoreToken)
+	if err != nil {
+		return errors.New("session refresh failed")
+	}
+	remote := cfg.RemoteURL
+	if strings.TrimSpace(remote) == "" {
+		if found, findErr := firstRepositoryURL(ctx, cfg, sessionTok); findErr == nil {
+			remote = found
+		}
+	}
+	if err := storeIdentityWith(ctx, cfg, run, []byte(parsed.LoreToken), remote); err != nil {
+		return err
+	}
+	return confirmIdentityWith(ctx, cfg, run, subject, parsed.Username)
+}
+
+func extractListedToken(stdout string) string {
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Token:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Token:"))
+		}
+	}
+	return ""
+}
+
+func jwtExpiresSoon(raw string, margin time.Duration) bool {
+	parts := strings.Split(raw, ".")
+	if len(parts) < 2 {
+		return true
+	}
+	dec, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return true
+	}
+	var claims struct {
+		Exp *int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(dec, &claims); err != nil || claims.Exp == nil || *claims.Exp <= 0 {
+		return true
+	}
+	return !time.Now().UTC().Add(margin).Before(time.Unix(*claims.Exp, 0))
 }

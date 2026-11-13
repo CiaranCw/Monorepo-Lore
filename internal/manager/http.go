@@ -24,6 +24,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/health/ready", a.ready)
 	mux.HandleFunc("/version", a.version)
 	mux.HandleFunc("/api/v1/auth/login", a.login)
+	mux.HandleFunc("/api/v1/auth/lore-token", a.issueLoreToken)
 	mux.HandleFunc("/api/v1/auth/password", a.changePassword)
 	mux.HandleFunc("/api/v1/auth/me", a.me)
 	mux.HandleFunc("/api/v1/", a.dispatchAPI)
