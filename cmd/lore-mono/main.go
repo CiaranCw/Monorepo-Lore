@@ -150,6 +150,12 @@ func login(args []string) error {
 			return fmt.Errorf("client config")
 		}
 	}
+	if err := client.CheckCA(cfg.CAFile, time.Now()); err != nil {
+		return err
+	}
+	if err := client.ValidateHTTPTrust(cfg); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	return client.Login(ctx, cfg, username, password, newExecutor(cfg.LoreBinary))

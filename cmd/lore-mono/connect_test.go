@@ -152,4 +152,20 @@ func TestConnectCommandAndFollowupWithoutConfigFlag(t *testing.T) {
 	if code := run([]string{"module", "list", "--config", manualCfg}); code != 0 || !strings.Contains(out.String(), "Pandora") {
 		t.Fatalf("manual --config module list failed code=%d out=%s err=%s", code, out.String(), errBuf.String())
 	}
+
+	// Auto profile with missing ca.pin -> module list fails closed and surfaces trust error.
+	pinPath := client.PinPathForCA(connRes.CAFile)
+	origPin, err := os.ReadFile(pinPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(pinPath); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := run([]string{"module", "list"}); code == 0 || !strings.Contains(errBuf.String(), "pin") {
+		t.Fatalf("expected module list to fail closed without ca.pin, got code=%d err=%s", code, errBuf.String())
+	}
+	_ = os.WriteFile(pinPath, origPin, 0o600)
 }

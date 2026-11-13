@@ -17,6 +17,7 @@ type connectFlags struct {
 	passwordStdin bool
 	project       string
 	caFile        string
+	retrustCA     bool
 	authURL       string
 	loreBinary    string
 	configPath    string
@@ -64,6 +65,8 @@ func parseConnectFlags(args []string) (connectFlags, error) {
 			}
 		case "--password-stdin":
 			f.passwordStdin = true
+		case "--retrust-ca":
+			f.retrustCA = true
 		case "--json":
 			f.asJSON = true
 		default:
@@ -136,6 +139,7 @@ func connectCmd(args []string) error {
 		Password:           password,
 		Project:            flags.project,
 		ExplicitCAFile:     flags.caFile,
+		RetrustCA:          flags.retrustCA,
 		ExplicitAuthURL:    flags.authURL,
 		LoreBinary:         loreBinary,
 		ExplicitConfigPath: flags.configPath,

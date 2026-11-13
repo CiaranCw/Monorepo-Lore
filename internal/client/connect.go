@@ -26,6 +26,7 @@ type ConnectOptions struct {
 	Password           []byte
 	Project            string
 	ExplicitCAFile     string
+	RetrustCA          bool
 	ExplicitAuthURL    string
 	LoreBinary         string
 	ExplicitConfigPath string
@@ -165,9 +166,53 @@ func ResolveLoreBinary(explicit string) string {
 	return "lore"
 }
 
+type fileSnapshot struct {
+	path    string
+	existed bool
+	data    []byte
+}
+
+func snapshotFiles(paths ...string) []fileSnapshot {
+	snaps := make([]fileSnapshot, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err == nil {
+			snaps = append(snaps, fileSnapshot{path: p, existed: true, data: data})
+		} else if errors.Is(err, os.ErrNotExist) {
+			snaps = append(snaps, fileSnapshot{path: p, existed: false})
+		}
+	}
+	return snaps
+}
+
+func restoreSnapshots(snaps []fileSnapshot) {
+	for _, s := range snaps {
+		if s.existed {
+			_ = writeFile(s.path, s.data)
+		} else {
+			_ = os.Remove(s.path)
+		}
+	}
+}
+
+func cleanupEmptyDir(dir string) {
+	if strings.TrimSpace(dir) == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err == nil && len(entries) == 0 {
+		_ = os.Remove(dir)
+	}
+}
+
 // Connect bootstraps TLS trust (with TOFU + SHA-256 fingerprint pinning for internal CAs),
 // creates an isolated client profile in the standard user config directory, logs in using
 // persistent Manager session + Lore credentials, and discovers accessible projects/modules.
+// Newly created trust/profile files are rolled back if login or onboarding fails, while
+// preserving any previously established valid profile, CA, and pin state.
 func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Executor) (ConnectResult, error) {
 	managerURL, err := NormalizeManagerURL(opts.ManagerURL)
 	if err != nil {
@@ -209,6 +254,27 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		hostCAPath = HostCAPath(baseDir, managerURL)
 	}
 
+	_, profileDirErr := os.Stat(profileDir)
+	profileDirExisted := profileDirErr == nil
+	_, authDirErr := os.Stat(authPath)
+	authDirExisted := authDirErr == nil
+
+	// Snapshot pre-existing trust/profile state before making any writes so failed
+	// connections never leave stale leaf-only pins or corrupt pre-existing valid pins.
+	snaps := snapshotFiles(configPath, caSavePath, profilePinPath, hostPinPath, hostCAPath)
+	committed := false
+	defer func() {
+		if !committed {
+			restoreSnapshots(snaps)
+			if !authDirExisted {
+				cleanupEmptyDir(authPath)
+			}
+			if !profileDirExisted {
+				cleanupEmptyDir(profileDir)
+			}
+		}
+	}()
+
 	if err := os.MkdirAll(authPath, 0o700); err != nil {
 		return ConnectResult{}, err
 	}
@@ -219,7 +285,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		prevCfg = loaded
 	}
 
-	boot, err := bootstrapTLSAndInfo(ctx, managerURL, opts.ExplicitCAFile, caSavePath, profilePinPath, hostPinPath, hostCAPath)
+	boot, err := bootstrapTLSAndInfo(ctx, managerURL, opts.ExplicitCAFile, opts.RetrustCA, caSavePath, profilePinPath, hostPinPath, hostCAPath)
 	if err != nil {
 		return ConnectResult{}, err
 	}
@@ -246,6 +312,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		AuthPath:   authPath,
 		Project:    prevCfg.Project,
 		CAFile:     boot.CAFile,
+		TrustMode:  boot.TrustMode,
 	}
 	if err := Save(cfg); err != nil {
 		return ConnectResult{}, err
@@ -256,7 +323,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 
 	if err := Login(ctx, cfg, username, opts.Password, execRunner); err != nil {
 		if boot.TOFULeafOnly {
-			return ConnectResult{}, fmt.Errorf("%w (server sent only a non-CA leaf cert without /api/v1/client/info ca_pem; pass --ca-file <ca.pem> if Lore rejects it)", err)
+			return ConnectResult{}, fmt.Errorf("%w (server sent only a non-CA leaf cert without /api/v1/client/info ca_pem; pass --ca-file <ca.pem>)", err)
 		}
 		return ConnectResult{}, err
 	}
@@ -304,6 +371,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		}
 	}
 
+	committed = true
 	return ConnectResult{
 		ConfigPath:   cfg.Path,
 		ProfileDir:   profileDir,
@@ -342,6 +410,9 @@ func fetchProjectNames(ctx context.Context, cfg Config, token []byte) ([]string,
 	req.Header.Set("Authorization", "Bearer "+string(token))
 	res, err := HTTPClient(cfg).Do(req)
 	if err != nil {
+		if IsTrustError(err) {
+			return nil, err
+		}
 		return nil, errors.New("project list failed")
 	}
 	defer res.Body.Close()
@@ -374,6 +445,9 @@ func countAuthorizedModules(ctx context.Context, cfg Config, token []byte, proje
 	req.Header.Set("Authorization", "Bearer "+string(token))
 	res, err := HTTPClient(cfg).Do(req)
 	if err != nil {
+		if IsTrustError(err) {
+			return 0, err
+		}
 		return 0, errors.New("module list failed")
 	}
 	defer res.Body.Close()
