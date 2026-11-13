@@ -39,6 +39,7 @@ type Config struct {
 	AuthPath   string
 	Project    string
 	CAFile     string
+	TrustMode  string
 }
 
 type fileConfig struct {
@@ -50,6 +51,7 @@ type fileConfig struct {
 	AuthPath   string `toml:"auth_path"`
 	Project    string `toml:"project"`
 	CAFile     string `toml:"ca_file"`
+	TrustMode  string `toml:"trust_mode,omitempty"`
 }
 
 // Load reads a client config. Unknown keys are rejected so a password or
@@ -77,6 +79,7 @@ func Load(path string) (Config, error) {
 		AuthPath:   strings.TrimSpace(raw.AuthPath),
 		Project:    strings.TrimSpace(raw.Project),
 		CAFile:     strings.TrimSpace(raw.CAFile),
+		TrustMode:  strings.TrimSpace(raw.TrustMode),
 	}
 	if cfg.LoreBinary == "" {
 		cfg.LoreBinary = "lore"
@@ -98,6 +101,11 @@ func (c Config) Validate() error {
 	case "", "fallback":
 	default:
 		return errors.New("client config: auth_store must be empty or fallback")
+	}
+	switch c.TrustMode {
+	case "", "pinned":
+	default:
+		return errors.New("client config: trust_mode must be empty or pinned")
 	}
 	return nil
 }
@@ -144,6 +152,7 @@ func Save(cfg Config) error {
 		AuthPath:   cfg.AuthPath,
 		Project:    cfg.Project,
 		CAFile:     cfg.CAFile,
+		TrustMode:  cfg.TrustMode,
 	}
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(raw); err != nil {
@@ -209,6 +218,9 @@ func fetchIdentity(ctx context.Context, cfg Config, username string, password []
 	req.Header.Set("Content-Type", "application/json")
 	res, err := HTTPClient(cfg).Do(req)
 	if err != nil {
+		if IsTrustError(err) {
+			return nil, nil, "", "", err
+		}
 		return nil, nil, "", "", errors.New("manager unavailable")
 	}
 	defer res.Body.Close()
@@ -465,6 +477,9 @@ func EnsureLoreCredentialWith(ctx context.Context, cfg Config, run func(context.
 	req.Header.Set("Authorization", "Bearer "+string(sessionTok))
 	resp, err := HTTPClient(cfg).Do(req)
 	if err != nil {
+		if IsTrustError(err) {
+			return err
+		}
 		return errors.New("manager unavailable")
 	}
 	defer resp.Body.Close()

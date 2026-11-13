@@ -867,6 +867,9 @@ func managerGETWithCfg(cfg client.Config, path string) ([]byte, error) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	res, err := client.HTTPClient(cfg).Do(req)
 	if err != nil {
+		if client.IsTrustError(err) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("request failed")
 	}
 	defer res.Body.Close()

@@ -140,7 +140,7 @@ func buildGuidePayload() guidePayload {
 				Name: "connect", Category: "Authentication",
 				Purpose:       "Zero-config onboarding: discover Manager/CA/Auth metadata (TOFU + SHA-256 pin), initialize an isolated per-user profile in the user config dir, and log in.",
 				RequiresLogin: false, OperationType: "local_write",
-				Arguments: "--manager <url> [--username name] [--password-stdin] [--project name] [--ca-file pem] [--auth-url url] [--lore-binary path] [--config file] [--json]",
+				Arguments: "--manager <url> [--username name] [--password-stdin] [--project name] [--ca-file pem] [--retrust-ca] [--auth-url url] [--lore-binary path] [--config file] [--json]",
 				Example:   "lore-mono connect --manager https://manager.example:57048 --username dev1 --password-stdin",
 			},
 			{

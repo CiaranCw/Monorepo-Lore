@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"lore-monorepo/internal/loreexec"
@@ -26,6 +28,7 @@ type ConnectOptions struct {
 	Password           []byte
 	Project            string
 	ExplicitCAFile     string
+	RetrustCA          bool
 	ExplicitAuthURL    string
 	LoreBinary         string
 	ExplicitConfigPath string
@@ -165,10 +168,164 @@ func ResolveLoreBinary(explicit string) string {
 	return "lore"
 }
 
+type fileSnapshot struct {
+	path    string
+	existed bool
+	data    []byte
+}
+
+type authDirSnapshot struct {
+	dir     string
+	existed bool
+	dirs    []string
+	files   map[string][]byte
+}
+
+var (
+	rollbackWriteFile = writeFile
+	rollbackRemove    = os.Remove
+)
+
+func snapshotFiles(paths ...string) ([]fileSnapshot, error) {
+	snaps := make([]fileSnapshot, 0, len(paths))
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err == nil {
+			snaps = append(snaps, fileSnapshot{path: p, existed: true, data: data})
+		} else if errors.Is(err, os.ErrNotExist) {
+			snaps = append(snaps, fileSnapshot{path: p, existed: false})
+		} else {
+			return nil, fmt.Errorf("snapshot %s: %w", p, err)
+		}
+	}
+	return snaps, nil
+}
+
+func snapshotAuthDir(dir string) (authDirSnapshot, error) {
+	snap := authDirSnapshot{dir: dir, files: map[string][]byte{}}
+	if strings.TrimSpace(dir) == "" {
+		return snap, nil
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return snap, nil
+		}
+		return snap, fmt.Errorf("stat auth dir %s: %w", dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return snap, fmt.Errorf("auth path %s must be a real directory", dir)
+	}
+	if err := verifyRealDirNoFollow(dir); err != nil {
+		return snap, fmt.Errorf("auth path %s must be a real directory: %w", dir, err)
+	}
+	snap.existed = true
+	dirSet := map[string]struct{}{}
+	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("unsupported symlink in auth dir: %s", p)
+		}
+		if p == dir {
+			if !d.IsDir() {
+				return fmt.Errorf("auth path %s is not a directory", p)
+			}
+			return verifyRealDirNoFollow(p)
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if err := verifyRealDirNoFollow(p); err != nil {
+				return fmt.Errorf("unsupported auth subdir %s: %w", p, err)
+			}
+			if _, seen := dirSet[rel]; !seen {
+				dirSet[rel] = struct{}{}
+				snap.dirs = append(snap.dirs, rel)
+			}
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("unsupported non-regular file in auth dir: %s", p)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("snapshot auth file %s: %w", p, err)
+		}
+		snap.files[rel] = data
+		return nil
+	})
+	if err != nil {
+		return snap, fmt.Errorf("snapshot auth dir %s: %w", dir, err)
+	}
+	sort.Strings(snap.dirs)
+	return snap, nil
+}
+
+func restoreSnapshots(snaps []fileSnapshot) error {
+	var errs []string
+	for _, s := range snaps {
+		if s.existed {
+			if err := rollbackWriteFile(s.path, s.data); err != nil {
+				errs = append(errs, fmt.Sprintf("restore %s: %v", s.path, err))
+			}
+		} else {
+			if err := rollbackRemove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Sprintf("remove %s: %v", s.path, err))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func restoreAuthDir(snap authDirSnapshot) error {
+	if strings.TrimSpace(snap.dir) == "" {
+		return nil
+	}
+	if !snap.existed {
+		return removeNewAuthDirSafe(snap.dir)
+	}
+	return restoreExistingAuthDirSafe(snap)
+}
+
+func cleanupEmptyDir(dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read dir %s: %w", dir, err)
+	}
+	if len(entries) == 0 {
+		if err := rollbackRemove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove empty dir %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // Connect bootstraps TLS trust (with TOFU + SHA-256 fingerprint pinning for internal CAs),
 // creates an isolated client profile in the standard user config directory, logs in using
 // persistent Manager session + Lore credentials, and discovers accessible projects/modules.
-func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Executor) (ConnectResult, error) {
+// Newly created trust/profile/auth files are rolled back if login or onboarding fails, while
+// preserving any previously established valid profile, CA, auth, and pin state.
+func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Executor) (res ConnectResult, retErr error) {
 	managerURL, err := NormalizeManagerURL(opts.ManagerURL)
 	if err != nil {
 		return ConnectResult{}, err
@@ -209,6 +366,77 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		hostCAPath = HostCAPath(baseDir, managerURL)
 	}
 
+	lockTargets, err := connectLockTargets(baseDir, managerURL, opts.ExplicitConfigPath, authPath, opts.ExplicitAuthPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	unlock, err := acquireConnectLocks(ctx, lockTargets)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	defer func() {
+		if uErr := unlock(); uErr != nil {
+			if retErr != nil {
+				retErr = fmt.Errorf("%w; %v", retErr, uErr)
+			} else {
+				retErr = uErr
+			}
+		}
+	}()
+
+	profileInfo, profileDirErr := os.Stat(profileDir)
+	profileDirExisted := false
+	if profileDirErr == nil {
+		if !profileInfo.IsDir() {
+			return ConnectResult{}, fmt.Errorf("profile path %s is not a directory", profileDir)
+		}
+		profileDirExisted = true
+	} else if !errors.Is(profileDirErr, os.ErrNotExist) {
+		return ConnectResult{}, fmt.Errorf("stat profile dir %s: %w", profileDir, profileDirErr)
+	}
+
+	// Snapshot pre-existing trust/profile/auth state before making any writes so failed
+	// connections never leave stale leaf-only pins/credentials or corrupt pre-existing state.
+	snaps, err := snapshotFiles(configPath, caSavePath, profilePinPath, hostPinPath, hostCAPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	authSnap, err := snapshotAuthDir(authPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	committed := false
+	defer func() {
+		defer func() {
+			for _, b := range authSnap.files {
+				wipe(b)
+			}
+		}()
+		if committed {
+			return
+		}
+		var rbErrs []string
+		if err := restoreSnapshots(snaps); err != nil {
+			rbErrs = append(rbErrs, err.Error())
+		}
+		if err := restoreAuthDir(authSnap); err != nil {
+			rbErrs = append(rbErrs, err.Error())
+		}
+		if !profileDirExisted {
+			if err := cleanupEmptyDir(profileDir); err != nil {
+				rbErrs = append(rbErrs, err.Error())
+			}
+		}
+		if len(rbErrs) > 0 {
+			msg := strings.Join(rbErrs, "; ")
+			if retErr != nil {
+				retErr = fmt.Errorf("%w; rollback failed (pin/config state may be inconsistent): %s", retErr, msg)
+			} else {
+				retErr = fmt.Errorf("rollback failed (pin/config state may be inconsistent): %s", msg)
+			}
+		}
+	}()
+
 	if err := os.MkdirAll(authPath, 0o700); err != nil {
 		return ConnectResult{}, err
 	}
@@ -219,7 +447,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		prevCfg = loaded
 	}
 
-	boot, err := bootstrapTLSAndInfo(ctx, managerURL, opts.ExplicitCAFile, caSavePath, profilePinPath, hostPinPath, hostCAPath)
+	boot, err := bootstrapTLSAndInfo(ctx, managerURL, opts.ExplicitCAFile, opts.RetrustCA, caSavePath, profilePinPath, hostPinPath, hostCAPath)
 	if err != nil {
 		return ConnectResult{}, err
 	}
@@ -246,6 +474,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		AuthPath:   authPath,
 		Project:    prevCfg.Project,
 		CAFile:     boot.CAFile,
+		TrustMode:  boot.TrustMode,
 	}
 	if err := Save(cfg); err != nil {
 		return ConnectResult{}, err
@@ -256,7 +485,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 
 	if err := Login(ctx, cfg, username, opts.Password, execRunner); err != nil {
 		if boot.TOFULeafOnly {
-			return ConnectResult{}, fmt.Errorf("%w (server sent only a non-CA leaf cert without /api/v1/client/info ca_pem; pass --ca-file <ca.pem> if Lore rejects it)", err)
+			return ConnectResult{}, fmt.Errorf("%w (server sent only a non-CA leaf cert without /api/v1/client/info ca_pem; pass --ca-file <ca.pem>)", err)
 		}
 		return ConnectResult{}, err
 	}
@@ -304,6 +533,7 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		}
 	}
 
+	committed = true
 	return ConnectResult{
 		ConfigPath:   cfg.Path,
 		ProfileDir:   profileDir,
@@ -342,6 +572,9 @@ func fetchProjectNames(ctx context.Context, cfg Config, token []byte) ([]string,
 	req.Header.Set("Authorization", "Bearer "+string(token))
 	res, err := HTTPClient(cfg).Do(req)
 	if err != nil {
+		if IsTrustError(err) {
+			return nil, err
+		}
 		return nil, errors.New("project list failed")
 	}
 	defer res.Body.Close()
@@ -374,6 +607,9 @@ func countAuthorizedModules(ctx context.Context, cfg Config, token []byte, proje
 	req.Header.Set("Authorization", "Bearer "+string(token))
 	res, err := HTTPClient(cfg).Do(req)
 	if err != nil {
+		if IsTrustError(err) {
+			return 0, err
+		}
 		return 0, errors.New("module list failed")
 	}
 	defer res.Body.Close()

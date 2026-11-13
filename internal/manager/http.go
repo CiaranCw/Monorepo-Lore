@@ -1,20 +1,17 @@
 package manager
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"net/http"
 	"os"
 	"runtime"
 	"strings"
 	"time"
 
+	"lore-monorepo/internal/client"
 	"lore-monorepo/internal/loreexec"
 )
 
@@ -122,32 +119,11 @@ func (a *App) publicCAPEM() (string, string) {
 	if err != nil {
 		return "", ""
 	}
-	var out bytes.Buffer
-	var firstSHA string
-	rest := raw
-	for len(rest) > 0 {
-		var blk *pem.Block
-		blk, rest = pem.Decode(rest)
-		if blk == nil {
-			break
-		}
-		if blk.Type != "CERTIFICATE" {
-			continue
-		}
-		cert, err := x509.ParseCertificate(blk.Bytes)
-		if err != nil {
-			continue
-		}
-		if firstSHA == "" {
-			sum := sha256.Sum256(cert.Raw)
-			firstSHA = hex.EncodeToString(sum[:])
-		}
-		_ = pem.Encode(&out, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
-	}
-	if out.Len() == 0 {
+	pemText, setSHA256, err := client.ParseCAPEMBundle(raw)
+	if err != nil {
 		return "", ""
 	}
-	return out.String(), firstSHA
+	return pemText, setSHA256
 }
 
 func (a *App) reserved(w http.ResponseWriter, _ *http.Request) {
