@@ -26,6 +26,11 @@ type trustError struct {
 	msg string
 }
 
+// testSystemRootCAs is nil in production (using OS system roots). Tests in
+// package client may override it to simulate system-trusted roots without
+// mutating the host certificate store.
+var testSystemRootCAs *x509.CertPool
+
 func (e trustError) Error() string { return e.msg }
 
 func newTrustError(format string, args ...any) error {
@@ -512,7 +517,9 @@ func bootstrapTLSAndInfo(ctx context.Context, managerURL, explicitCAFile string,
 			return tlsBootstrapResult{}, err
 		}
 		if hostCAPath != "" {
-			_ = writeFile(hostCAPath, cleanPEM)
+			if err := writeFile(hostCAPath, cleanPEM); err != nil {
+				return tlsBootstrapResult{}, err
+			}
 		}
 		info, _ := fetchClientInfo(ctx, hc, managerURL)
 		return tlsBootstrapResult{
@@ -559,8 +566,12 @@ func bootstrapTLSAndInfo(ctx context.Context, managerURL, explicitCAFile string,
 				}
 			}
 			upgradedPin := makeSetPin(certs)
-			_ = writePinFile(profilePinPath, upgradedPin)
-			_ = writePinFile(hostPinPath, upgradedPin)
+			if err := writePinFile(profilePinPath, upgradedPin); err != nil {
+				return tlsBootstrapResult{}, err
+			}
+			if err := writePinFile(hostPinPath, upgradedPin); err != nil {
+				return tlsBootstrapResult{}, err
+			}
 			info, _ := fetchClientInfo(ctx, hc, managerURL)
 			return tlsBootstrapResult{
 				Info:      info,
@@ -602,6 +613,9 @@ func bootstrapTLSAndInfo(ctx context.Context, managerURL, explicitCAFile string,
 		} else if len(peerCerts) > 0 {
 			finalPin = makeSetPin([]*x509.Certificate{peerCerts[len(peerCerts)-1]})
 		}
+		if finalPin.Digest == "" {
+			return tlsBootstrapResult{}, newTrustError("system tls verification did not return peer certificates")
+		}
 		savedCA := ""
 		if strings.TrimSpace(info.CAPEM) != "" && len(peerCerts) > 0 {
 			if caCerts, cleanCA, err := parsePEMCerts([]byte(info.CAPEM), now); err == nil {
@@ -615,10 +629,20 @@ func bootstrapTLSAndInfo(ctx context.Context, managerURL, explicitCAFile string,
 							savedCA = caSavePath
 						}
 						if hostCAPath != "" {
-							_ = writeFile(hostCAPath, cleanCA)
+							if err := writeFile(hostCAPath, cleanCA); err != nil {
+								return tlsBootstrapResult{}, err
+							}
 						}
 					}
 				}
+			}
+		}
+		if savedCA == "" {
+			if err := removeIfExists(caSavePath); err != nil {
+				return tlsBootstrapResult{}, err
+			}
+			if err := removeIfExists(hostCAPath); err != nil {
+				return tlsBootstrapResult{}, err
 			}
 		}
 		if err := writePinFile(profilePinPath, finalPin); err != nil {
@@ -810,6 +834,7 @@ func pinnedHTTPClient(certs []*x509.Certificate, pemBytes []byte, host string) (
 
 func systemPinnedHTTPClient(pin CAPin, host string) *http.Client {
 	tlsCfg := &tls.Config{
+		RootCAs:    testSystemRootCAs,
 		ServerName: host,
 		MinVersion: tls.VersionTLS12,
 		VerifyConnection: func(cs tls.ConnectionState) error {
@@ -943,6 +968,7 @@ func probeSystemTLS(ctx context.Context, u *url.URL, managerURL string) (*http.C
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
+				RootCAs:    testSystemRootCAs,
 				ServerName: u.Hostname(),
 				MinVersion: tls.VersionTLS12,
 			},
@@ -1007,4 +1033,15 @@ func fetchClientInfo(ctx context.Context, hc *http.Client, managerURL string) (C
 func isUnknownAuthorityError(err error) bool {
 	var unknown x509.UnknownAuthorityError
 	return errors.As(err, &unknown)
+}
+
+func removeIfExists(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }

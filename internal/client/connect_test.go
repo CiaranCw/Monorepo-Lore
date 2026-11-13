@@ -849,3 +849,317 @@ func TestIsUnknownAuthorityErrorStrictClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectRetrustCAToSystemRootRemovesStaleCAAndSupportsSecondConnect(t *testing.T) {
+	cfgRoot := setTempUserConfigDir(t)
+	internalCA := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, []string{"localhost"}, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	sysCA := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, []string{"localhost"}, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	otherCA := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, []string{"localhost"}, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	var curTLS atomic.Value
+	var curCAPEM atomic.Value
+	curTLS.Store(internalCA.tlsCert)
+	curCAPEM.Store(string(internalCA.caPEM))
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health/live":
+			_, _ = w.Write([]byte(`{"status":"live"}`))
+		case "/api/v1/client/info":
+			_ = json.NewEncoder(w).Encode(ClientInfo{
+				ManagerVersion: "test",
+				CAPEM:          curCAPEM.Load().(string),
+			})
+		case "/api/v1/auth/login":
+			tok := fakeIdentity("10")
+			_ = json.NewEncoder(w).Encode(map[string]any{"identity_token": tok, "lore_token": tok, "token_type": "Bearer", "username": "alice"})
+		case "/api/v1/projects":
+			_, _ = w.Write([]byte(`{"projects":[{"Name":"Kubee"}]}`))
+		case "/api/v1/me/modules":
+			_, _ = w.Write([]byte(`{"modules":[{"ProjectName":"Kubee","Name":"Pandora","MountPath":"Pandora","RepositoryURL":"grpcs://127.0.0.1:57047/repo1","Permission":"write"}]}`))
+		}
+	}))
+	srv.TLS = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			cert := curTLS.Load().(tls.Certificate)
+			return &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}, nil
+		},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// Separate profile on a different Manager to verify it is never affected.
+	srvOther := startTLSManagerMock(t, otherCA.tlsCert, otherCA.caPEM, "", true)
+
+	exec := testLore(t)
+	resInit, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+	}, exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resOther, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srvOther.URL,
+		Username:   "bob",
+		Password:   []byte("pw"),
+	}, exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	normURL, _ := NormalizeManagerURL(srv.URL)
+	hostCA := HostCAPath(filepath.Join(cfgRoot, "lore-mono"), normURL)
+	if _, err := os.Stat(resInit.CAFile); err != nil {
+		t.Fatalf("expected initial profile ca.pem: %v", err)
+	}
+	if _, err := os.Stat(hostCA); err != nil {
+		t.Fatalf("expected initial host CA cache: %v", err)
+	}
+
+	// Simulate srv rotating to a cert trusted by system roots, with NO ca_pem in /api/v1/client/info.
+	sysPool := x509.NewCertPool()
+	sysPool.AddCert(sysCA.caCert)
+	prevRoots := testSystemRootCAs
+	testSystemRootCAs = sysPool
+	t.Cleanup(func() { testSystemRootCAs = prevRoots })
+	curTLS.Store(sysCA.tlsCert)
+	curCAPEM.Store("")
+
+	// Failed --retrust-ca (e.g., unknown project) MUST roll back deletion of old ca.pem and host CA cache!
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "NoSuchProject",
+		RetrustCA:  true,
+	}, exec); err == nil {
+		t.Fatal("expected failure on missing project")
+	}
+	if gotCA, err := os.ReadFile(resInit.CAFile); err != nil || string(gotCA) != string(internalCA.caPEM) {
+		t.Fatalf("failed --retrust-ca did not restore old profile ca.pem: err=%v", err)
+	}
+	if gotHostCA, err := os.ReadFile(hostCA); err != nil || string(gotHostCA) != string(internalCA.caPEM) {
+		t.Fatalf("failed --retrust-ca did not restore old host CA cache: err=%v", err)
+	}
+
+	// Successful --retrust-ca transitions cleanly to system-root pinning and removes stale ca.pem / hostCA.
+	resRetrust, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		RetrustCA:  true,
+	}, exec)
+	if err != nil {
+		t.Fatalf("--retrust-ca to system root failed: %v", err)
+	}
+	if resRetrust.CAFile != "" {
+		t.Fatalf("expected empty CAFile after retrust to system roots without ca_pem, got %q", resRetrust.CAFile)
+	}
+	if resRetrust.CASHA256 != CertSHA256Hex(sysCA.caCert) {
+		t.Fatalf("expected system root pin %s, got %s", CertSHA256Hex(sysCA.caCert), resRetrust.CASHA256)
+	}
+	if _, err := os.Stat(resInit.CAFile); !os.IsNotExist(err) {
+		t.Fatalf("stale profile ca.pem still exists after --retrust-ca: err=%v", err)
+	}
+	if _, err := os.Stat(hostCA); !os.IsNotExist(err) {
+		t.Fatalf("stale host CA cache still exists after --retrust-ca: err=%v", err)
+	}
+
+	// Second Connect WITHOUT --retrust-ca MUST succeed!
+	resSecond, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+	}, exec)
+	if err != nil {
+		t.Fatalf("second Connect after system-root retrust failed: %v", err)
+	}
+	if resSecond.CASHA256 != CertSHA256Hex(sysCA.caCert) {
+		t.Fatalf("unexpected pin on second connect: %s", resSecond.CASHA256)
+	}
+	cfg, err := Load(resSecond.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := HTTPClient(cfg).Get(srv.URL + "/health/live")
+	if err != nil {
+		t.Fatalf("HTTPClient failed after system-root retrust: %v", err)
+	}
+	resp.Body.Close()
+
+	// Other profile on srvOther remains completely untouched.
+	if gotOther, err := os.ReadFile(resOther.CAFile); err != nil || string(gotOther) != string(otherCA.caPEM) {
+		t.Fatalf("other profile ca.pem was affected: err=%v", err)
+	}
+}
+
+func TestConnectSnapshotAndRollbackErrorHandling(t *testing.T) {
+	cfgRoot := setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	srv := startTLSManagerMock(t, ca.tlsCert, ca.caPEM, "", true)
+	exec := testLore(t)
+
+	// 1. Non-NotExist error during snapshotFiles must abort Connect immediately.
+	normURL, _ := NormalizeManagerURL(srv.URL)
+	baseDir := filepath.Join(cfgRoot, "lore-mono")
+	profDir := ProfileDir(baseDir, normURL, "alice")
+	caAsDir := filepath.Join(profDir, "ca.pem")
+	if err := os.MkdirAll(caAsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+	}, exec); err == nil || !strings.Contains(err.Error(), "snapshot") {
+		t.Fatalf("expected snapshot error when ca.pem is a directory, got %v", err)
+	}
+	_ = os.RemoveAll(profDir)
+
+	// 2. Rollback write failure on existing profile must NOT silently return only the normal error.
+	res, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+	}, exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevWrite := rollbackWriteFile
+	rollbackWriteFile = func(path string, body []byte) error {
+		if path == res.ConfigPath || path == PinPathForCA(res.CAFile) {
+			return errors.New("injected disk write failure")
+		}
+		return prevWrite(path, body)
+	}
+	_, err = Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "NoSuchProject",
+	}, exec)
+	rollbackWriteFile = prevWrite
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("expected rollback failed error to be surfaced, got %v", err)
+	}
+
+	// 3. Rollback remove failure on fresh profile must surface rollback error.
+	prevRemove := rollbackRemove
+	rollbackRemove = func(path string) error {
+		if strings.HasSuffix(path, "ca.pem") {
+			return errors.New("injected remove failure")
+		}
+		return prevRemove(path)
+	}
+	_, err = Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "bob",
+		Password:   []byte("pw"),
+		Project:    "NoSuchProject",
+	}, exec)
+	rollbackRemove = prevRemove
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("expected rollback remove failure to be surfaced, got %v", err)
+	}
+}
+
+func TestConnectCleansUpNewAuthCredentialsOnDiscoveryFailureAndPreservesExisting(t *testing.T) {
+	cfgRoot := setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+
+	var loginCount int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health/live":
+			_, _ = w.Write([]byte(`{"status":"live"}`))
+		case "/api/v1/client/info":
+			_ = json.NewEncoder(w).Encode(ClientInfo{CAPEM: string(ca.caPEM)})
+		case "/api/v1/auth/login":
+			n := atomic.AddInt32(&loginCount, 1)
+			tok := fakeIdentity(fmt.Sprintf("%d", 10+n))
+			_ = json.NewEncoder(w).Encode(map[string]any{"identity_token": tok, "lore_token": tok, "token_type": "Bearer", "username": "alice"})
+		case "/api/v1/projects":
+			_, _ = w.Write([]byte(`{"projects":[{"Name":"Kubee"}]}`))
+		case "/api/v1/me/modules":
+			_, _ = w.Write([]byte(`{"modules":[{"ProjectName":"Kubee","Name":"Pandora","MountPath":"Pandora","RepositoryURL":"grpcs://127.0.0.1:57047/repo1","Permission":"write"}]}`))
+		}
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{ca.tlsCert}, MinVersion: tls.VersionTLS12}
+	srv.StartTLS()
+	defer srv.Close()
+
+	exec := testLore(t)
+	normURL, _ := NormalizeManagerURL(srv.URL)
+	baseDir := filepath.Join(cfgRoot, "lore-mono")
+	profDir := ProfileDir(baseDir, normURL, "alice")
+	authDir := filepath.Join(profDir, "auth")
+
+	// Case A: Fresh profile/auth dir where Login succeeds, then project discovery fails -> must remove session, Lore creds, auth dir, and profile dir!
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "MissingProject",
+	}, exec); err == nil {
+		t.Fatal("expected error for missing project")
+	}
+	for _, p := range []string{
+		filepath.Join(authDir, "lore-mono-session.tok"),
+		filepath.Join(authDir, "identity"),
+		authDir,
+		profDir,
+		HostPinPath(baseDir, normURL),
+		HostCAPath(baseDir, normURL),
+	} {
+		if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+			t.Fatalf("failed Connect left credential/dir artifact %s", p)
+		}
+	}
+
+	// Case B: Pre-existing valid profile & auth dir (plus unrelated user file) -> later failed Connect restores previous creds & preserves user file!
+	res, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "Kubee",
+	}, exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origSess, err := os.ReadFile(filepath.Join(res.AuthPath, "lore-mono-session.tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origIdent, err := os.ReadFile(filepath.Join(res.AuthPath, "identity"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	userFile := filepath.Join(res.AuthPath, "user-keep.txt")
+	if err := os.WriteFile(userFile, []byte("keep-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL: srv.URL,
+		Username:   "alice",
+		Password:   []byte("pw"),
+		Project:    "MissingProject",
+	}, exec); err == nil {
+		t.Fatal("expected error on second connect with missing project")
+	}
+	gotSess, err := os.ReadFile(filepath.Join(res.AuthPath, "lore-mono-session.tok"))
+	if err != nil || string(gotSess) != string(origSess) {
+		t.Fatalf("pre-existing session token was not preserved: got=%q want=%q err=%v", gotSess, origSess, err)
+	}
+	gotIdent, err := os.ReadFile(filepath.Join(res.AuthPath, "identity"))
+	if err != nil || string(gotIdent) != string(origIdent) {
+		t.Fatalf("pre-existing identity was not preserved: got=%q want=%q err=%v", gotIdent, origIdent, err)
+	}
+	gotUser, err := os.ReadFile(userFile)
+	if err != nil || string(gotUser) != "keep-me" {
+		t.Fatalf("pre-existing user file was modified or deleted: got=%q err=%v", gotUser, err)
+	}
+}

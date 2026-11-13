@@ -172,7 +172,19 @@ type fileSnapshot struct {
 	data    []byte
 }
 
-func snapshotFiles(paths ...string) []fileSnapshot {
+type authDirSnapshot struct {
+	dir     string
+	existed bool
+	files   map[string][]byte
+}
+
+var (
+	rollbackWriteFile = writeFile
+	rollbackRemove    = os.Remove
+	rollbackRemoveAll = os.RemoveAll
+)
+
+func snapshotFiles(paths ...string) ([]fileSnapshot, error) {
 	snaps := make([]fileSnapshot, 0, len(paths))
 	for _, p := range paths {
 		if strings.TrimSpace(p) == "" {
@@ -183,37 +195,132 @@ func snapshotFiles(paths ...string) []fileSnapshot {
 			snaps = append(snaps, fileSnapshot{path: p, existed: true, data: data})
 		} else if errors.Is(err, os.ErrNotExist) {
 			snaps = append(snaps, fileSnapshot{path: p, existed: false})
+		} else {
+			return nil, fmt.Errorf("snapshot %s: %w", p, err)
 		}
 	}
-	return snaps
+	return snaps, nil
 }
 
-func restoreSnapshots(snaps []fileSnapshot) {
+func snapshotAuthDir(dir string) (authDirSnapshot, error) {
+	snap := authDirSnapshot{dir: dir, files: map[string][]byte{}}
+	if strings.TrimSpace(dir) == "" {
+		return snap, nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return snap, nil
+		}
+		return snap, fmt.Errorf("stat auth dir %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return snap, fmt.Errorf("auth path %s is not a directory", dir)
+	}
+	snap.existed = true
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return snap, fmt.Errorf("read auth dir %s: %w", dir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return snap, fmt.Errorf("snapshot auth file %s: %w", p, err)
+		}
+		snap.files[e.Name()] = data
+	}
+	return snap, nil
+}
+
+func restoreSnapshots(snaps []fileSnapshot) error {
+	var errs []string
 	for _, s := range snaps {
 		if s.existed {
-			_ = writeFile(s.path, s.data)
+			if err := rollbackWriteFile(s.path, s.data); err != nil {
+				errs = append(errs, fmt.Sprintf("restore %s: %v", s.path, err))
+			}
 		} else {
-			_ = os.Remove(s.path)
+			if err := rollbackRemove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Sprintf("remove %s: %v", s.path, err))
+			}
 		}
 	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
 }
 
-func cleanupEmptyDir(dir string) {
+func restoreAuthDir(snap authDirSnapshot) error {
+	if strings.TrimSpace(snap.dir) == "" {
+		return nil
+	}
+	if !snap.existed {
+		if err := rollbackRemoveAll(snap.dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove new auth dir %s: %w", snap.dir, err)
+		}
+		return nil
+	}
+	var errs []string
+	entries, err := os.ReadDir(snap.dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("read auth dir %s: %w", snap.dir, err)
+		}
+	} else {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if _, existed := snap.files[e.Name()]; !existed {
+				p := filepath.Join(snap.dir, e.Name())
+				if err := rollbackRemove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+					errs = append(errs, fmt.Sprintf("remove new auth file %s: %v", p, err))
+				}
+			}
+		}
+	}
+	for name, data := range snap.files {
+		p := filepath.Join(snap.dir, name)
+		if err := rollbackWriteFile(p, data); err != nil {
+			errs = append(errs, fmt.Sprintf("restore auth file %s: %v", p, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func cleanupEmptyDir(dir string) error {
 	if strings.TrimSpace(dir) == "" {
-		return
+		return nil
 	}
 	entries, err := os.ReadDir(dir)
-	if err == nil && len(entries) == 0 {
-		_ = os.Remove(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read dir %s: %w", dir, err)
 	}
+	if len(entries) == 0 {
+		if err := rollbackRemove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove empty dir %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 // Connect bootstraps TLS trust (with TOFU + SHA-256 fingerprint pinning for internal CAs),
 // creates an isolated client profile in the standard user config directory, logs in using
 // persistent Manager session + Lore credentials, and discovers accessible projects/modules.
-// Newly created trust/profile files are rolled back if login or onboarding fails, while
-// preserving any previously established valid profile, CA, and pin state.
-func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Executor) (ConnectResult, error) {
+// Newly created trust/profile/auth files are rolled back if login or onboarding fails, while
+// preserving any previously established valid profile, CA, auth, and pin state.
+func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Executor) (res ConnectResult, retErr error) {
 	managerURL, err := NormalizeManagerURL(opts.ManagerURL)
 	if err != nil {
 		return ConnectResult{}, err
@@ -254,23 +361,55 @@ func Connect(ctx context.Context, opts ConnectOptions, execRunner loreexec.Execu
 		hostCAPath = HostCAPath(baseDir, managerURL)
 	}
 
-	_, profileDirErr := os.Stat(profileDir)
-	profileDirExisted := profileDirErr == nil
-	_, authDirErr := os.Stat(authPath)
-	authDirExisted := authDirErr == nil
+	profileInfo, profileDirErr := os.Stat(profileDir)
+	profileDirExisted := false
+	if profileDirErr == nil {
+		if !profileInfo.IsDir() {
+			return ConnectResult{}, fmt.Errorf("profile path %s is not a directory", profileDir)
+		}
+		profileDirExisted = true
+	} else if !errors.Is(profileDirErr, os.ErrNotExist) {
+		return ConnectResult{}, fmt.Errorf("stat profile dir %s: %w", profileDir, profileDirErr)
+	}
 
-	// Snapshot pre-existing trust/profile state before making any writes so failed
-	// connections never leave stale leaf-only pins or corrupt pre-existing valid pins.
-	snaps := snapshotFiles(configPath, caSavePath, profilePinPath, hostPinPath, hostCAPath)
+	// Snapshot pre-existing trust/profile/auth state before making any writes so failed
+	// connections never leave stale leaf-only pins/credentials or corrupt pre-existing state.
+	snaps, err := snapshotFiles(configPath, caSavePath, profilePinPath, hostPinPath, hostCAPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
+	authSnap, err := snapshotAuthDir(authPath)
+	if err != nil {
+		return ConnectResult{}, err
+	}
 	committed := false
 	defer func() {
-		if !committed {
-			restoreSnapshots(snaps)
-			if !authDirExisted {
-				cleanupEmptyDir(authPath)
+		defer func() {
+			for _, b := range authSnap.files {
+				wipe(b)
 			}
-			if !profileDirExisted {
-				cleanupEmptyDir(profileDir)
+		}()
+		if committed {
+			return
+		}
+		var rbErrs []string
+		if err := restoreSnapshots(snaps); err != nil {
+			rbErrs = append(rbErrs, err.Error())
+		}
+		if err := restoreAuthDir(authSnap); err != nil {
+			rbErrs = append(rbErrs, err.Error())
+		}
+		if !profileDirExisted {
+			if err := cleanupEmptyDir(profileDir); err != nil {
+				rbErrs = append(rbErrs, err.Error())
+			}
+		}
+		if len(rbErrs) > 0 {
+			msg := strings.Join(rbErrs, "; ")
+			if retErr != nil {
+				retErr = fmt.Errorf("%w; rollback failed (pin/config state may be inconsistent): %s", retErr, msg)
+			} else {
+				retErr = fmt.Errorf("rollback failed (pin/config state may be inconsistent): %s", msg)
 			}
 		}
 	}()
