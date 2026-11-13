@@ -111,3 +111,9 @@ lore-mono show <模块名> <Commit或Revision> --config client.toml
 - **新增授权**：运行 `lore-mono module list` 即可看到新模块，随后可单独 `lore-mono clone <新模块>` 或重新运行 `lore-mono clone --all-authorized`。
 - **撤销授权**：服务端即时生效；后续执行 `module list`、`stage --all`、`history --all` 等命令会自动排除已撤权模块，本地旧目录不会再被访问或误提交。
 - **修改密码或账号重新启用**：旧登录会话立即失效，需重新运行一次 `lore-mono login`。
+
+## 8. 命令行快速发现与 AI Agent 指引
+
+- 日常命令行参数速查：`lore-mono --help`
+- 面向 AI Agent 的完整能力与约束指引：`lore-mono guide`（机器可读清单：`lore-mono guide --json`）
+
