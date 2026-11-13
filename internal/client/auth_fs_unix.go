@@ -3,6 +3,8 @@
 package client
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -86,9 +88,25 @@ func writeAllFD(fd int, data []byte) error {
 }
 
 func writeFileAtNoFollow(parentFD int, name string, data []byte) error {
-	tmpName := name + ".tmp"
-	_ = syscall.Unlinkat(parentFD, tmpName)
-	fd, err := syscall.Openat(parentFD, tmpName, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+	var (
+		tmpName string
+		fd      int
+		err     error
+	)
+	for attempt := 0; attempt < 8; attempt++ {
+		var rnd [8]byte
+		if _, rErr := rand.Read(rnd[:]); rErr != nil {
+			return rErr
+		}
+		tmpName = ".lore-tmp-" + hex.EncodeToString(rnd[:])
+		fd, err = syscall.Openat(parentFD, tmpName, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EEXIST) {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}

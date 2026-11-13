@@ -3,6 +3,8 @@
 package client
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -161,14 +163,26 @@ func writeAuthFileNoFollow(rootDir, rel string, data []byte) error {
 	if err := verifyRegularFileNoFollow(target); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	tmp := target + ".tmp"
-	if _, err := os.Lstat(tmp); err == nil {
-		if err := verifyRegularFileNoFollow(tmp); err != nil {
+	parentDir := filepath.Dir(target)
+	var (
+		tmp string
+		f   *os.File
+		err error
+	)
+	for attempt := 0; attempt < 8; attempt++ {
+		var rnd [8]byte
+		if _, rErr := rand.Read(rnd[:]); rErr != nil {
+			return rErr
+		}
+		tmp = filepath.Join(parentDir, ".lore-tmp-"+hex.EncodeToString(rnd[:]))
+		f, err = os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
 			return err
 		}
-		_ = os.Remove(tmp)
 	}
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}

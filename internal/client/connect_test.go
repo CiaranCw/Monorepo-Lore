@@ -1812,3 +1812,82 @@ func TestRestoreAuthDirRejectsReplacedRootSymlinkAndProtectsExternalDir(t *testi
 	}
 	_ = os.Remove(authDir2)
 }
+
+func TestRestoreAuthDirPreservesFooAndFooTmp(t *testing.T) {
+	// 1. Direct snapshot/restore with foo and foo.tmp in root and nested subdir.
+	authDir := filepath.Join(t.TempDir(), "auth")
+	subDir := filepath.Join(authDir, "sub")
+	if err := os.MkdirAll(subDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(authDir, "foo"):     "root-foo-original",
+		filepath.Join(authDir, "foo.tmp"): "root-foo-tmp-original",
+		filepath.Join(subDir, "foo"):      "sub-foo-original",
+		filepath.Join(subDir, "foo.tmp"):  "sub-foo-tmp-original",
+	}
+	for p, content := range files {
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	snap, err := snapshotAuthDir(authDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate foo and delete foo.tmp before rollback to ensure both are restored without colliding.
+	if err := os.WriteFile(filepath.Join(authDir, "foo"), []byte("corrupted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(authDir, "foo.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "foo.tmp"), []byte("corrupted-tmp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := restoreAuthDir(snap); err != nil {
+		t.Fatalf("restoreAuthDir failed: %v", err)
+	}
+	for p, want := range files {
+		got, err := os.ReadFile(p)
+		if err != nil || string(got) != want {
+			t.Fatalf("file %s content=%q err=%v want %q", p, string(got), err, want)
+		}
+	}
+	for _, d := range []string{authDir, subDir} {
+		entries, err := os.ReadDir(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".lore-tmp-") {
+				t.Fatalf("leftover temp file in %s: %s", d, e.Name())
+			}
+		}
+	}
+
+	// 2. End-to-end failing Connect where authDir already holds both foo and foo.tmp.
+	setTempUserConfigDir(t)
+	ca := makeTestCA(t, "127.0.0.1", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	srv := startTLSManagerMock(t, ca.tlsCert, ca.caPEM, "", true)
+	cfgPath := filepath.Join(t.TempDir(), "client.toml")
+
+	if _, err := Connect(context.Background(), ConnectOptions{
+		ManagerURL:         srv.URL,
+		Username:           "alice",
+		Password:           []byte("pw"),
+		Project:            "MissingProject",
+		ExplicitConfigPath: cfgPath,
+		ExplicitAuthPath:   authDir,
+	}, testLore(t)); err == nil {
+		t.Fatal("expected Connect failure on MissingProject")
+	}
+	for p, want := range files {
+		got, err := os.ReadFile(p)
+		if err != nil || string(got) != want {
+			t.Fatalf("post-Connect file %s content=%q err=%v want %q", p, string(got), err, want)
+		}
+	}
+}
