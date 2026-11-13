@@ -56,7 +56,8 @@ func TestGuideTextOfflineAndComplete(t *testing.T) {
 		"D. Command Reference",
 		"E. Common Workflows",
 		"F. Operational Constraints",
-		"Login -> Project List -> Select Project -> Module List -> Select Module -> Clone",
+		"Connect/Login -> Project List -> Select Project -> Module List -> Select Module -> Clone",
+		"lore-mono connect --manager",
 		"lore-mono-session.tok",
 		"lore-mono stage --all",
 		"lore-mono commit --all --message",
@@ -121,7 +122,7 @@ func TestGuideJSONValidAndMatchesCLI(t *testing.T) {
 	}
 
 	expectedCommands := []string{
-		"guide", "help", "login", "password", "logout",
+		"guide", "help", "connect", "login", "password", "logout",
 		"project list", "project use", "module list",
 		"clone", "status", "sync", "stage", "commit", "push",
 		"history", "refs", "show", "import", "publish",

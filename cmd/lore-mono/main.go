@@ -40,6 +40,12 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
+	case "connect":
+		if err := connectCmd(args[1:]); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 1
+		}
+		return 0
 	case "login":
 		if err := login(args[1:]); err != nil {
 			fmt.Fprintln(stderr, err.Error())
@@ -79,6 +85,12 @@ func login(args []string) error {
 		}
 		if err == nil {
 			cfg = loaded
+		}
+	} else if flags.managerURL == "" {
+		if activePath, err := client.ActiveConfigPath(); err == nil && activePath != "" {
+			if loaded, loadErr := client.Load(activePath); loadErr == nil {
+				cfg = loaded
+			}
 		}
 	}
 	if flags.managerURL != "" {
@@ -137,6 +149,12 @@ func login(args []string) error {
 		if err := client.Save(cfg); err != nil {
 			return fmt.Errorf("client config")
 		}
+	}
+	if err := client.CheckCA(cfg.CAFile, time.Now()); err != nil {
+		return err
+	}
+	if err := client.ValidateHTTPTrust(cfg); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -228,6 +246,7 @@ First time or AI Agent? Run:
   lore-mono guide --json    Machine-readable capability & command inventory
 
 Discovery & Authentication:
+  lore-mono connect --manager <url> [--username name] [--password-stdin] [--project P] [--ca-file pem] [--json]
   lore-mono login [--config file] [--manager url] [--username name] [--password-stdin]
   lore-mono password [--config file] [--password-stdin]
   lore-mono logout [--config file]
@@ -257,7 +276,7 @@ Admin / Migration (requires project_admin):
   lore-mono publish [--config file]
 
 Typical Workflows:
-  1. Discover & clone one: login -> project list -> project use <P> -> module list -> clone <M>
+  1. Zero-config connect: connect --manager <url> --username <U> --password-stdin -> project list -> module list -> clone <M>
   2. Multi-repo batch edit: stage --all -> commit --all --message "..." -> push --all
 
 Notes: client.toml never stores passwords or tokens; batch commands run once per authorized module.
