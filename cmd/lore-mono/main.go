@@ -34,6 +34,18 @@ func run(args []string) int {
 		return 0
 	}
 	switch args[0] {
+	case "guide":
+		if err := guideCmd(args[1:]); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 1
+		}
+		return 0
+	case "connect":
+		if err := connectCmd(args[1:]); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 1
+		}
+		return 0
 	case "login":
 		if err := login(args[1:]); err != nil {
 			fmt.Fprintln(stderr, err.Error())
@@ -47,7 +59,7 @@ func run(args []string) int {
 			return 1
 		}
 		return 0
-	case "logout", "project", "module", "clone", "status", "sync", "commit", "push", "publish", "history", "refs", "show", "import":
+	case "logout", "project", "module", "clone", "status", "sync", "stage", "commit", "push", "publish", "history", "refs", "show", "import":
 		if err := dispatch(args); err != nil {
 			fmt.Fprintln(stderr, err.Error())
 			return 1
@@ -73,6 +85,12 @@ func login(args []string) error {
 		}
 		if err == nil {
 			cfg = loaded
+		}
+	} else if flags.managerURL == "" {
+		if activePath, err := client.ActiveConfigPath(); err == nil && activePath != "" {
+			if loaded, loadErr := client.Load(activePath); loadErr == nil {
+				cfg = loaded
+			}
 		}
 	}
 	if flags.managerURL != "" {
@@ -131,6 +149,12 @@ func login(args []string) error {
 		if err := client.Save(cfg); err != nil {
 			return fmt.Errorf("client config")
 		}
+	}
+	if err := client.CheckCA(cfg.CAFile, time.Now()); err != nil {
+		return err
+	}
+	if err := client.ValidateHTTPTrust(cfg); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -215,39 +239,45 @@ func wipe(b []byte) {
 	}
 }
 
-const usage = `lore-mono is the user command for the Lore monorepo Manager.
+const usage = `lore-mono is the CLI for Monorepo-Lore (multi-module Lore repositories via Manager).
 
-Usage:
+First time or AI Agent? Run:
+  lore-mono guide           Full onboarding guide (architecture, rules, workflows)
+  lore-mono guide --json    Machine-readable capability & command inventory
+
+Discovery & Authentication:
+  lore-mono connect --manager <url> [--username name] [--password-stdin] [--project P] [--ca-file pem] [--json]
   lore-mono login [--config file] [--manager url] [--username name] [--password-stdin]
   lore-mono password [--config file] [--password-stdin]
   lore-mono logout [--config file]
   lore-mono project list [--config file]
   lore-mono project use <project> [--config file]
   lore-mono module list [--config file]
+
+Workspace & Sync:
   lore-mono clone <module> [--config file] [--dest dir]
   lore-mono clone --all-authorized [--config file] [--root dir]
-  lore-mono status [--config file]
-  lore-mono status --all [--config file] [--root dir]
-  lore-mono status <module> [--config file] [--root dir]
-  lore-mono sync --all [--config file] [--root dir]
-  lore-mono sync <module> [--config file] [--root dir]
-  lore-mono commit --all --message text [--config file] [--root dir]
-  lore-mono commit <module> --message text [--config file] [--root dir]
-  lore-mono push --all [--config file] [--root dir]
-  lore-mono push <module> [--config file] [--root dir]
-  lore-mono history [module|--all] [--project name] [--branch b] [--tag t] [--author a] [--search q] [--limit n] [--cursor c] [--all-pages]
-  lore-mono refs <module> [--type branch|tag] [--config file]
-  lore-mono show <module> <commit-or-revision> [--config file]
+  lore-mono status [--all|<module>] [--config file] [--root dir]
+  lore-mono sync [--all|<module>] [--config file] [--root dir]
+
+Stage, Commit & Push (each module keeps independent revisions):
+  lore-mono stage [--all|<module>] [--config file] [--root dir]
+  lore-mono commit [--all|<module>] --message text [--config file] [--root dir]
+  lore-mono push [--all|<module>] [--config file] [--root dir]
+
+History & Inspection:
+  lore-mono history [module|--all] [--project name] [--branch b] [--tag t] [--limit n] [--all-pages] [--sync] [--json]
+  lore-mono refs <module> [--type branch|tag] [--json] [--config file]
+  lore-mono show <module> <commit-or-revision> [--json] [--config file]
+
+Admin / Migration (requires project_admin):
   lore-mono import --manifest file [--dry-run] [--on-conflict policy] [--config file]
-  lore-mono import --source url --module name [--subdir path] [--mount path] [--token-env VAR] [--ssh-key file] [--dry-run]
+  lore-mono import jobs [--project name] [--job id] [--json] [--config file]
   lore-mono publish [--config file]
-  lore-mono help
 
-login stores the identity token with the native Lore credential command.
-The client config stores the Manager URL and selected project, never a
-password or token. Batch commands ask the Manager for authorized modules,
-then run the native lore CLI once per repository. A module the server
-does not return is omitted. lore itself is unchanged.
+Typical Workflows:
+  1. Zero-config connect: connect --manager <url> --username <U> --password-stdin -> project list -> module list -> clone <M>
+  2. Multi-repo batch edit: stage --all -> commit --all --message "..." -> push --all
 
-Plain HTTP is accepted only for a loopback Manager. Use HTTPS elsewhere.
+Notes: client.toml never stores passwords or tokens; batch commands run once per authorized module.
 `

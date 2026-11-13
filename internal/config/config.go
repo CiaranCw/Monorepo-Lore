@@ -47,6 +47,14 @@ type Config struct {
 	Auth            Auth
 	Publish         Publish
 	Import          Import
+	Client          ClientBootstrap
+}
+
+// ClientBootstrap holds optional public client discovery settings returned by
+// Manager's unauthenticated bootstrap endpoint. It never contains secrets.
+type ClientBootstrap struct {
+	AuthURL string
+	CAFile  string
 }
 
 // Import configures external Git repository batch importing and server-side
@@ -62,11 +70,12 @@ type Import struct {
 // Publish is the server-side snapshot publisher. Empty Workspace leaves it unmounted.
 // The auth path belongs to the publisher service account and is never returned to users.
 type Publish struct {
-	ParentURL string
-	Workspace string
-	AuthStore string
-	AuthPath  string
-	CAFile    string
+	ParentURL   string
+	Workspace   string
+	AuthStore   string
+	AuthPath    string
+	CAFile      string
+	ServiceUser string
 }
 
 // Auth is the Token Service configuration. Paths are files, not key material.
@@ -111,11 +120,12 @@ type fileConfig struct {
 		JWKS        string   `toml:"jwks"`
 	} `toml:"auth"`
 	Publish struct {
-		ParentURL string `toml:"parent_url"`
-		Workspace string `toml:"workspace"`
-		AuthStore string `toml:"auth_store"`
-		AuthPath  string `toml:"auth_path"`
-		CAFile    string `toml:"ca_file"`
+		ParentURL   string `toml:"parent_url"`
+		Workspace   string `toml:"workspace"`
+		AuthStore   string `toml:"auth_store"`
+		AuthPath    string `toml:"auth_path"`
+		CAFile      string `toml:"ca_file"`
+		ServiceUser string `toml:"service_user"`
 	} `toml:"publish"`
 	Import struct {
 		Workspace        string   `toml:"workspace"`
@@ -124,6 +134,10 @@ type fileConfig struct {
 		AllowedLocalDirs []string `toml:"allowed_local_dirs"`
 		AllowedSSHDirs   []string `toml:"allowed_ssh_dirs"`
 	} `toml:"import"`
+	Client struct {
+		AuthURL string `toml:"auth_url"`
+		CAFile  string `toml:"ca_file"`
+	} `toml:"client"`
 }
 
 // Load reads path and validates it. Missing files and malformed TOML are errors.
@@ -162,11 +176,12 @@ func Load(path string) (Config, error) {
 			JWKS:       raw.Auth.JWKS,
 		},
 		Publish: Publish{
-			ParentURL: strings.TrimSpace(raw.Publish.ParentURL),
-			Workspace: strings.TrimSpace(raw.Publish.Workspace),
-			AuthStore: strings.TrimSpace(raw.Publish.AuthStore),
-			AuthPath:  strings.TrimSpace(raw.Publish.AuthPath),
-			CAFile:    strings.TrimSpace(raw.Publish.CAFile),
+			ParentURL:   strings.TrimSpace(raw.Publish.ParentURL),
+			Workspace:   strings.TrimSpace(raw.Publish.Workspace),
+			AuthStore:   strings.TrimSpace(raw.Publish.AuthStore),
+			AuthPath:    strings.TrimSpace(raw.Publish.AuthPath),
+			CAFile:      strings.TrimSpace(raw.Publish.CAFile),
+			ServiceUser: strings.TrimSpace(raw.Publish.ServiceUser),
 		},
 		Import: Import{
 			Workspace:        strings.TrimSpace(raw.Import.Workspace),
@@ -174,6 +189,10 @@ func Load(path string) (Config, error) {
 			RemoteBaseURL:    strings.TrimSpace(raw.Import.RemoteBaseURL),
 			AllowedLocalDirs: append([]string(nil), raw.Import.AllowedLocalDirs...),
 			AllowedSSHDirs:   append([]string(nil), raw.Import.AllowedSSHDirs...),
+		},
+		Client: ClientBootstrap{
+			AuthURL: strings.TrimSpace(raw.Client.AuthURL),
+			CAFile:  strings.TrimSpace(raw.Client.CAFile),
 		},
 	}
 	if cfg.Listen == "" {
@@ -233,6 +252,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Import.Workspace != "" {
 		cfg.Import.Workspace = resolve(base, cfg.Import.Workspace)
+	}
+	if cfg.Client.CAFile != "" {
+		cfg.Client.CAFile = resolve(base, cfg.Client.CAFile)
 	}
 	for i, d := range cfg.Import.AllowedLocalDirs {
 		cfg.Import.AllowedLocalDirs[i] = resolve(base, strings.TrimSpace(d))

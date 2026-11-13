@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -255,7 +256,7 @@ func TestBatchCloneSwitchesToRecordedDefaultBranch(t *testing.T) {
 	defer srv.Close()
 	root := t.TempDir()
 	cfgPath := filepath.Join(root, "client.toml")
-	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: "lore", Project: "Alpha"}); err != nil {
+	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: "lore", Project: "Alpha", AuthPath: filepath.Join(root, "auth"), AuthStore: "fallback"}); err != nil {
 		t.Fatal(err)
 	}
 	var calls []string
@@ -277,4 +278,223 @@ func TestBatchCloneSwitchesToRecordedDefaultBranch(t *testing.T) {
 	if len(calls) != 2 || !strings.HasPrefix(calls[0], "clone ") || !strings.Contains(calls[1], "branch switch") || !strings.Contains(calls[1], "master") {
 		t.Fatalf("clone calls %v", calls)
 	}
+}
+
+func TestBatchStageScansClonedAuthorizedReposOnly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/me/batch" || r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			Action string `json:"action"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Action != "stage" {
+			http.Error(w, "wrong action", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[` +
+			`{"ProjectName":"Alpha","Name":"Engine","MountPath":"Engine","RepositoryURL":"grpc://127.0.0.1:53547/engine"},` +
+			`{"ProjectName":"Alpha","Name":"GameClient","MountPath":"GameClient","RepositoryURL":"grpc://127.0.0.1:53547/gameclient"},` +
+			`{"ProjectName":"Alpha","Name":"NotCloned","MountPath":"NotCloned","RepositoryURL":"grpc://127.0.0.1:53547/notcloned"}` +
+			`]}`))
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	// Create Engine & GameClient cloned workdirs, plus a revoked/unauthorized local dir that must NOT be staged.
+	for _, name := range []string{"Engine", "GameClient", "RevokedOld"} {
+		if err := os.MkdirAll(filepath.Join(root, name, ".lore"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfgPath := filepath.Join(root, "client.toml")
+	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: "lore", Project: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stagedDirs []string
+	var stageArgs []string
+	prevExec := execRun
+	execRun = func(_ context.Context, _ string, req loreexec.Request) (loreexec.CommandResult, error) {
+		if len(req.Argv) > 0 && req.Argv[0] == "auth" {
+			return loreexec.CommandResult{ExitCode: 0, Stdout: "Token: token-value\n"}, nil
+		}
+		stagedDirs = append(stagedDirs, req.Dir)
+		stageArgs = append(stageArgs, strings.Join(req.Argv, " "))
+		if filepath.Base(req.Dir) == "GameClient" {
+			return loreexec.CommandResult{ExitCode: 1}, nil
+		}
+		return loreexec.CommandResult{ExitCode: 0}, nil
+	}
+	defer func() { execRun = prevExec }()
+
+	prevOut := stdout
+	var out bytes.Buffer
+	stdout = &out
+	defer func() { stdout = prevOut }()
+
+	err := batchAction("stage", []string{"--all", "--config", cfgPath, "--root", root})
+	if err == nil {
+		t.Fatal("expected partial failure error when GameClient failed")
+	}
+	if len(stagedDirs) != 2 {
+		t.Fatalf("expected 2 stage invocations (skipping NotCloned & RevokedOld), got %d: %v", len(stagedDirs), stagedDirs)
+	}
+	if stagedDirs[0] != filepath.Join(root, "Engine") || stagedDirs[1] != filepath.Join(root, "GameClient") {
+		t.Fatalf("unexpected staged dirs: %v", stagedDirs)
+	}
+	for _, arg := range stageArgs {
+		if !strings.Contains(arg, "stage --scan --repository ") || strings.Contains(arg, "RevokedOld") || strings.Contains(arg, "NotCloned") {
+			t.Fatalf("unexpected stage args: %s", arg)
+		}
+	}
+	got := out.String()
+	if !strings.Contains(got, "[OK] Engine") || !strings.Contains(got, "[FAIL] GameClient") || !strings.Contains(got, "[SKIP] NotCloned (not cloned)") || !strings.Contains(got, "summary ok=1 skipped=1 failed=1") {
+		t.Fatalf("unexpected stage output:\n%s", got)
+	}
+}
+
+func TestBatchStageRealLoreSemantics(t *testing.T) {
+	loreBin := `C:\Program Files\lore\lore.exe`
+	if _, err := os.Stat(loreBin); err != nil {
+		loreBin = `/data/lore/bin/lore`
+		if _, err := os.Stat(loreBin); err != nil {
+			t.Skip("real lore binary not present")
+		}
+	}
+
+	root := t.TempDir()
+	outsideFile := filepath.Join(root, "outside.txt")
+	if err := os.WriteFile(outsideFile, []byte("outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repoA := filepath.Join(root, "ModA")
+	repoB := filepath.Join(root, "ModB")
+	repoRevoked := filepath.Join(root, "ModRevoked")
+	for _, dir := range []string{repoA, repoB, repoRevoked} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		res, err := loreexec.Executor{Config: loreexec.Config{Binary: loreBin}}.Run(context.Background(), loreexec.Request{
+			Argv: []string{"--non-interactive", "--offline", "repository", "create", "--repository", dir, filepath.Base(dir)},
+			Dir:  dir,
+		})
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("create %s: %v %+v", dir, err, res)
+		}
+	}
+	// Seed initial commits in ModA & ModB including .loreignore & a file to delete.
+	seed := func(dir, file, content string) {
+		_ = os.WriteFile(filepath.Join(dir, ".loreignore"), []byte("*.ignored\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "remove.txt"), []byte("bye\n"), 0o644)
+		ex := loreexec.Executor{Config: loreexec.Config{Binary: loreBin}}
+		if res, err := ex.Run(context.Background(), loreexec.Request{Argv: []string{"--non-interactive", "--offline", "stage", "--scan", "--repository", dir, "."}, Dir: dir}); err != nil || res.ExitCode != 0 {
+			t.Fatalf("seed stage %s: %v %+v", dir, err, res)
+		}
+		if res, err := ex.Run(context.Background(), loreexec.Request{Argv: []string{"--non-interactive", "--offline", "commit", "--repository", dir, "init"}, Dir: dir}); err != nil || res.ExitCode != 0 {
+			t.Fatalf("seed commit %s: %v %+v", dir, err, res)
+		}
+	}
+	seed(repoA, "a.txt", "a1\n")
+	seed(repoB, "b.txt", "b1\n")
+	seed(repoRevoked, "r.txt", "r1\n")
+
+	// Modify a.txt, add new_a.txt, delete remove.txt, write ignored file in ModA.
+	_ = os.WriteFile(filepath.Join(repoA, "a.txt"), []byte("a2\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(repoA, "new_a.txt"), []byte("new\n"), 0o644)
+	_ = os.Remove(filepath.Join(repoA, "remove.txt"))
+	_ = os.WriteFile(filepath.Join(repoA, "skip.ignored"), []byte("ignore\n"), 0o644)
+	// ModB left clean (empty changes). ModRevoked modified locally but omitted by Manager.
+	_ = os.WriteFile(filepath.Join(repoRevoked, "r.txt"), []byte("r2\n"), 0o644)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/auth/lore-token" {
+			_, _ = w.Write([]byte(`{"lore_token":"` + fakeValidJWT() + `","expires_in":43200,"username":"alice"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[` +
+			`{"ProjectName":"Alpha","Name":"ModA","MountPath":"ModA","RepositoryURL":"lore://local/a"},` +
+			`{"ProjectName":"Alpha","Name":"ModB","MountPath":"ModB","RepositoryURL":"lore://local/b"},` +
+			`{"ProjectName":"Alpha","Name":"ModMissing","MountPath":"ModMissing","RepositoryURL":"lore://local/missing"}` +
+			`]}`))
+	}))
+	defer srv.Close()
+
+	cfgPath := filepath.Join(root, "client.toml")
+	if err := client.Save(client.Config{Path: cfgPath, ManagerURL: srv.URL, LoreBinary: loreBin, Project: "Alpha", AuthPath: filepath.Join(root, "auth"), AuthStore: "fallback"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.MkdirAll(filepath.Join(root, "auth"), 0o700)
+	// Ensure stage never refreshes or contacts Lore auth when running offline; auth is stubbed,
+	// and EnsureLoreCredential must see the valid JWT above without calling lore login.
+	if err := client.SaveSession(client.Config{AuthPath: filepath.Join(root, "auth"), ManagerURL: srv.URL}, []byte("session-tok")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !isClonedLoreDir(filepath.Join(root, "ModA")) {
+		t.Fatal("ModA missing .lore")
+	}
+	prevExec := execRun
+	execRun = func(ctx context.Context, binary string, req loreexec.Request) (loreexec.CommandResult, error) {
+		if len(req.Argv) > 0 && req.Argv[0] == "auth" {
+			if len(req.Argv) > 2 && req.Argv[2] == "--with-token" {
+				return loreexec.CommandResult{ExitCode: 0, Stdout: "Token: " + fakeValidJWT() + "\n"}, nil
+			}
+			return loreexec.CommandResult{ExitCode: 0, Stdout: "User: alice (1)\n"}, nil
+		}
+		argv := append([]string{"--non-interactive", "--offline"}, req.Argv...)
+		return loreexec.Executor{Config: loreexec.Config{Binary: binary}}.Run(ctx, loreexec.Request{Argv: argv, Dir: req.Dir, Env: req.Env})
+	}
+	defer func() { execRun = prevExec }()
+
+	prevOut := stdout
+	var out bytes.Buffer
+	stdout = &out
+	defer func() { stdout = prevOut }()
+
+	// Run stage --all twice (idempotent re-stage of already staged changes + clean repo + uncloned skip).
+	for pass := 0; pass < 2; pass++ {
+		out.Reset()
+		if err := batchAction("stage", []string{"--all", "--config", cfgPath, "--root", root}); err != nil {
+			t.Fatalf("pass %d failed: %v\n%s", pass, err, out.String())
+		}
+		got := out.String()
+		if !strings.Contains(got, "[OK] ModA") || !strings.Contains(got, "[OK] ModB") || !strings.Contains(got, "[SKIP] ModMissing (not cloned)") {
+			t.Fatalf("pass %d output:\n%s", pass, got)
+		}
+	}
+
+	// Verify ModA staged state contains a.txt, new_a.txt, remove.txt; excludes skip.ignored, .lore, outside.txt.
+	stA, err := loreexec.Executor{Config: loreexec.Config{Binary: loreBin}}.Run(context.Background(), loreexec.Request{
+		Argv: []string{"--non-interactive", "--offline", "status", "--repository", repoA}, Dir: repoA,
+	})
+	if err != nil || stA.ExitCode != 0 {
+		t.Fatalf("status ModA: %v %+v", err, stA)
+	}
+	for _, want := range []string{"a.txt", "new_a.txt", "remove.txt"} {
+		if !strings.Contains(stA.Stdout, want) {
+			t.Fatalf("ModA missing staged %s:\n%s", want, stA.Stdout)
+		}
+	}
+	for _, forbid := range []string{"skip.ignored", "outside.txt", ".lore/", "r.txt"} {
+		if strings.Contains(stA.Stdout, forbid) {
+			t.Fatalf("ModA staged forbidden %s:\n%s", forbid, stA.Stdout)
+		}
+	}
+	// Verify ModRevoked remained untouched (nothing staged).
+	stRev, err := loreexec.Executor{Config: loreexec.Config{Binary: loreBin}}.Run(context.Background(), loreexec.Request{
+		Argv: []string{"--non-interactive", "--offline", "status", "--repository", repoRevoked}, Dir: repoRevoked,
+	})
+	if err != nil || strings.Contains(stRev.Stdout, "Changes staged") {
+		t.Fatalf("unauthorized ModRevoked was modified:\n%s", stRev.Stdout)
+	}
+}
+
+func fakeValidJWT() string {
+	h := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`))
+	p := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"1","exp":4102444800}`))
+	return h + "." + p + ".sig"
 }

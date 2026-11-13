@@ -25,11 +25,17 @@ Lore CLI   -->  TLS gateway  -->  Lore Server
 
 The gateway forwards HTTP/2. It does not decide repository access. AuthBridge does.
 
+## Quick Entry Points
+
+- **Human developers**: see [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for daily login, clone, sync, batch stage/commit/push, and history inspection.
+- **AI Agents & CLI quick discovery**: run `lore-mono --help` for categorized commands, `lore-mono guide` for the complete Agent onboarding guide, `lore-mono guide --json` for a structured capability inventory, or `lore-mono connect --manager <url>` for zero-config onboarding.
+
 ## Core features
 
 - Username and password login, then a Lore identity token stored by the Lore CLI.
 - Projects, modules, membership, and per-module read or write grants.
-- `lore-mono` commands for login, project selection, module list, clone, status, sync, commit, push, history, refs, show, import, and publish.
+- `lore-mono` commands for login, project selection, module list, clone, status, sync, stage, commit, push, history, refs, show, import, and publish.
+- Persistent login: Manager issues an exp-free session token (revoked immediately via `auth_version` and account status) while `lore-mono` silently refreshes short-lived Lore credentials when expired, avoiding repeated password prompts.
 - Complete per-module commit DAG indexing (all branches, tags, and merge parents without truncation) and permission-filtered monorepo aggregated commit timelines with keyset cursor pagination.
 - Single and batch external Git repository import (GitHub, Gitee, GitLab, Gongfeng, and generic Git) preserving commit DAG topology, branches, tags, original authorship/timestamps, and Git LFS / submodule metadata, with dry-run, checkpoint resume, failure isolation, and post-import digest verification.
 - Batch commands run one Lore process per authorized module and print a per-module result plus a summary.

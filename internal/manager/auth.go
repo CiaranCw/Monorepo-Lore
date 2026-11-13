@@ -25,8 +25,10 @@ type loginRequest struct {
 
 type loginResponse struct {
 	IdentityToken string `json:"identity_token"`
+	LoreToken     string `json:"lore_token,omitempty"`
 	TokenType     string `json:"token_type"`
 	ExpiresIn     int    `json:"expires_in"`
+	LoreExpiresIn int    `json:"lore_expires_in,omitempty"`
 	Username      string `json:"username"`
 }
 
@@ -62,7 +64,13 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
-	token, err := a.Tokens.IssueIdentity(strconv.FormatInt(account.ID, 10), account.Username, account.AuthVersion)
+	sub := strconv.FormatInt(account.ID, 10)
+	persistentToken, err := a.Tokens.IssuePersistentIdentity(sub, account.Username, account.AuthVersion)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "login failed")
+		return
+	}
+	loreToken, err := a.Tokens.IssueIdentity(sub, account.Username, account.AuthVersion)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "login failed")
 		return
@@ -72,10 +80,41 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, loginResponse{
-		IdentityToken: token,
+		IdentityToken: persistentToken,
+		LoreToken:     loreToken,
 		TokenType:     "Bearer",
-		ExpiresIn:     int(a.Config.Auth.IdentityTTL.Seconds()),
+		ExpiresIn:     0,
+		LoreExpiresIn: int(a.Config.Auth.IdentityTTL.Seconds()),
 		Username:      account.Username,
+	})
+}
+
+func (a *App) issueLoreToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	raw := bearerToken(r)
+	session, err := authbridge.AuthenticateIdentity(r.Context(), a.Tokens, authbridge.UserDirectory{Get: a.userByID}, raw)
+	if err != nil {
+		if raw != "" {
+			if _, verifyErr := a.Tokens.VerifyIdentity(raw); verifyErr != nil && strings.Contains(verifyErr.Error(), "expired") {
+				writeError(w, http.StatusUnauthorized, "expired token")
+				return
+			}
+		}
+		writeError(w, http.StatusUnauthorized, "invalid token")
+		return
+	}
+	loreToken, err := a.Tokens.IssueIdentity(strconv.FormatInt(session.User.ID, 10), session.User.Username, session.User.AuthVersion)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "token issue failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"lore_token": loreToken,
+		"expires_in": int(a.Config.Auth.IdentityTTL.Seconds()),
+		"username":   session.User.Username,
 	})
 }
 

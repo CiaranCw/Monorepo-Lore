@@ -641,7 +641,7 @@ func (a *App) batch(w http.ResponseWriter, r *http.Request, actor *user.User) {
 		return
 	}
 	switch body.Action {
-	case "clone", "status", "sync", "commit", "push":
+	case "clone", "status", "sync", "stage", "commit", "push":
 	default:
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return

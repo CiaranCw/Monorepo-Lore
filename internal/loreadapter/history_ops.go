@@ -106,8 +106,11 @@ func (c *Client) runMode(ctx context.Context, dir string, offline, force, jsonOu
 	if c.Exec == nil {
 		return loreexec.CommandResult{}, fmt.Errorf("loreadapter: executor is nil")
 	}
-	argv := make([]string, 0, len(args)+4)
+	argv := make([]string, 0, len(args)+6)
 	argv = append(argv, "--non-interactive")
+	if c.Identity != "" {
+		argv = append(argv, "--identity", c.Identity)
+	}
 	if offline {
 		argv = append(argv, "--offline")
 	}
