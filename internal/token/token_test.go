@@ -108,6 +108,43 @@ func TestIdentityAndAccessClaims(t *testing.T) {
 	}
 }
 
+func TestPersistentIdentityWithoutExp(t *testing.T) {
+	svc := openTest(t)
+	raw, err := svc.IssuePersistentIdentity("42", "alice", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := decodedPayload(t, raw)
+	if _, hasExp := payload["exp"]; hasExp {
+		t.Fatalf("persistent identity token must omit exp: %#v", payload)
+	}
+	claims, err := svc.VerifyIdentity(raw)
+	if err != nil {
+		t.Fatalf("verify persistent token: %v", err)
+	}
+	if claims.Subject != "42" || claims.PreferredUsername != "alice" || claims.AuthVersion != 3 || !claims.Expires.IsZero() {
+		t.Fatalf("claims mismatch: %+v", claims)
+	}
+	// Remains valid far beyond IdentityTTL (e.g. +365 days) because persistence relies on auth_version/status.
+	svc.setClock(func() time.Time { return time.Now().Add(365 * 24 * time.Hour) })
+	if _, err := svc.VerifyIdentity(raw); err != nil {
+		t.Fatalf("persistent token rejected after 365 days: %v", err)
+	}
+	svc.setClock(time.Now)
+
+	// Access tokens must still require exp.
+	noExpAccess := baseClaims("access")
+	delete(noExpAccess, "exp")
+	noExpAccess["resources"] = []Resource{{ResourceID: repo, Permission: []string{"access"}}}
+	badAccess, err := svc.signRaw(jwt.SigningMethodRS256, svc.ActiveKID(), noExpAccess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.VerifyAccess(badAccess); category(err) != "claims" {
+		t.Fatalf("access token without exp must fail: %v", err)
+	}
+}
+
 func TestRejectsBadTokens(t *testing.T) {
 	svc := openTest(t)
 	identity := mustIdentity(t, svc)

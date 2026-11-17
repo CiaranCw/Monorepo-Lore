@@ -1,0 +1,38 @@
+# Example batch Git import manifest.
+# Never place plaintext tokens, passwords, or private keys in this file;
+# unknown keys are rejected by the manifest loader. Reference environment
+# variable names via token_env or key file paths via ssh_key_path.
+
+project = "Alpha"
+conflict_policy = "fail" # "fail", "skip_if_imported", or "resume"
+concurrency = 2
+global_files_policy = "strict"
+
+[[repositories]]
+source_url = "https://github.com/example-org/engine.git"
+module_name = "Engine"
+mount_path = "Engine"
+lfs_mode = "hydrate" # requires all LFS binaries; use "pointer" only for explicitly incomplete pointer-only migration
+submodule_policy = "record_gitlink"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"
+
+[[repositories]]
+source_url = "git@git.woa.com:example-group/game-client.git"
+module_name = "GameClient"
+mount_path = "GameClient"
+
+[repositories.auth]
+auth_method = "ssh_key"
+ssh_key_path = "/path/to/id_ed25519"
+known_hosts = "/path/to/known_hosts"
+
+# Optional: split an external Git Monorepo subdirectory into an independent Lore module:
+# [[repositories]]
+# source_url = "https://github.com/example-org/games-monorepo.git"
+# source_subdir = "Chess"
+# module_name = "Chess"
+# mount_path = "Chess"
+# expected_default_branch = "main"

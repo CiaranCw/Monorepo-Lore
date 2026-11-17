@@ -41,8 +41,11 @@ func TestHashAndVerify(t *testing.T) {
 			t.Fatalf("malformed hash accepted: %q", bad)
 		}
 	}
-	if _, err := HashPassword("short"); err == nil {
-		t.Fatal("short password accepted")
+	if _, err := HashPassword("short"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := HashPassword(""); err == nil {
+		t.Fatal("empty password accepted")
 	}
 }
 

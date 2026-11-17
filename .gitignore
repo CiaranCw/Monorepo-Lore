@@ -7,6 +7,11 @@
 *.sqlite
 *.sqlite3
 *.db
+*-wal
+*-shm
+*-journal
+*.log
+*.log.*
 .env
 .env.*
 credentials/
@@ -15,6 +20,9 @@ certs/private/
 logs/
 data/
 store/
+backups/
+restore-drill/
+migration-evidence/private/
 
 # Build output
 bin/

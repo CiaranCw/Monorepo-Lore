@@ -11,7 +11,7 @@ import (
 var (
 	hash32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	hash64 = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	nameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,62}$`)
+	nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 )
 
 func validateHash(v string, n int) error {
@@ -59,6 +59,21 @@ func validateRevisionSpec(v string) error {
 func validateName(name string) error {
 	if !nameRe.MatchString(name) {
 		return fmt.Errorf("%w: name %q", ErrInvalid, name)
+	}
+	return nil
+}
+
+// validateBranchName accepts standard Git/Lore branch names including slash
+// hierarchies such as feature/login or release/v1.0, while rejecting flags,
+// path traversal, empty segments, and whitespace/control characters.
+func validateBranchName(name string) error {
+	if name == "" || len(name) > 255 || strings.HasPrefix(name, "-") || strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || strings.Contains(name, "..") || strings.Contains(name, "//") {
+		return fmt.Errorf("%w: branch name %q", ErrInvalid, name)
+	}
+	for _, r := range name {
+		if r <= 0x20 || r == 0x7f || r == '\\' || r == '~' || r == '^' || r == ':' || r == '?' || r == '*' || r == '[' {
+			return fmt.Errorf("%w: branch name %q", ErrInvalid, name)
+		}
 	}
 	return nil
 }

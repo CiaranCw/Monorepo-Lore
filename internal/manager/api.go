@@ -114,6 +114,14 @@ func (a *App) projects(w http.ResponseWriter, r *http.Request, actor *user.User,
 			a.projectStatus(w, r, actor, p)
 			return
 		}
+	case "history":
+		if len(rest) == 2 {
+			a.projectHistory(w, r, actor, p)
+			return
+		}
+	case "imports":
+		a.projectImports(w, r, actor, p, rest[2:])
+		return
 	}
 	writeError(w, http.StatusNotFound, "not found")
 }
@@ -161,6 +169,22 @@ func (a *App) modules(w http.ResponseWriter, r *http.Request, actor *user.User, 
 		a.modulePermissions(w, r, actor, m, rest[2:])
 		return
 	}
+	if len(rest) >= 2 && rest[1] == "history" {
+		a.moduleHistoryRoutes(w, r, actor, m, rest[2:])
+		return
+	}
+	if len(rest) >= 2 && rest[1] == "commits" {
+		a.moduleCommitDetail(w, r, actor, m, rest[2:])
+		return
+	}
+	if len(rest) >= 2 && rest[1] == "refs" {
+		a.moduleRefsRoute(w, r, actor, m, rest[2:])
+		return
+	}
+	if len(rest) >= 2 && rest[1] == "aliases" {
+		a.moduleAliasesRoute(w, r, actor, m, rest[2:])
+		return
+	}
 	writeError(w, http.StatusNotFound, "not found")
 }
 
@@ -178,6 +202,43 @@ func (a *App) users(w http.ResponseWriter, r *http.Request, actor *user.User, re
 	}
 	if err := a.perms().CanManageProject(r.Context(), actor.ID, body.ProjectID); err != nil {
 		writeAPIError(w, err)
+		return
+	}
+	target, _, err := user.Get(r.Context(), a.DB, rest[0])
+	if err != nil || target.Kind == "service" {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	var memberInProject int
+	if err := a.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM project_members WHERE project_id=? AND user_id=?`, body.ProjectID, target.ID).Scan(&memberInProject); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if memberInProject == 0 {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	// Account status is global. A project administrator must not be able to
+	// disable a user who also belongs to a project that the actor does not
+	// administer, because that would cross a project isolation boundary.
+	var unmanagedMemberships int
+	if err := a.DB.QueryRowContext(r.Context(), `
+		SELECT COUNT(*)
+		FROM project_members target_membership
+		WHERE target_membership.user_id=?
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM project_members actor_membership
+			WHERE actor_membership.project_id=target_membership.project_id
+			  AND actor_membership.user_id=?
+			  AND actor_membership.role='project_admin'
+		  )
+	`, target.ID, actor.ID).Scan(&unmanagedMemberships); err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if unmanagedMemberships > 0 {
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
 	if err := user.SetStatus(r.Context(), a.DB, actor.Username, rest[0], body.Status); err != nil {
@@ -232,7 +293,7 @@ func (a *App) meModules(w http.ResponseWriter, r *http.Request, actor *user.User
 			if projectName != "" && m.ProjectName != projectName {
 				continue
 			}
-			if q != "" && m.Name != q && m.MountPath != q {
+			if q != "" && m.Name != q && m.MountPath != q && m.RepositoryID != q && m.RepositoryURL != q {
 				continue
 			}
 			found = append(found, m)
@@ -487,9 +548,7 @@ func (a *App) publishProject(w http.ResponseWriter, r *http.Request, actor *user
 		return
 	}
 	var body struct {
-		ParentDir  string            `json:"parent_dir"`
-		ModuleDirs map[string]string `json:"module_dirs"`
-		Message    string            `json:"message"`
+		Message string `json:"message"`
 	}
 	if !decode(w, r, &body) {
 		return
@@ -498,16 +557,22 @@ func (a *App) publishProject(w http.ResponseWriter, r *http.Request, actor *user
 		writeError(w, http.StatusServiceUnavailable, "publisher unavailable")
 		return
 	}
-	parentDir, moduleDirs := body.ParentDir, body.ModuleDirs
-	if parentDir == "" {
-		var err error
-		parentDir, moduleDirs, err = a.prepareSnapshot(r.Context(), p)
-		if err != nil {
-			writeAPIError(w, err)
-			return
-		}
+	preparer := a.prepareSnapshot
+	if a.snapshotPreparer != nil {
+		preparer = a.snapshotPreparer
 	}
-	result, err := (publish.Publisher{DB: a.DB, Driver: a.PublishDriver}).Publish(r.Context(), publish.Request{
+	parentDir, moduleDirs, err := preparer(r.Context(), p)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	requestDriver := a.PublishDriver
+	if shared, ok := a.PublishDriver.(*publish.LoreDriver); ok {
+		scoped := *shared
+		scoped.ParentURL = p.ParentRepositoryURL
+		requestDriver = &scoped
+	}
+	result, err := (publish.Publisher{DB: a.DB, Driver: requestDriver}).Publish(r.Context(), publish.Request{
 		ProjectID: p.ID, ParentDir: parentDir, ModuleDirs: moduleDirs, Actor: actor.Username, Message: body.Message,
 	})
 	if err != nil {
@@ -558,7 +623,7 @@ func (a *App) visibleNamed(r *http.Request, userID int64, projectName string, na
 		if projectName != "" && m.ProjectName != projectName {
 			continue
 		}
-		if len(want) > 0 && !want[m.Name] {
+		if len(want) > 0 && !want[m.Name] && !want[m.MountPath] {
 			continue
 		}
 		out = append(out, m)
@@ -576,7 +641,7 @@ func (a *App) batch(w http.ResponseWriter, r *http.Request, actor *user.User) {
 		return
 	}
 	switch body.Action {
-	case "clone", "status", "sync", "commit", "push":
+	case "clone", "status", "sync", "stage", "commit", "push":
 	default:
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return

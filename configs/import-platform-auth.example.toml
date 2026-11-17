@@ -1,0 +1,51 @@
+# Parseable authentication examples for supported external Git platforms.
+# Token values are read by lore-mono from the named client environment variables
+# and transmitted in-memory. SSH key paths must be inside Manager [import].allowed_ssh_dirs.
+
+project = "ExamplePlatformImports"
+conflict_policy = "fail"
+concurrency = 2
+global_files_policy = "strict"
+
+[[repositories]]
+source_url = "https://github.com/example-org/github-module.git"
+module_name = "GitHubModule"
+mount_path = "GitHubModule"
+lfs_mode = "hydrate"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"
+
+[[repositories]]
+source_url = "https://gitee.com/example-org/gitee-module.git"
+module_name = "GiteeModule"
+mount_path = "GiteeModule"
+lfs_mode = "hydrate"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITEE_IMPORT_TOKEN"
+token_username = "oauth2"
+
+[[repositories]]
+source_url = "https://gitlab.com/example-org/gitlab-module.git"
+module_name = "GitLabModule"
+mount_path = "GitLabModule"
+lfs_mode = "hydrate"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITLAB_IMPORT_TOKEN"
+token_username = "oauth2"
+
+[[repositories]]
+source_url = "git@git.woa.com:example-group/gongfeng-module.git"
+module_name = "GongfengModule"
+mount_path = "GongfengModule"
+lfs_mode = "hydrate"
+
+[repositories.auth]
+auth_method = "ssh_key"
+ssh_key_path = "/etc/lore-monorepo/ssh/import_ed25519"
+known_hosts = "/etc/lore-monorepo/ssh/known_hosts"

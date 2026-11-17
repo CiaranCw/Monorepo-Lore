@@ -1,0 +1,2 @@
+inventory_id,external_platform,repository_name,repository_url,default_branch,branch_count,tag_count,commit_count,repository_size_bytes,uses_lfs,lfs_object_count,lfs_total_bytes,uses_submodules,submodule_count,contains_symlinks,is_monorepo,is_shallow,unmapped_root_files_status,target_project,target_module,target_mount_path,required_users,migration_status,source_ref_snapshot_id,owner,notes
+REPO-001,,,,,,,,,UNKNOWN,,,UNKNOWN,,UNKNOWN,UNKNOWN,UNKNOWN,NOT_REVIEWED,,,,,INVENTORY_PENDING,,,,

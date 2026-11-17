@@ -18,6 +18,7 @@ func TestProjectAndRepositoryIsolation(t *testing.T) {
 	alice := makeAcct(t, app, "alice")
 	bob := makeAcct(t, app, "bob")
 	dave := makeAcct(t, app, "dave")
+	erin := makeAcct(t, app, "erin")
 	svc, err := user.Create(ctx, app.DB, "test", "publisher", "correct-horse", "service")
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +31,7 @@ func TestProjectAndRepositoryIsolation(t *testing.T) {
 		}
 		return raw
 	}
-	carolTok, aliceTok, bobTok, daveTok := tok(carol, "carol"), tok(alice, "alice"), tok(bob, "bob"), tok(dave, "dave")
+	carolTok, aliceTok, bobTok, daveTok, erinTok := tok(carol, "carol"), tok(alice, "alice"), tok(bob, "bob"), tok(dave, "dave"), tok(erin, "erin")
 	svcTok := tok(svc, "publisher")
 
 	status, alphaBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects", carolTok, map[string]string{
@@ -47,6 +48,17 @@ func TestProjectAndRepositoryIsolation(t *testing.T) {
 		t.Fatalf("beta %d", status)
 	}
 	beta := int64(betaBody["ID"].(float64))
+	status, gammaBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects", erinTok, map[string]string{
+		"name": "Gamma", "parent_repository_id": "55555555555555555555555555555555", "parent_repository_url": "grpc://127.0.0.1:53547/gamma",
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("gamma %d", status)
+	}
+	gamma := int64(gammaBody["ID"].(float64))
+	status, _ = apiJSON(t, http.MethodPost, srv+"/api/v1/projects/"+itoa(gamma)+"/members", erinTok, map[string]any{"username": "bob", "role": "project_member"})
+	if status != http.StatusCreated {
+		t.Fatalf("gamma member bob %d", status)
+	}
 
 	addMod := func(project int64, name, repo, mount string) int64 {
 		t.Helper()
@@ -85,6 +97,21 @@ func TestProjectAndRepositoryIsolation(t *testing.T) {
 	grant(alphaClient, "alice", "write")
 	grant(alphaDocs, "bob", "read")
 	grant(betaEngine, "bob", "write")
+
+	// User status is global: Carol must not be able to disable Bob through
+	// Alpha while Bob also belongs to Gamma, which Carol does not administer.
+	status, crossProjectStatus := apiJSON(t, http.MethodPost, srv+"/api/v1/users/bob/status", carolTok, map[string]any{
+		"status": "disabled", "project_id": alpha,
+	})
+	if status != http.StatusNotFound || crossProjectStatus["error"] != "not found" {
+		t.Fatalf("cross-project global status change leaked/changed Bob: %d %v", status, crossProjectStatus)
+	}
+	status, unknownStatus := apiJSON(t, http.MethodPost, srv+"/api/v1/users/not-a-user/status", carolTok, map[string]any{
+		"status": "disabled", "project_id": alpha,
+	})
+	if status != http.StatusNotFound || unknownStatus["error"] != crossProjectStatus["error"] {
+		t.Fatalf("unknown and cross-project status target differ: %d %v vs %v", status, unknownStatus, crossProjectStatus)
+	}
 
 	names := func(token string) string {
 		t.Helper()

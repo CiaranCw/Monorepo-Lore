@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -29,7 +30,8 @@ func TestHelperProcess(t *testing.T) {
 		if os.Getenv("LORE_MONO_FAIL_LOGIN") == "1" || !isLoreIdentityLogin(args) {
 			os.Exit(9)
 		}
-		sub := jwtSubject(flagValue(args, "--token"))
+		tok := flagValue(args, "--token")
+		sub := jwtSubject(tok)
 		if sub == "" {
 			os.Exit(9)
 		}
@@ -40,8 +42,18 @@ func TestHelperProcess(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "identity"), []byte(sub), 0o600); err != nil {
 			os.Exit(9)
 		}
+		if _, statErr := os.Stat(filepath.Join(dir, "token_value")); statErr == nil {
+			_ = os.WriteFile(filepath.Join(dir, "token_value"), []byte(tok), 0o600)
+		}
 	case "auth":
-		body, err := os.ReadFile(filepath.Join(os.Getenv("LORE_AUTH_PATH"), "identity"))
+		dir := os.Getenv("LORE_AUTH_PATH")
+		if len(args) > 1 && hasArg(args, "--with-token") {
+			if tokBytes, rErr := os.ReadFile(filepath.Join(dir, "token_value")); rErr == nil {
+				os.Stdout.WriteString("Token: " + string(tokBytes) + "\n")
+				os.Exit(0)
+			}
+		}
+		body, err := os.ReadFile(filepath.Join(dir, "identity"))
 		if err != nil {
 			os.Exit(9)
 		}
@@ -165,6 +177,15 @@ func isLoreIdentityLogin(args []string) bool {
 	return len(args) > 0 && args[0] == "login" && flagValue(args, "--token-type") == "lore" && flagValue(args, "--token") != ""
 }
 
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
 func flagValue(args []string, name string) string {
 	for i, arg := range args {
 		if arg == name && i+1 < len(args) {
@@ -216,8 +237,83 @@ func serveLogin(t *testing.T, handle func(user, password string) (int, string)) 
 	return srv.URL
 }
 
+func TestSilentLoreCredentialRefreshFromPersistentSession(t *testing.T) {
+	dir := t.TempDir()
+	authDir := filepath.Join(dir, "auth")
+	_ = os.MkdirAll(authDir, 0o700)
+	persistentTok := fakeIdentity("7")
+	// Expired exp-bearing token simulates 12h+ elapsed in Lore credential store.
+	expiredLore := fakeJWTWithExp("7", time.Now().Add(-time.Hour).Unix())
+	freshLore := fakeJWTWithExp("7", time.Now().Add(12*time.Hour).Unix())
+	_ = os.WriteFile(filepath.Join(authDir, "token_value"), []byte(expiredLore), 0o600)
+
+	refreshCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/lore-token":
+			refreshCalls++
+			if r.Header.Get("Authorization") != "Bearer "+persistentTok {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			_, _ = io.WriteString(w, `{"lore_token":"`+freshLore+`","expires_in":43200,"username":"alice"}`)
+		case "/api/v1/me/modules":
+			_, _ = io.WriteString(w, `{"modules":[{"RepositoryURL":"grpc://127.0.0.1:53547/engine"}]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := Config{ManagerURL: srv.URL, AuthStore: "fallback", AuthPath: authDir, LoreBinary: "lore"}
+	if err := SaveSession(cfg, []byte(persistentTok)); err != nil {
+		t.Fatal(err)
+	}
+	ex := loreexec.Executor{Config: loreexec.Config{
+		Binary:      os.Args[0],
+		LeadingArgs: []string{"-test.run=^TestHelperProcess$", "--"},
+		Env:         map[string]string{"LORE_MONO_HELPER": "1"},
+		Timeout:     5 * time.Second,
+	}}
+	if err := os.WriteFile(filepath.Join(authDir, "token_value"), []byte(expiredLore), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureLoreCredential(context.Background(), cfg, ex); err != nil {
+		t.Fatalf("EnsureLoreCredential with expired lore token: %v", err)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected 1 silent refresh call when expired, got %d", refreshCalls)
+	}
+	// When stored Lore token is still valid, no extra refresh HTTP request is made.
+	if err := os.WriteFile(filepath.Join(authDir, "token_value"), []byte(freshLore), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureLoreCredential(context.Background(), cfg, ex); err != nil {
+		t.Fatalf("EnsureLoreCredential with fresh lore token: %v", err)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected no refresh when lore token still valid, got %d", refreshCalls)
+	}
+	_ = os.Remove(filepath.Join(authDir, "token_value"))
+	if err := os.Remove(filepath.Join(authDir, "identity")); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureLoreCredential(context.Background(), cfg, ex); err != nil {
+		t.Fatalf("EnsureLoreCredential when lore token missing: %v", err)
+	}
+	if refreshCalls != 2 {
+		t.Fatalf("expected second refresh when lore token missing, got %d", refreshCalls)
+	}
+}
+
 func fakeIdentity(sub string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`))
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"` + sub + `"}`))
+	return header + "." + payload + ".sig"
+}
+
+func fakeJWTWithExp(sub string, exp int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":%q,"exp":%d}`, sub, exp)))
 	return header + "." + payload + ".sig"
 }

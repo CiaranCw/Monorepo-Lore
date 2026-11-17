@@ -39,8 +39,11 @@ type Module struct {
 	Name          string
 	RepositoryID  string
 	RepositoryURL string
-	MountPath     string
-	Permission    string
+	MountPath       string
+	Permission      string
+	// DefaultBranch is the module's recorded default branch. Empty means the
+	// client should keep whatever branch Lore checked out.
+	DefaultBranch string
 	// LoreEnforcement is always "access". Lore does not enforce read versus write.
 	LoreEnforcement string
 }
@@ -126,7 +129,10 @@ func (s Service) ListAccessibleModules(ctx context.Context, userID int64) ([]Mod
 		return nil, err
 	}
 	rows, err := s.DB.QueryContext(ctx, `SELECT pr.project_id, pr.name, m.module_id, m.name, m.repository_id,
-		m.repository_url, m.mount_path, mp.permission
+		m.repository_url, m.mount_path, mp.permission,
+		COALESCE((SELECT r.ref_name FROM module_refs r
+			WHERE r.module_id=m.module_id AND r.ref_type='branch' AND r.is_default=1
+			ORDER BY r.ref_name LIMIT 1), '')
 		FROM module_permissions mp
 		JOIN modules m ON m.module_id=mp.module_id
 		JOIN projects pr ON pr.project_id=m.project_id
@@ -139,7 +145,7 @@ func (s Service) ListAccessibleModules(ctx context.Context, userID int64) ([]Mod
 	var out []Module
 	for rows.Next() {
 		var m Module
-		if err := rows.Scan(&m.ProjectID, &m.ProjectName, &m.ModuleID, &m.Name, &m.RepositoryID, &m.RepositoryURL, &m.MountPath, &m.Permission); err != nil {
+		if err := rows.Scan(&m.ProjectID, &m.ProjectName, &m.ModuleID, &m.Name, &m.RepositoryID, &m.RepositoryURL, &m.MountPath, &m.Permission, &m.DefaultBranch); err != nil {
 			return nil, err
 		}
 		m.LoreEnforcement = "access"

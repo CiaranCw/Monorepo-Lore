@@ -17,9 +17,11 @@ import (
 	"lore-monorepo/internal/authbridge"
 	"lore-monorepo/internal/config"
 	"lore-monorepo/internal/database"
+	"lore-monorepo/internal/gitimport"
 	"lore-monorepo/internal/logging"
 	"lore-monorepo/internal/loreadapter"
 	"lore-monorepo/internal/loreexec"
+	"lore-monorepo/internal/project"
 	"lore-monorepo/internal/publish"
 	"lore-monorepo/internal/token"
 
@@ -54,8 +56,13 @@ type App struct {
 	PublishDriver publish.Driver
 	PublishLore   *loreadapter.Client
 	PublishRoot   string
+	Importer      *gitimport.Importer
 	HTTP          *http.Server
 	grpcSrv       *grpc.Server
+
+	// snapshotPreparer is test-only dependency injection. Production always
+	// prepares server-owned parent/module workspaces through prepareSnapshot.
+	snapshotPreparer func(context.Context, *project.Project) (string, map[string]string, error)
 
 	// Gate, if set, runs at the start of every HTTP request. Tests use it
 	// to hold a request across shutdown. Production leaves it nil.
@@ -110,6 +117,19 @@ func New(cfg config.Config, log *logging.Logger) (*App, error) {
 		Timeout: cfg.CommandTimeout,
 		Env:     envOrNil,
 	}}
+	if err := gitimport.RecoverInterruptedJobs(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover import jobs: %w", err)
+	}
+	loreClient := &loreadapter.Client{Exec: exec, Env: envOrNil}
+	importWorkspace := cfg.Import.Workspace
+	if importWorkspace == "" {
+		importWorkspace = filepath.Join(filepath.Dir(cfg.DatabasePath), "imports")
+	}
+	gitBin := cfg.Import.GitBinary
+	if gitBin == "" {
+		gitBin = "git"
+	}
 	app := &App{
 		Config:   cfg,
 		Log:      log,
@@ -117,8 +137,19 @@ func New(cfg config.Config, log *logging.Logger) (*App, error) {
 		Users:    &UserStore{DB: db},
 		Projects: &ProjectStore{DB: db},
 		Exec:     exec,
-		Lore:     &loreadapter.Client{Exec: exec},
+		Lore:     loreClient,
 		Tokens:   tokens,
+		Importer: &gitimport.Importer{
+			DB:                   db,
+			Lore:                 loreClient,
+			GitBinary:            gitBin,
+			WorkspaceRoot:        importWorkspace,
+			RemoteBaseURL:        cfg.Import.RemoteBaseURL,
+			RestrictLocalSources: true,
+			AllowedLocalDirs:     append([]string(nil), cfg.Import.AllowedLocalDirs...),
+			RestrictSSHKeyPaths:  true,
+			AllowedSSHKeyDirs:    append([]string(nil), cfg.Import.AllowedSSHDirs...),
+		},
 	}
 	app.Bridge = authbridge.New(
 		authbridge.UserDirectory{Get: app.userByID},

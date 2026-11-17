@@ -3,8 +3,14 @@ package manager
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -13,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"lore-monorepo/internal/client"
 	"lore-monorepo/internal/config"
 	"lore-monorepo/internal/logging"
 )
@@ -232,6 +239,61 @@ func TestTokenServiceLoadsWithoutAffectingHealth(t *testing.T) {
 	if body["status"] != "live" {
 		t.Fatalf("%v", body)
 	}
+}
+
+func TestClientInfoEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.pem")
+	// Write a certificate PEM alongside an unrelated private key block to verify private keys are never leaked.
+	if err := os.WriteFile(caPath, []byte("-----BEGIN PRIVATE KEY-----\nSECRET\n-----END PRIVATE KEY-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := testApp(t, fakeLore(t))
+	app.Config.Client.AuthURL = "https://auth.example.internal:57049"
+	app.Config.Import.RemoteBaseURL = "grpcs://gw.example.internal:57047"
+	app.Config.Client.CAFile = caPath
+	srv := httptestServer(t, app)
+
+	// Private-key-only file yields empty ca_pem/ca_sha256.
+	info := getJSON(t, srv+"/api/v1/client/info")
+	if info["auth_url"] != "https://auth.example.internal:57049" || info["remote_base_url"] != "grpcs://gw.example.internal:57047" {
+		t.Fatalf("unexpected client info: %v", info)
+	}
+	if info["ca_pem"] != "" || info["ca_sha256"] != "" {
+		t.Fatalf("non-cert block leaked: %v", info)
+	}
+
+	// Two-cert bundle produces the exact same canonical set digest as client.ParseCAPEMBundle.
+	bundlePEM := append(testCertPEM(t, "RootA"), testCertPEM(t, "RootB")...)
+	if err := os.WriteFile(caPath, bundlePEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantPEM, wantSHA, err := client.ParseCAPEMBundle(bundlePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info2 := getJSON(t, srv+"/api/v1/client/info")
+	if info2["ca_pem"] != wantPEM || info2["ca_sha256"] != wantSHA {
+		t.Fatalf("manager ca_sha256 mismatch: got (%v, %v) want (%v, %v)", info2["ca_sha256"], info2["ca_pem"], wantSHA, wantPEM)
+	}
+}
+
+func testCertPEM(t *testing.T, cn string) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: cn},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 func httptestServer(t *testing.T, app *App) string {

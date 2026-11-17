@@ -29,12 +29,27 @@ func TestLoginAndMe(t *testing.T) {
 	password := "correct-horse"
 
 	ok := postLogin(t, srv, "alice", password)
-	if ok.Username != "alice" || ok.TokenType != "Bearer" || ok.ExpiresIn != int(app.Config.Auth.IdentityTTL.Seconds()) || ok.IdentityToken == "" {
-		t.Fatalf("login response missing identity fields")
+	if ok.Username != "alice" || ok.TokenType != "Bearer" || ok.ExpiresIn != 0 || ok.IdentityToken == "" || ok.LoreToken == "" || ok.LoreExpiresIn != int(app.Config.Auth.IdentityTTL.Seconds()) {
+		t.Fatalf("login response missing identity/lore fields: %+v", ok)
 	}
 	if strings.Contains(ok.IdentityToken, "resources") {
 		t.Fatal("identity token contains resources")
 	}
+	// Persistent identity token must remain valid after IdentityTTL, while old exp-bearing Lore token expires.
+	issued := time.Now()
+	app.Tokens.SetClock(func() time.Time { return issued.Add(30 * 24 * time.Hour) })
+	if getMeStatus(t, srv, ok.IdentityToken) != http.StatusOK {
+		t.Fatal("persistent identity token rejected after 30 days")
+	}
+	if getMeStatus(t, srv, ok.LoreToken) != http.StatusUnauthorized {
+		t.Fatal("expired lore token was accepted")
+	}
+	// Dynamic refresh of Lore token succeeds using persistent identity token.
+	refreshedStatus, refreshedBody := apiJSON(t, http.MethodPost, srv+"/api/v1/auth/lore-token", ok.IdentityToken, nil)
+	if refreshedStatus != http.StatusOK || refreshedBody["lore_token"] == "" {
+		t.Fatalf("lore-token refresh failed: %d %v", refreshedStatus, refreshedBody)
+	}
+	app.Tokens.SetClock(time.Now)
 	me := getMe(t, srv, ok.IdentityToken, http.StatusOK)
 	if me["username"] != "alice" || me["auth_version"].(float64) != 1 {
 		t.Fatalf("me %#v", me)
@@ -89,11 +104,15 @@ func TestLoginAndMe(t *testing.T) {
 		t.Fatal("login after re-enable failed")
 	}
 
-	issued := time.Now()
+	issued = time.Now()
 	app.Tokens.SetClock(func() time.Time { return issued.Add(13 * time.Hour) })
-	if getMeStatus(t, srv, fresh.IdentityToken) != http.StatusUnauthorized {
-		t.Fatal("expired token accepted")
+	if getMeStatus(t, srv, fresh.IdentityToken) != http.StatusOK {
+		t.Fatal("persistent identity token rejected after 13 hours")
 	}
+	if getMeStatus(t, srv, fresh.LoreToken) != http.StatusUnauthorized {
+		t.Fatal("expired lore token accepted")
+	}
+	app.Tokens.SetClock(time.Now)
 	if getMeStatus(t, srv, "not-a-token") != http.StatusUnauthorized {
 		t.Fatal("invalid token accepted")
 	}
@@ -112,8 +131,10 @@ func TestLoginAndMe(t *testing.T) {
 
 type loginJSON struct {
 	IdentityToken string `json:"identity_token"`
+	LoreToken     string `json:"lore_token"`
 	TokenType     string `json:"token_type"`
 	ExpiresIn     int    `json:"expires_in"`
+	LoreExpiresIn int    `json:"lore_expires_in"`
 	Username      string `json:"username"`
 	Error         string `json:"error"`
 }

@@ -93,6 +93,10 @@ func TestLoginCommandStoresCredential(t *testing.T) {
 	if err != nil || string(stored) != "7" {
 		t.Fatalf("credential store %q %v", stored, err)
 	}
+	sess, err := os.ReadFile(filepath.Join(authPath, "lore-mono-session.tok"))
+	if err != nil || string(sess) != token {
+		t.Fatalf("session store %q %v", sess, err)
+	}
 }
 
 func TestHiddenPasswordReaderIsUsed(t *testing.T) {

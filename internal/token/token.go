@@ -83,6 +83,7 @@ type AccessClaims struct {
 // that server.
 type Issuer interface {
 	IssueIdentity(subject, username string, authVersion int64) (string, error)
+	IssuePersistentIdentity(subject, username string, authVersion int64) (string, error)
 	IssueAccess(subject string, authVersion int64, resources []Resource) (string, error)
 	VerifyIdentity(raw string) (IdentityClaims, error)
 	VerifyAccess(raw string) (AccessClaims, error)
@@ -165,8 +166,18 @@ func (s *Service) Retire(kid string) error {
 	return s.retire(kid)
 }
 
-// IssueIdentity signs an identity token. It has no resources claim.
+// IssueIdentity signs an identity token with IdentityTTL for Lore CLI. It has no resources claim.
 func (s *Service) IssueIdentity(subject, username string, authVersion int64) (string, error) {
+	return s.issueIdentity(subject, username, authVersion, true)
+}
+
+// IssuePersistentIdentity signs an identity token without an exp claim for persistent CLI sessions.
+// Revocation still applies immediately through auth_version, user status, and signing key retirement.
+func (s *Service) IssuePersistentIdentity(subject, username string, authVersion int64) (string, error) {
+	return s.issueIdentity(subject, username, authVersion, false)
+}
+
+func (s *Service) issueIdentity(subject, username string, authVersion int64, withExp bool) (string, error) {
 	if !subjectPattern.MatchString(subject) || !namePattern.MatchString(username) || authVersion < 1 {
 		return "", claimErr("claims")
 	}
@@ -178,10 +189,12 @@ func (s *Service) IssueIdentity(subject, username string, authVersion int64) (st
 		"sub":                subject,
 		"aud":                append([]string(nil), s.opt.Audience...),
 		"iat":                now.Unix(),
-		"exp":                now.Add(s.opt.IdentityTTL).Unix(),
 		"preferred_username": username,
 		"auth_version":       authVersion,
 		"token_use":          useIdentity,
+	}
+	if withExp {
+		claims["exp"] = now.Add(s.opt.IdentityTTL).Unix()
 	}
 	return s.signLocked(claims)
 }
@@ -260,11 +273,15 @@ func (s *Service) VerifyIdentity(raw string) (IdentityClaims, error) {
 	if err != nil {
 		return IdentityClaims{}, err
 	}
+	var exp time.Time
+	if rawExp, ok := payload["exp"]; ok {
+		exp = expTime(rawExp)
+	}
 	return IdentityClaims{
 		Subject:           payload["sub"].(string),
 		PreferredUsername: name,
 		AuthVersion:       version,
-		Expires:           expTime(payload["exp"]),
+		Expires:           exp,
 		KID:               kid,
 	}, nil
 }
@@ -350,16 +367,25 @@ func (s *Service) verifyCommon(raw string, wantUse string) (map[string]any, stri
 	if err != nil {
 		return nil, "", claimErr("claims")
 	}
-	expires, err := integerClaim(payload["exp"])
-	if err != nil {
-		return nil, "", claimErr("claims")
-	}
 	current := now().UTC()
-	if issued > expires || issued > current.Add(time.Minute).Unix() {
+	if issued > current.Add(time.Minute).Unix() {
 		return nil, "", claimErr("claims")
 	}
-	if !current.Before(time.Unix(expires, 0)) {
-		return nil, "", claimErr("expired")
+	rawExp, hasExp := payload["exp"]
+	if wantUse == useAccess && !hasExp {
+		return nil, "", claimErr("claims")
+	}
+	if hasExp {
+		expires, err := integerClaim(rawExp)
+		if err != nil {
+			return nil, "", claimErr("claims")
+		}
+		if issued > expires {
+			return nil, "", claimErr("claims")
+		}
+		if !current.Before(time.Unix(expires, 0)) {
+			return nil, "", claimErr("expired")
+		}
 	}
 	use, _ := payload["token_use"].(string)
 	if use != wantUse {

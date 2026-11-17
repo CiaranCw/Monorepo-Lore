@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"testing"
 
+	"lore-monorepo/internal/project"
 	"lore-monorepo/internal/user"
 )
 
@@ -103,6 +104,11 @@ func TestTeamAPIAndBypass(t *testing.T) {
 
 	drv := &apiDriver{local: map[string]string{"parent": "p1", "engine": "e1", "client": "c1"}, remote: map[string]string{"parent": "p1"}}
 	app.PublishDriver = drv
+	prepared := 0
+	app.snapshotPreparer = func(_ context.Context, _ *project.Project) (string, map[string]string, error) {
+		prepared++
+		return "parent", map[string]string{"Engine": "engine", "GameClient": "client"}, nil
+	}
 	status, pubBody := apiJSON(t, http.MethodPost, srv+"/api/v1/projects/"+itoa(pid)+"/publish", aliceTok, map[string]any{
 		"parent_dir": "parent", "module_dirs": map[string]string{"Engine": "engine", "GameClient": "client"},
 	})
@@ -110,10 +116,19 @@ func TestTeamAPIAndBypass(t *testing.T) {
 		t.Fatalf("member publish %d", status)
 	}
 	status, pubBody = apiJSON(t, http.MethodPost, srv+"/api/v1/projects/"+itoa(pid)+"/publish", carolTok, map[string]any{
-		"parent_dir": "parent", "module_dirs": map[string]string{"Engine": "engine", "GameClient": "client"},
+		"parent_dir": "another-project-parent",
+	})
+	if status != http.StatusBadRequest || prepared != 0 {
+		t.Fatalf("caller-controlled publish path was accepted: status=%d prepared=%d body=%v", status, prepared, pubBody)
+	}
+	status, pubBody = apiJSON(t, http.MethodPost, srv+"/api/v1/projects/"+itoa(pid)+"/publish", carolTok, map[string]any{
+		"message": "publish module pins",
 	})
 	if status != http.StatusOK {
 		t.Fatalf("publish %d %v", status, pubBody)
+	}
+	if prepared != 1 {
+		t.Fatalf("server-owned snapshot preparation count=%d, want 1", prepared)
 	}
 	if drv.links["Engine"] != "e1" || drv.links["GameClient"] != "c1" {
 		t.Fatalf("pins %v", drv.links)

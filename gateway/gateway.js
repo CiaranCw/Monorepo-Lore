@@ -76,21 +76,22 @@ let session = null;
 
 function upstreamSession() {
   if (session && !session.closed && !session.destroyed) return session;
-  session = http2.connect(upstream, {
+  const created = http2.connect(upstream, {
     ca: ca,
     servername: "localhost",
     rejectUnauthorized: true,
   });
-  session.on("error", (err) => {
+  session = created;
+  created.on("error", (err) => {
     log({ event: "upstream_session_error", message: err.message });
-    session = null;
+    if (session === created) session = null;
   });
-  session.on("close", () => {
-    session = null;
+  created.on("close", () => {
+    if (session === created) session = null;
     log({ event: "upstream_session_close" });
   });
-  session.on("connect", () => {
-    const sock = session.socket;
+  created.on("connect", () => {
+    const sock = created.socket;
     log({
       event: "upstream_tls",
       authorized: Boolean(sock && sock.authorized),
@@ -99,7 +100,7 @@ function upstreamSession() {
       alpn: sock && sock.alpnProtocol ? sock.alpnProtocol : "",
     });
   });
-  return session;
+  return created;
 }
 
 function copyHeaders(headers) {
@@ -248,10 +249,11 @@ server.on("secureConnection", (socket) => {
   guard(socket);
 });
 server.on("session", (httpSession) => {
-  const socket = httpSession.socket;
-  if (!guard(socket)) return;
   sessions += 1;
-  log({ event: "client_session_open", address: ipv4(socket.remoteAddress), sessions: sessions, authorized: socket.authorized });
+  // The connection was already checked in secureConnection. Node wraps an
+  // HTTP/2 session socket and deliberately rejects direct socket property
+  // access with ERR_HTTP2_NO_SOCKET_MANIPULATION.
+  log({ event: "client_session_open", sessions: sessions });
   httpSession.on("error", (err) => log({ event: "client_session_error", message: err.message }));
   httpSession.on("close", () => {
     sessions = Math.max(0, sessions - 1);
@@ -260,7 +262,6 @@ server.on("session", (httpSession) => {
 });
 server.on("stream", (stream, headers) => {
   stream.on("error", () => {});
-  if (!guard(stream.session.socket)) return;
   log({ event: "client_stream", rpc: String(headers[":path"] || ""), scheme: String(headers[":scheme"] || "") });
   forward(stream, headers);
 });
@@ -300,6 +301,8 @@ function startAuthProxy() {
   proxy.on("stream", (stream, headers) => {
     stream.on("error", () => {});
     if (!guard(stream.session.socket)) return;
+    const rpc = String(headers[":path"] || "");
+    log({ event: "auth_stream", rpc: rpc });
     const out = {};
     for (const key of Object.keys(headers)) {
       if (key === ":authority") out[key] = target.host;
@@ -309,20 +312,28 @@ function startAuthProxy() {
     let up;
     try { up = authUpstreamSession().request(out); }
     catch (err) {
+      log({ event: "auth_request_error", rpc: rpc, message: err.message });
       try { stream.respond({ ":status": 200, "grpc-status": "14", "content-type": "application/grpc" }, { endStream: true }); } catch (_e) {}
       return;
     }
     stream.pipe(up);
     up.on("response", (responseHeaders, flags) => {
+      log({ event: "auth_response", rpc: rpc, status: responseHeaders[":status"], grpc: responseHeaders["grpc-status"] || "" });
       const endStream = Boolean(flags & http2.constants.NGHTTP2_FLAG_END_STREAM);
       try { stream.respond(responseHeaders, { waitForTrailers: !endStream, endStream: endStream }); } catch (_e) {}
     });
     up.on("data", (chunk) => {
       if (!stream.write(chunk)) { up.pause(); stream.once("drain", () => up.resume()); }
     });
-    up.on("trailers", (value) => { stream.on("wantTrailers", () => { try { stream.sendTrailers(value); } catch (_e) {} }); });
+    up.on("trailers", (value) => {
+      log({ event: "auth_trailers", rpc: rpc, grpc: value["grpc-status"] || "" });
+      stream.on("wantTrailers", () => { try { stream.sendTrailers(value); } catch (_e) {} });
+    });
     up.on("end", () => { try { stream.end(); } catch (_e) {} });
-    up.on("error", () => { try { stream.close(http2.constants.NGHTTP2_CANCEL); } catch (_e) {} });
+    up.on("error", (err) => {
+      log({ event: "auth_upstream_error", rpc: rpc, message: err.message });
+      try { stream.close(http2.constants.NGHTTP2_CANCEL); } catch (_e) {}
+    });
     stream.on("aborted", () => { try { up.close(http2.constants.NGHTTP2_CANCEL); } catch (_e) {} });
   });
   proxy.listen(authPort, host, () => {

@@ -1,0 +1,19 @@
+# Parseable single-repository import manifest.
+# Replace example URL/name only after inventory review. Never put a raw token here.
+
+project = "ExampleProject"
+conflict_policy = "fail"
+concurrency = 1
+global_files_policy = "strict"
+
+[[repositories]]
+source_url = "https://github.com/example-org/example-engine.git"
+module_name = "Engine"
+mount_path = "Engine"
+lfs_mode = "hydrate"
+submodule_policy = "require_registered"
+expected_default_branch = "main"
+
+[repositories.auth]
+auth_method = "https_token"
+token_env = "GITHUB_IMPORT_TOKEN"
