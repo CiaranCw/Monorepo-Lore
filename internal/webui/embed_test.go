@@ -20,8 +20,8 @@ func TestWebUIHandlerHeadersMIMEsAndBounds(t *testing.T) {
 	}{
 		{"/", http.StatusOK, "text/html; charset=utf-8", `<script type="module" src="/ui/app.js"></script>`},
 		{"/ui/", http.StatusOK, "text/html; charset=utf-8", `Monorepo-Lore`},
-		{"/ui/styles.css", http.StatusOK, "text/css; charset=utf-8", `--primary:`},
-		{"/ui/app.js", http.StatusOK, "application/javascript; charset=utf-8", `bootAuthenticated`},
+		{"/ui/styles.css", http.StatusOK, "text/css; charset=utf-8", `data-theme="dark"`},
+		{"/ui/app.js", http.StatusOK, "application/javascript; charset=utf-8", `data-theme-toggle`},
 		{"/ui/api.js", http.StatusOK, "application/javascript; charset=utf-8", `/api/v1/projects/`},
 		{"/ui/presets.js", http.StatusOK, "application/javascript; charset=utf-8", `cloudpunk-web-study`},
 		{"/favicon.svg", http.StatusOK, "image/svg+xml", `<svg`},

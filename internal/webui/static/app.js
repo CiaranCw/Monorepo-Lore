@@ -37,6 +37,56 @@ const state = {
 };
 
 const appRoot = document.getElementById("app");
+const THEME_KEY = "lore_mono_console_theme";
+
+function currentTheme() {
+  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+}
+
+function applyTheme(theme, persist = true) {
+  const mode = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = mode;
+  if (persist) {
+    try {
+      localStorage.setItem(THEME_KEY, mode);
+    } catch (_e) {
+      // localStorage unavailable
+    }
+  }
+  document.querySelectorAll("[data-theme-toggle]").forEach((btn) => {
+    btn.textContent = mode === "dark" ? "浅色主题" : "深色主题";
+  });
+}
+
+function initTheme() {
+  let saved = "";
+  try {
+    saved = localStorage.getItem(THEME_KEY) || "";
+  } catch (_e) {
+    // localStorage unavailable
+  }
+  if (saved === "dark" || saved === "light") {
+    applyTheme(saved, false);
+    return;
+  }
+  const prefersDark = Boolean(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  applyTheme(prefersDark ? "dark" : "light", false);
+}
+
+function createThemeToggleBtn(extraClass = "btn btn-sm") {
+  const btn = el("button", {
+    type: "button",
+    className: extraClass,
+    "data-theme-toggle": "1",
+    text: currentTheme() === "dark" ? "浅色主题" : "深色主题",
+    onClick: () => {
+      applyTheme(currentTheme() === "dark" ? "light" : "dark", true);
+    },
+  });
+  return btn;
+}
+
+initTheme();
 
 async function downloadCACert() {
   try {
@@ -136,7 +186,12 @@ function renderLogin(reason = "") {
         "div",
         { className: "login-footer" },
         el("span", { text: "会话仅保存在当前标签页" }),
-        el("button", { type: "button", className: "btn btn-xs", text: "下载根证书 ca.pem", onClick: downloadCACert })
+        el(
+          "div",
+          { className: "action-row" },
+          createThemeToggleBtn("btn btn-xs"),
+          el("button", { type: "button", className: "btn btn-xs", text: "下载根证书 ca.pem", onClick: downloadCACert })
+        )
       )
     )
   );
@@ -283,6 +338,7 @@ function renderShell() {
       { className: "topbar-right" },
       el("span", { className: "mono", text: state.me.username }),
       roleBadge,
+      createThemeToggleBtn("btn btn-sm"),
       el("button", { type: "button", className: "btn btn-sm", text: "下载 CA 证书", onClick: downloadCACert }),
       el("button", { type: "button", className: "btn btn-sm", text: "修改密码", onClick: openOwnPasswordModal }),
       el("button", {
