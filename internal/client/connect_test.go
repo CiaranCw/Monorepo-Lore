@@ -216,6 +216,10 @@ func setTempUserConfigDir(t *testing.T) string {
 	dir := t.TempDir()
 	t.Setenv("AppData", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
+	if runtime.GOOS == "darwin" {
+		t.Setenv("HOME", dir)
+		return filepath.Join(dir, "Library", "Application Support")
+	}
 	return dir
 }
 
@@ -1889,5 +1893,25 @@ func TestRestoreAuthDirPreservesFooAndFooTmp(t *testing.T) {
 		if err != nil || string(got) != want {
 			t.Fatalf("post-Connect file %s content=%q err=%v want %q", p, string(got), err, want)
 		}
+	}
+}
+
+func TestResolveLoreBinaryExplicitAndFallback(t *testing.T) {
+	if got := ResolveLoreBinary("  /custom/path/lore  "); got != "/custom/path/lore" {
+		t.Fatalf("explicit ResolveLoreBinary = %q, want /custom/path/lore", got)
+	}
+
+	tmpBinDir := t.TempDir()
+	binName := "lore"
+	if runtime.GOOS == "windows" {
+		binName = "lore.exe"
+	}
+	fakeBin := filepath.Join(tmpBinDir, binName)
+	if err := os.WriteFile(fakeBin, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmpBinDir)
+	if got := ResolveLoreBinary(""); got != "lore" {
+		t.Fatalf("ResolveLoreBinary on PATH = %q, want lore", got)
 	}
 }

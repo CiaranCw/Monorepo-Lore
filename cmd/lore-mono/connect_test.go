@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,9 @@ func TestConnectCommandAndFollowupWithoutConfigFlag(t *testing.T) {
 	cfgRoot := t.TempDir()
 	t.Setenv("AppData", cfgRoot)
 	t.Setenv("XDG_CONFIG_HOME", cfgRoot)
+	if runtime.GOOS == "darwin" {
+		t.Setenv("HOME", cfgRoot)
+	}
 
 	caKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	caTpl := &x509.Certificate{

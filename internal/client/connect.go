@@ -159,7 +159,16 @@ func ResolveLoreBinary(explicit string) string {
 			return candidate
 		}
 	} else {
-		for _, candidate := range []string{"/usr/local/bin/lore", "/data/lore/bin/lore"} {
+		var candidates []string
+		if runtime.GOOS == "darwin" {
+			candidates = append(candidates, "/opt/homebrew/bin/lore")
+		}
+		candidates = append(candidates, "/usr/local/bin/lore")
+		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+			candidates = append(candidates, filepath.Join(home, ".local", "bin", "lore"))
+		}
+		candidates = append(candidates, "/data/lore/bin/lore")
+		for _, candidate := range candidates {
 			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 				return candidate
 			}
