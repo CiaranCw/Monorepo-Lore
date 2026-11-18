@@ -13,6 +13,7 @@ import (
 
 	"lore-monorepo/internal/client"
 	"lore-monorepo/internal/loreexec"
+	"lore-monorepo/internal/webui"
 )
 
 type ctxKey int
@@ -30,6 +31,9 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/auth/password", a.changePassword)
 	mux.HandleFunc("/api/v1/auth/me", a.me)
 	mux.HandleFunc("/api/v1/", a.dispatchAPI)
+	ui := webui.Handler()
+	mux.Handle("/ui/", ui)
+	mux.Handle("/", ui)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := requestID(r)
 		w.Header().Set("X-Request-ID", id)

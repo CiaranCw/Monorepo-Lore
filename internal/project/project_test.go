@@ -264,3 +264,75 @@ func TestReactivateArchivedModuleRestoresMount(t *testing.T) {
 		t.Fatalf("reactivated mount must be reserved, got %v", err)
 	}
 }
+
+func TestModuleMetadataLastAdminAndBatchPermissions(t *testing.T) {
+	ctx := context.Background()
+	db, adminUID := setup(t)
+	p := mustProject(t, db, adminUID)
+	if err := AddMember(ctx, db, "test", p.ID, adminUID, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.Exec(`INSERT INTO users(username, password_hash, kind) VALUES ('member1', 'h', 'user')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memUID, _ := res.LastInsertId()
+	if err := AddMember(ctx, db, "test", p.ID, memUID, RoleMember); err != nil {
+		t.Fatal(err)
+	}
+
+	// Last active project_admin cannot be demoted or removed.
+	if err := UpdateMemberRole(ctx, db, "test", p.ID, adminUID, RoleMember); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("expected ErrLastAdmin on sole admin demote, got %v", err)
+	}
+	if err := RemoveMember(ctx, db, "test", p.ID, adminUID); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("expected ErrLastAdmin on sole admin remove, got %v", err)
+	}
+
+	m1, err := CreateModule(ctx, db, "test", Module{
+		ProjectID: p.ID, Name: "tide-holiday", DisplayName: " 潮汐假日 ", Description: "钓鱼",
+		RepositoryID: alphaID, RepositoryURL: base + "alpha", MountPath: "tide-holiday",
+	})
+	if err != nil || m1.DisplayName != "潮汐假日" || m1.Description != "钓鱼" {
+		t.Fatalf("create with metadata: %v %+v", err, m1)
+	}
+	m2, err := CreateModule(ctx, db, "test", Module{
+		ProjectID: p.ID, Name: "garden", RepositoryID: betaID, RepositoryURL: base + "beta", MountPath: "garden",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reject control characters in display_name.
+	badDisp := "坏\n名字"
+	if _, err := UpdateModule(ctx, db, "test", m2.ID, ModuleUpdate{DisplayName: &badDisp}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid on control char display_name, got %v", err)
+	}
+
+	// Bulk metadata update.
+	n, err := BulkUpdateModuleMetadata(ctx, db, "test", p.ID, []MetadataItem{
+		{ModuleName: "garden", DisplayName: "小小花园"},
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("bulk metadata: n=%d err=%v", n, err)
+	}
+	if got, _ := GetModuleByID(ctx, db, m2.ID); got.DisplayName != "小小花园" {
+		t.Fatalf("expected display_name 小小花园, got %+v", got)
+	}
+
+	// Batch permissions: grant both, then downgrade m1 to read and revoke m2.
+	applied, err := BatchSetModulePermissions(ctx, db, "test", p.ID, []PermissionChange{
+		{UserID: memUID, ModuleID: m1.ID, Permission: PermWrite},
+		{UserID: memUID, ModuleID: m2.ID, Permission: PermWrite},
+	})
+	if err != nil || applied != 2 {
+		t.Fatalf("batch grant: applied=%d err=%v", applied, err)
+	}
+	applied, err = BatchSetModulePermissions(ctx, db, "test", p.ID, []PermissionChange{
+		{UserID: memUID, ModuleID: m1.ID, Permission: PermRead},
+		{UserID: memUID, ModuleID: m2.ID, Permission: PermNone},
+	})
+	if err != nil || applied != 2 {
+		t.Fatalf("batch update/revoke: applied=%d err=%v", applied, err)
+	}
+}

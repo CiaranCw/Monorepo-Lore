@@ -81,22 +81,58 @@ func (a *App) projects(w http.ResponseWriter, r *http.Request, actor *user.User,
 		return
 	}
 	switch rest[1] {
+	case "overview":
+		if len(rest) == 2 && r.Method == http.MethodGet {
+			a.projectOverview(w, r, actor, p)
+			return
+		}
 	case "modules":
-		if r.Method == http.MethodPost {
+		if len(rest) == 2 && r.Method == http.MethodPost {
 			a.createModule(w, r, actor, p)
 			return
 		}
-		if r.Method == http.MethodGet {
+		if len(rest) == 2 && r.Method == http.MethodGet {
 			a.listModules(w, r, actor, p)
 			return
 		}
+		if len(rest) == 3 && rest[2] == "metadata" && r.Method == http.MethodPost {
+			a.bulkModuleMetadata(w, r, actor, p)
+			return
+		}
 	case "members":
+		if len(rest) == 2 && r.Method == http.MethodGet {
+			a.listMembers(w, r, actor, p)
+			return
+		}
 		if len(rest) == 2 && r.Method == http.MethodPost {
 			a.addMember(w, r, actor, p)
 			return
 		}
+		if len(rest) == 3 && r.Method == http.MethodPatch {
+			a.updateMemberRole(w, r, actor, p, rest[2])
+			return
+		}
 		if len(rest) == 3 && r.Method == http.MethodDelete {
 			a.removeMember(w, r, actor, p, rest[2])
+			return
+		}
+	case "users":
+		if len(rest) == 2 && r.Method == http.MethodPost {
+			a.createProjectUser(w, r, actor, p)
+			return
+		}
+	case "permissions":
+		if len(rest) == 2 && r.Method == http.MethodGet {
+			a.projectPermissions(w, r, actor, p)
+			return
+		}
+		if len(rest) == 3 && rest[2] == "batch" && r.Method == http.MethodPost {
+			a.batchProjectPermissions(w, r, actor, p)
+			return
+		}
+	case "audit":
+		if len(rest) == 2 && r.Method == http.MethodGet {
+			a.projectAudit(w, r, actor, p)
 			return
 		}
 	case "publish":
@@ -189,63 +225,66 @@ func (a *App) modules(w http.ResponseWriter, r *http.Request, actor *user.User, 
 }
 
 func (a *App) users(w http.ResponseWriter, r *http.Request, actor *user.User, rest []string) {
-	if len(rest) != 2 || rest[1] != "status" || r.Method != http.MethodPost {
+	if len(rest) != 2 || r.Method != http.MethodPost {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	var body struct {
-		Status    string `json:"status"`
-		ProjectID int64  `json:"project_id"`
-	}
-	if !decode(w, r, &body) {
-		return
-	}
-	if err := a.perms().CanManageProject(r.Context(), actor.ID, body.ProjectID); err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	target, _, err := user.Get(r.Context(), a.DB, rest[0])
-	if err != nil || target.Kind == "service" {
+	switch rest[1] {
+	case "status":
+		var body struct {
+			Status    string `json:"status"`
+			ProjectID int64  `json:"project_id"`
+		}
+		if !decode(w, r, &body) {
+			return
+		}
+		target, err := a.loadProjectManagedUser(r.Context(), actor, rest[0], body.ProjectID)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		if body.Status == "disabled" {
+			if target.ID == actor.ID {
+				writeError(w, http.StatusConflict, "cannot disable your own active session")
+				return
+			}
+			if err := a.ensureNotDisablingLastAdmin(r.Context(), target.ID); err != nil {
+				writeAPIError(w, err)
+				return
+			}
+		}
+		if err := user.SetStatus(r.Context(), a.DB, actor.Username, target.Username, body.Status); err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": body.Status})
+
+	case "password":
+		var body struct {
+			Password  string `json:"password"`
+			ProjectID int64  `json:"project_id"`
+		}
+		if !decode(w, r, &body) {
+			return
+		}
+		pw := body.Password
+		body.Password = ""
+		defer func() { pw = "" }()
+
+		target, err := a.loadProjectManagedUser(r.Context(), actor, rest[0], body.ProjectID)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		if err := user.SetPassword(r.Context(), a.DB, actor.Username, target.Username, pw); err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+
+	default:
 		writeError(w, http.StatusNotFound, "not found")
-		return
 	}
-	var memberInProject int
-	if err := a.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM project_members WHERE project_id=? AND user_id=?`, body.ProjectID, target.ID).Scan(&memberInProject); err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	if memberInProject == 0 {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	// Account status is global. A project administrator must not be able to
-	// disable a user who also belongs to a project that the actor does not
-	// administer, because that would cross a project isolation boundary.
-	var unmanagedMemberships int
-	if err := a.DB.QueryRowContext(r.Context(), `
-		SELECT COUNT(*)
-		FROM project_members target_membership
-		WHERE target_membership.user_id=?
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM project_members actor_membership
-			WHERE actor_membership.project_id=target_membership.project_id
-			  AND actor_membership.user_id=?
-			  AND actor_membership.role='project_admin'
-		  )
-	`, target.ID, actor.ID).Scan(&unmanagedMemberships); err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	if unmanagedMemberships > 0 {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	if err := user.SetStatus(r.Context(), a.DB, actor.Username, rest[0], body.Status); err != nil {
-		writeAPIError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": body.Status})
 }
 
 func (a *App) meModules(w http.ResponseWriter, r *http.Request, actor *user.User, rest []string) {
@@ -392,6 +431,8 @@ func (a *App) createModule(w http.ResponseWriter, r *http.Request, actor *user.U
 	}
 	var body struct {
 		Name          string `json:"name"`
+		DisplayName   string `json:"display_name"`
+		Description   string `json:"description"`
 		RepositoryID  string `json:"repository_id"`
 		RepositoryURL string `json:"repository_url"`
 		MountPath     string `json:"mount_path"`
@@ -400,7 +441,8 @@ func (a *App) createModule(w http.ResponseWriter, r *http.Request, actor *user.U
 		return
 	}
 	m, err := project.CreateModule(r.Context(), a.DB, actor.Username, project.Module{
-		ProjectID: p.ID, Name: body.Name, RepositoryID: body.RepositoryID, RepositoryURL: body.RepositoryURL, MountPath: body.MountPath,
+		ProjectID: p.ID, Name: body.Name, DisplayName: body.DisplayName, Description: body.Description,
+		RepositoryID: body.RepositoryID, RepositoryURL: body.RepositoryURL, MountPath: body.MountPath,
 	})
 	if err != nil {
 		writeAPIError(w, err)
@@ -468,6 +510,10 @@ func (a *App) removeMember(w http.ResponseWriter, r *http.Request, actor *user.U
 		writeError(w, http.StatusBadRequest, "invalid user")
 		return
 	}
+	if id == actor.ID {
+		writeError(w, http.StatusConflict, "cannot remove yourself from project")
+		return
+	}
 	if err := project.RemoveMember(r.Context(), a.DB, actor.Username, p.ID, id); err != nil {
 		writeAPIError(w, err)
 		return
@@ -525,12 +571,17 @@ func (a *App) patchModule(w http.ResponseWriter, r *http.Request, actor *user.Us
 		return
 	}
 	var body struct {
-		MountPath string `json:"mount_path"`
+		MountPath   string  `json:"mount_path"`
+		DisplayName *string `json:"display_name"`
+		Description *string `json:"description"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
-	upd := project.ModuleUpdate{}
+	upd := project.ModuleUpdate{
+		DisplayName: body.DisplayName,
+		Description: body.Description,
+	}
 	if body.MountPath != "" {
 		upd.MountPath = &body.MountPath
 	}
@@ -662,6 +713,7 @@ func (a *App) batch(w http.ResponseWriter, r *http.Request, actor *user.User) {
 }
 
 func (a *App) projectSnapshots(w http.ResponseWriter, r *http.Request, actor *user.User, p *project.Project) {
+	isAdmin := a.perms().CanManageProject(r.Context(), actor.ID, p.ID) == nil
 	mods, err := a.perms().ListAccessibleModules(r.Context(), actor.ID)
 	if err != nil {
 		writeAPIError(w, err)
@@ -673,21 +725,24 @@ func (a *App) projectSnapshots(w http.ResponseWriter, r *http.Request, actor *us
 			allowed[m.RepositoryID] = true
 		}
 	}
-	rows, err := a.DB.QueryContext(r.Context(), `SELECT snapshot_id, pins_json FROM snapshots WHERE project_id=? ORDER BY snapshot_id`, p.ID)
+	rows, err := a.DB.QueryContext(r.Context(), `SELECT snapshot_id, COALESCE(description,''), created_at, pins_json FROM snapshots WHERE project_id=? ORDER BY snapshot_id`, p.ID)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
 	defer rows.Close()
 	type view struct {
-		ID   int64
-		Pins []publish.Pin
+		ID          int64
+		Description string
+		CreatedAt   string
+		TotalPins   int `json:",omitempty"`
+		Pins        []publish.Pin
 	}
 	out := []view{}
 	for rows.Next() {
 		var id int64
-		var raw string
-		if err := rows.Scan(&id, &raw); err != nil {
+		var desc, createdAt, raw string
+		if err := rows.Scan(&id, &desc, &createdAt, &raw); err != nil {
 			writeAPIError(w, err)
 			return
 		}
@@ -702,7 +757,11 @@ func (a *App) projectSnapshots(w http.ResponseWriter, r *http.Request, actor *us
 				visible = append(visible, pin)
 			}
 		}
-		out = append(out, view{ID: id, Pins: visible})
+		v := view{ID: id, Description: desc, CreatedAt: createdAt, Pins: visible}
+		if isAdmin {
+			v.TotalPins = len(pins)
+		}
+		out = append(out, v)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
 }
@@ -741,6 +800,8 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "not permitted")
 	case errors.Is(err, project.ErrNotFound), errors.Is(err, user.ErrNotFound), errors.Is(err, permission.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, project.ErrLastAdmin):
+		writeError(w, http.StatusConflict, "project must retain at least one active project_admin")
 	case errors.Is(err, project.ErrConflict):
 		writeError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, project.ErrInvalid):
