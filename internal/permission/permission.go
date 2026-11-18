@@ -37,6 +37,8 @@ type Module struct {
 	ProjectName   string
 	ModuleID      int64
 	Name          string
+	DisplayName   string
+	Description   string
 	RepositoryID  string
 	RepositoryURL string
 	MountPath       string
@@ -128,7 +130,7 @@ func (s Service) ListAccessibleModules(ctx context.Context, userID int64) ([]Mod
 		}
 		return nil, err
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT pr.project_id, pr.name, m.module_id, m.name, m.repository_id,
+	rows, err := s.DB.QueryContext(ctx, `SELECT pr.project_id, pr.name, m.module_id, m.name, m.display_name, m.description, m.repository_id,
 		m.repository_url, m.mount_path, mp.permission,
 		COALESCE((SELECT r.ref_name FROM module_refs r
 			WHERE r.module_id=m.module_id AND r.ref_type='branch' AND r.is_default=1
@@ -145,7 +147,7 @@ func (s Service) ListAccessibleModules(ctx context.Context, userID int64) ([]Mod
 	var out []Module
 	for rows.Next() {
 		var m Module
-		if err := rows.Scan(&m.ProjectID, &m.ProjectName, &m.ModuleID, &m.Name, &m.RepositoryID, &m.RepositoryURL, &m.MountPath, &m.Permission, &m.DefaultBranch); err != nil {
+		if err := rows.Scan(&m.ProjectID, &m.ProjectName, &m.ModuleID, &m.Name, &m.DisplayName, &m.Description, &m.RepositoryID, &m.RepositoryURL, &m.MountPath, &m.Permission, &m.DefaultBranch); err != nil {
 			return nil, err
 		}
 		m.LoreEnforcement = "access"

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"lore-monorepo/internal/database"
 )
@@ -45,11 +46,20 @@ type Module struct {
 	ID            int64
 	ProjectID     int64
 	Name          string
+	DisplayName   string
+	Description   string
 	RepositoryID  string
 	RepositoryURL string
 	MountPath     string
 	ArchivedAt    string // empty when active
 	CreatedAt     string
+}
+
+// MetadataItem pairs a module name with its human-readable display metadata.
+type MetadataItem struct {
+	ModuleName  string
+	DisplayName string
+	Description *string
 }
 
 // Archived reports whether the module has been archived.
@@ -280,13 +290,43 @@ func UpdateProject(ctx context.Context, db *sql.DB, actor string, id int64, u Pr
 	return out, nil
 }
 
+// NormalizeDisplayName trims and validates a module's human-readable title (at most 128 runes, no control characters).
+func NormalizeDisplayName(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if utf8.RuneCountInString(s) > 128 {
+		return "", invalid("display_name exceeds 128 characters")
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return "", invalid("display_name contains control characters")
+		}
+	}
+	return s, nil
+}
+
+// NormalizeDescription trims and validates a module's human-readable note (at most 512 runes).
+func NormalizeDescription(raw string) (string, error) {
+	s := strings.ReplaceAll(raw, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.TrimSpace(s)
+	if utf8.RuneCountInString(s) > 512 {
+		return "", invalid("description exceeds 512 characters")
+	}
+	for _, r := range s {
+		if (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f {
+			return "", invalid("description contains control characters")
+		}
+	}
+	return s, nil
+}
+
 // ---------------------------------------------------------------- modules
 
-const moduleCols = `module_id, project_id, name, repository_id, repository_url, mount_path, COALESCE(archived_at,''), created_at`
+const moduleCols = `module_id, project_id, name, display_name, description, repository_id, repository_url, mount_path, COALESCE(archived_at,''), created_at`
 
 func scanModule(row interface{ Scan(...interface{}) error }) (*Module, error) {
 	m := &Module{}
-	err := row.Scan(&m.ID, &m.ProjectID, &m.Name, &m.RepositoryID, &m.RepositoryURL, &m.MountPath, &m.ArchivedAt, &m.CreatedAt)
+	err := row.Scan(&m.ID, &m.ProjectID, &m.Name, &m.DisplayName, &m.Description, &m.RepositoryID, &m.RepositoryURL, &m.MountPath, &m.ArchivedAt, &m.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -329,6 +369,14 @@ func CreateModule(ctx context.Context, db *sql.DB, actor string, m Module) (*Mod
 	if err != nil {
 		return nil, err
 	}
+	disp, err := NormalizeDisplayName(m.DisplayName)
+	if err != nil {
+		return nil, err
+	}
+	desc, err := NormalizeDescription(m.Description)
+	if err != nil {
+		return nil, err
+	}
 	var out *Module
 	err = database.Tx(ctx, db, func(tx *sql.Tx) error {
 		if _, err := scanProject(tx.QueryRowContext(ctx, `SELECT `+projectCols+` FROM projects WHERE project_id=?`, m.ProjectID)); err != nil {
@@ -340,8 +388,8 @@ func CreateModule(ctx context.Context, db *sql.DB, actor string, m Module) (*Mod
 		if err := checkMount(ctx, tx, m.ProjectID, mount, 0); err != nil {
 			return err
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO modules(project_id, name, repository_id, repository_url, mount_path)
-			VALUES (?,?,?,?,?)`, m.ProjectID, m.Name, m.RepositoryID, m.RepositoryURL, mount)
+		res, err := tx.ExecContext(ctx, `INSERT INTO modules(project_id, name, display_name, description, repository_id, repository_url, mount_path)
+			VALUES (?,?,?,?,?,?,?)`, m.ProjectID, m.Name, disp, desc, m.RepositoryID, m.RepositoryURL, mount)
 		if err != nil {
 			return mapConstraint(err)
 		}
@@ -398,6 +446,8 @@ func ListModules(ctx context.Context, db *sql.DB, projectID int64, includeArchiv
 // repository is a Snapshot Manager (P3-B3) operation and is not done here.
 type ModuleUpdate struct {
 	Name          *string
+	DisplayName   *string
+	Description   *string
 	RepositoryURL *string
 	MountPath     *string
 }
@@ -420,6 +470,26 @@ func UpdateModule(ctx context.Context, db *sql.DB, actor string, id int64, u Mod
 			}
 			changes = append(changes, "name="+cur.Name+"->"+*u.Name)
 			cur.Name = *u.Name
+		}
+		if u.DisplayName != nil {
+			disp, err := NormalizeDisplayName(*u.DisplayName)
+			if err != nil {
+				return err
+			}
+			if disp != cur.DisplayName {
+				changes = append(changes, "display_name="+cur.DisplayName+"->"+disp)
+				cur.DisplayName = disp
+			}
+		}
+		if u.Description != nil {
+			desc, err := NormalizeDescription(*u.Description)
+			if err != nil {
+				return err
+			}
+			if desc != cur.Description {
+				changes = append(changes, fmt.Sprintf("description_len=%d->%d", len(cur.Description), len(desc)))
+				cur.Description = desc
+			}
 		}
 		if u.RepositoryURL != nil && *u.RepositoryURL != cur.RepositoryURL {
 			if err := ValidateRepositoryURL(*u.RepositoryURL); err != nil {
@@ -445,8 +515,8 @@ func UpdateModule(ctx context.Context, db *sql.DB, actor string, id int64, u Mod
 		if len(changes) == 0 {
 			return nil
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE modules SET name=?, repository_url=?, mount_path=? WHERE module_id=?`,
-			cur.Name, cur.RepositoryURL, cur.MountPath, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE modules SET name=?, display_name=?, description=?, repository_url=?, mount_path=? WHERE module_id=?`,
+			cur.Name, cur.DisplayName, cur.Description, cur.RepositoryURL, cur.MountPath, id); err != nil {
 			return mapConstraint(err)
 		}
 		return database.Audit(ctx, tx, actor, "module_update", fmt.Sprint(id), strings.Join(changes, "; "))
@@ -455,6 +525,55 @@ func UpdateModule(ctx context.Context, db *sql.DB, actor string, id int64, u Mod
 		return nil, err
 	}
 	return out, nil
+}
+
+// BulkUpdateModuleMetadata atomically updates display_name (and optional description) by module_name within projectID.
+func BulkUpdateModuleMetadata(ctx context.Context, db *sql.DB, actor string, projectID int64, items []MetadataItem) (int, error) {
+	if actor == "" {
+		return 0, invalid("actor is required")
+	}
+	if len(items) == 0 {
+		return 0, invalid("items must not be empty")
+	}
+	if len(items) > 1000 {
+		return 0, invalid("too many metadata items (%d > 1000)", len(items))
+	}
+	updated := 0
+	err := database.Tx(ctx, db, func(tx *sql.Tx) error {
+		for _, it := range items {
+			name := strings.TrimSpace(it.ModuleName)
+			if err := ValidateName(name); err != nil {
+				return err
+			}
+			disp, err := NormalizeDisplayName(it.DisplayName)
+			if err != nil {
+				return err
+			}
+			cur, err := scanModule(tx.QueryRowContext(ctx, `SELECT `+moduleCols+` FROM modules WHERE project_id=? AND name=?`, projectID, name))
+			if err != nil {
+				return fmt.Errorf("module %q: %w", name, err)
+			}
+			if cur.Archived() {
+				return invalid("module %q is archived", name)
+			}
+			desc := cur.Description
+			if it.Description != nil {
+				desc, err = NormalizeDescription(*it.Description)
+				if err != nil {
+					return err
+				}
+			}
+			if disp == cur.DisplayName && desc == cur.Description {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE modules SET display_name=?, description=? WHERE module_id=?`, disp, desc, cur.ID); err != nil {
+				return err
+			}
+			updated++
+		}
+		return database.Audit(ctx, tx, actor, "module_metadata_bulk", fmt.Sprint(projectID), fmt.Sprintf("items=%d updated=%d", len(items), updated))
+	})
+	return updated, err
 }
 
 // ArchiveModule marks a module archived. Its repository id stays reserved (not reusable),

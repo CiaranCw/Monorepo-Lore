@@ -164,11 +164,13 @@ func (a *App) me(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
+	projects := a.meProjects(r.Context(), session.User.ID, session.User.Kind)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"username":     session.User.Username,
 		"user_id":      strconv.FormatInt(session.User.ID, 10),
 		"auth_version": session.User.AuthVersion,
 		"status":       session.User.Status,
+		"projects":     projects,
 	})
 }
 
