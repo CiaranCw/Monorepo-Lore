@@ -12,20 +12,21 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func verifyRealDirNoFollow(dir string) error {
-	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
-	return syscall.Close(fd)
+	return unix.Close(fd)
 }
 
 func openAuthRootNoFollow(dir string, createIfMissing bool) (int, error) {
-	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_DIRECTORY | syscall.O_CLOEXEC
-	fd, err := syscall.Open(dir, flags, 0)
+	flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_DIRECTORY | unix.O_CLOEXEC
+	fd, err := unix.Open(dir, flags, 0)
 	if err == nil {
 		return fd, nil
 	}
@@ -35,11 +36,11 @@ func openAuthRootNoFollow(dir string, createIfMissing bool) (int, error) {
 	if mkErr := os.Mkdir(dir, 0o700); mkErr != nil && !errors.Is(mkErr, os.ErrExist) {
 		return -1, mkErr
 	}
-	return syscall.Open(dir, flags, 0)
+	return unix.Open(dir, flags, 0)
 }
 
 func openSubdirNoFollow(rootFD int, rel string, createMissing bool) (int, error) {
-	curFD, err := syscall.Dup(rootFD)
+	curFD, err := unix.Dup(rootFD)
 	if err != nil {
 		return -1, err
 	}
@@ -52,19 +53,19 @@ func openSubdirNoFollow(rootFD int, rel string, createMissing bool) (int, error)
 			continue
 		}
 		if part == ".." {
-			_ = syscall.Close(curFD)
+			_ = unix.Close(curFD)
 			return -1, fmt.Errorf("invalid relative auth subdir %q", rel)
 		}
-		flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_DIRECTORY | syscall.O_CLOEXEC
-		nextFD, err := syscall.Openat(curFD, part, flags, 0)
-		if err != nil && createMissing && errors.Is(err, syscall.ENOENT) {
-			if mkErr := syscall.Mkdirat(curFD, part, 0o700); mkErr != nil && !errors.Is(mkErr, syscall.EEXIST) {
-				_ = syscall.Close(curFD)
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_DIRECTORY | unix.O_CLOEXEC
+		nextFD, err := unix.Openat(curFD, part, flags, 0)
+		if err != nil && createMissing && errors.Is(err, unix.ENOENT) {
+			if mkErr := unix.Mkdirat(curFD, part, 0o700); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
+				_ = unix.Close(curFD)
 				return -1, mkErr
 			}
-			nextFD, err = syscall.Openat(curFD, part, flags, 0)
+			nextFD, err = unix.Openat(curFD, part, flags, 0)
 		}
-		_ = syscall.Close(curFD)
+		_ = unix.Close(curFD)
 		if err != nil {
 			return -1, err
 		}
@@ -75,9 +76,9 @@ func openSubdirNoFollow(rootFD int, rel string, createMissing bool) (int, error)
 
 func writeAllFD(fd int, data []byte) error {
 	for len(data) > 0 {
-		n, err := syscall.Write(fd, data)
+		n, err := unix.Write(fd, data)
 		if err != nil {
-			if errors.Is(err, syscall.EINTR) {
+			if errors.Is(err, unix.EINTR) {
 				continue
 			}
 			return err
@@ -99,11 +100,11 @@ func writeFileAtNoFollow(parentFD int, name string, data []byte) error {
 			return rErr
 		}
 		tmpName = ".lore-tmp-" + hex.EncodeToString(rnd[:])
-		fd, err = syscall.Openat(parentFD, tmpName, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
+		fd, err = unix.Openat(parentFD, tmpName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, syscall.EEXIST) {
+		if !errors.Is(err, unix.EEXIST) {
 			return err
 		}
 	}
@@ -111,17 +112,17 @@ func writeFileAtNoFollow(parentFD int, name string, data []byte) error {
 		return err
 	}
 	wErr := writeAllFD(fd, data)
-	cErr := syscall.Close(fd)
+	cErr := unix.Close(fd)
 	if wErr != nil {
-		_ = syscall.Unlinkat(parentFD, tmpName)
+		_ = unix.Unlinkat(parentFD, tmpName, 0)
 		return wErr
 	}
 	if cErr != nil {
-		_ = syscall.Unlinkat(parentFD, tmpName)
+		_ = unix.Unlinkat(parentFD, tmpName, 0)
 		return cErr
 	}
-	if err := syscall.Renameat(parentFD, tmpName, parentFD, name); err != nil {
-		_ = syscall.Unlinkat(parentFD, tmpName)
+	if err := unix.Renameat(parentFD, tmpName, parentFD, name); err != nil {
+		_ = unix.Unlinkat(parentFD, tmpName, 0)
 		return err
 	}
 	return nil
@@ -130,12 +131,12 @@ func writeFileAtNoFollow(parentFD int, name string, data []byte) error {
 func removeNewAuthDirSafe(dir string) error {
 	rootFD, err := openAuthRootNoFollow(dir, false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
 			return nil
 		}
 		return fmt.Errorf("validate new auth dir %s: %w", dir, err)
 	}
-	_ = syscall.Close(rootFD)
+	_ = unix.Close(rootFD)
 
 	var subdirs []string
 	walkErr := filepath.WalkDir(dir, func(p string, d fs.DirEntry, wErr error) error {
@@ -172,12 +173,12 @@ func removeNewAuthDirSafe(dir string) error {
 
 	rootFD, err = openAuthRootNoFollow(dir, false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
 			return nil
 		}
 		return fmt.Errorf("re-verify new auth dir %s: %w", dir, err)
 	}
-	defer syscall.Close(rootFD)
+	defer unix.Close(rootFD)
 
 	// Remove files via dirfd-pinned Unlinkat, then subdirs deepest-first, then root.
 	var relFiles []string
@@ -214,9 +215,9 @@ func removeNewAuthDirSafe(dir string) error {
 		if err != nil {
 			return fmt.Errorf("open auth parent %s: %w", parentRel, err)
 		}
-		uErr := syscall.Unlinkat(pFD, filepath.Base(rel))
-		_ = syscall.Close(pFD)
-		if uErr != nil && !errors.Is(uErr, syscall.ENOENT) {
+		uErr := unix.Unlinkat(pFD, filepath.Base(rel), 0)
+		_ = unix.Close(pFD)
+		if uErr != nil && !errors.Is(uErr, unix.ENOENT) {
 			return fmt.Errorf("remove new auth file %s: %w", rel, uErr)
 		}
 	}
@@ -238,7 +239,7 @@ func restoreExistingAuthDirSafe(snap authDirSnapshot) error {
 	if err != nil {
 		return fmt.Errorf("auth root %s failed no-follow directory verification: %w", snap.dir, err)
 	}
-	defer syscall.Close(rootFD)
+	defer unix.Close(rootFD)
 
 	origDirs := make(map[string]struct{}, len(snap.dirs))
 	for _, d := range snap.dirs {
@@ -300,10 +301,10 @@ func restoreExistingAuthDirSafe(snap authDirSnapshot) error {
 			errs = append(errs, fmt.Sprintf("open auth parent %s: %v", parentRel, err))
 			continue
 		}
-		if uErr := syscall.Unlinkat(pFD, filepath.Base(rel)); uErr != nil && !errors.Is(uErr, syscall.ENOENT) {
+		if uErr := unix.Unlinkat(pFD, filepath.Base(rel), 0); uErr != nil && !errors.Is(uErr, unix.ENOENT) {
 			errs = append(errs, fmt.Sprintf("remove new auth file %s: %v", rel, uErr))
 		}
-		_ = syscall.Close(pFD)
+		_ = unix.Close(pFD)
 	}
 
 	sort.Slice(curDirs, func(i, j int) bool {
@@ -328,7 +329,7 @@ func restoreExistingAuthDirSafe(snap authDirSnapshot) error {
 			errs = append(errs, fmt.Sprintf("restore auth subdir %s: %v", rel, err))
 			continue
 		}
-		_ = syscall.Close(subFD)
+		_ = unix.Close(subFD)
 	}
 
 	for rel, data := range snap.files {
@@ -339,7 +340,7 @@ func restoreExistingAuthDirSafe(snap authDirSnapshot) error {
 			continue
 		}
 		wErr := writeFileAtNoFollow(pFD, filepath.Base(rel), data)
-		_ = syscall.Close(pFD)
+		_ = unix.Close(pFD)
 		if wErr != nil {
 			errs = append(errs, fmt.Sprintf("restore auth file %s: %v", rel, wErr))
 		}

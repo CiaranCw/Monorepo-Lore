@@ -73,7 +73,7 @@ func makeLockTarget(lockFilePath string) (lockTarget, error) {
 		return lockTarget{}, err
 	}
 	key := canon
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		key = strings.ToLower(key)
 	}
 	return lockTarget{key: key, path: canon}, nil
