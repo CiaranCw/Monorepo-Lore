@@ -72,6 +72,19 @@ func (a *App) projectHistory(w http.ResponseWriter, r *http.Request, actor *user
 	writeJSON(w, http.StatusOK, page)
 }
 
+func (a *App) syncProjectHistory(w http.ResponseWriter, r *http.Request, _ *user.User, p *project.Project) {
+	if a.PublishLore == nil && a.Lore == nil {
+		writeError(w, http.StatusServiceUnavailable, "publisher unavailable")
+		return
+	}
+	res, err := a.SyncChangedModules(r.Context(), p.ID, true)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "project history sync failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (a *App) moduleHistoryRoutes(w http.ResponseWriter, r *http.Request, actor *user.User, m *project.Module, sub []string) {
 	if len(sub) == 0 {
 		if r.Method != http.MethodGet {

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,8 +58,10 @@ type App struct {
 	PublishLore   *loreadapter.Client
 	PublishRoot   string
 	Importer      *gitimport.Importer
-	HTTP          *http.Server
-	grpcSrv       *grpc.Server
+	HTTP            *http.Server
+	grpcSrv         *grpc.Server
+	historySyncOnce sync.Once
+	historySync     *historySyncCoordinator
 
 	// snapshotPreparer is test-only dependency injection. Production always
 	// prepares server-owned parent/module workspaces through prepareSnapshot.
@@ -187,6 +190,11 @@ func (a *App) Serve(ctx context.Context, ln net.Listener) error {
 		"http": ln.Addr().String(),
 		"grpc": grpcLn.Addr().String(),
 	})
+	autoSyncCtx, autoSyncCancel := context.WithCancel(ctx)
+	var syncWG sync.WaitGroup
+	syncWG.Add(1)
+	go a.runHistoryAutoSync(autoSyncCtx, &syncWG)
+
 	errCh := make(chan error, 2)
 	go func() {
 		err := a.grpcSrv.Serve(grpcLn)
@@ -205,11 +213,15 @@ func (a *App) Serve(ctx context.Context, ln net.Listener) error {
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
+		autoSyncCancel()
 		a.stopServers()
+		syncWG.Wait()
 		a.closeDB()
 		return err
 	}
+	autoSyncCancel()
 	a.stopServers()
+	syncWG.Wait()
 	a.closeDB()
 	a.Log.Info("manager stopped", nil)
 	return nil

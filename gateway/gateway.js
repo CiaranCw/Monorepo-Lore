@@ -23,8 +23,10 @@ const logPath = process.env.GATEWAY_LOG || "";
 const allowText = process.env.GATEWAY_ALLOW || "";
 const managerUpstream = process.env.MANAGER_UPSTREAM || "";
 const managerPort = Number(process.env.MANAGER_TLS_PORT || "0");
+const managerHttpPort = Number(process.env.MANAGER_HTTP_PORT || "0");
 const authUpstream = process.env.AUTH_UPSTREAM || "";
 const authPort = Number(process.env.AUTH_TLS_PORT || "0");
+const pushNotifyPath = (process.env.GATEWAY_PUSH_NOTIFY || "").trim();
 
 function fail(message) {
   process.stderr.write(message + "\n");
@@ -45,6 +47,16 @@ const cert = fs.readFileSync(certPath);
 const key = fs.readFileSync(keyPath);
 const upstreamHost = upstream.slice("https://".length);
 let sessions = 0;
+let pushNotifyTimer = null;
+
+function notifyBranchPush() {
+  if (!pushNotifyPath) return;
+  if (pushNotifyTimer) return;
+  pushNotifyTimer = setTimeout(() => {
+    pushNotifyTimer = null;
+    fs.writeFile(pushNotifyPath, String(Date.now()) + "\n", () => {});
+  }, 300);
+}
 
 function log(event) {
   event.at = new Date().toISOString();
@@ -141,17 +153,21 @@ function forward(client, headers) {
   function finish(statusCode, forwarded) {
     if (logged) return;
     logged = true;
+    const statusText = statusCode == null ? "" : String(statusCode);
     log({
       event: "stream_end",
       rpc: rpc,
       forwarded: forwarded,
-      grpc_status: statusCode == null ? "" : String(statusCode),
+      grpc_status: statusText,
       client_bytes: clientBytes,
       upstream_bytes: upstreamBytes,
       frames_up: framesUp,
       frames_down: framesDown,
       sessions: sessions,
     });
+    if (forwarded && statusText === "0" && rpc === "/lore.revision.v1.RevisionService/BranchPush") {
+      notifyBranchPush();
+    }
   }
 
   client.on("data", (chunk) => {
@@ -245,7 +261,12 @@ function guard(socket) {
 
 const server = http2.createSecureServer({ cert: cert, key: key, ALPNProtocols: ["h2"] });
 server.on("error", (err) => fail("listen error " + err.message));
+server.on("tlsClientError", (err, socket) => {
+  log({ event: "tls_client_error", service: "gateway", message: err.message });
+  try { socket.destroy(); } catch (_e) {}
+});
 server.on("secureConnection", (socket) => {
+  socket.on("error", () => {});
   guard(socket);
 });
 server.on("session", (httpSession) => {
@@ -279,8 +300,30 @@ function startManagerProxy() {
     socket.on("error", () => up.destroy());
   });
   proxy.on("error", (err) => fail("manager proxy " + err.message));
+  proxy.on("tlsClientError", (err, socket) => {
+    log({ event: "tls_client_error", service: "manager", message: err.message });
+    try { socket.destroy(); } catch (_e) {}
+  });
   proxy.listen(managerPort, host, () => {
     log({ event: "manager_tls_listening", host: host, port: managerPort });
+  });
+}
+
+function startManagerHttpProxy() {
+  if (!managerUpstream || !managerHttpPort) return;
+  const target = new URL(managerUpstream);
+  const proxy = net.createServer((socket) => {
+    if (!guard(socket)) return;
+    const up = net.connect(Number(target.port), target.hostname, () => {
+      socket.pipe(up);
+      up.pipe(socket);
+    });
+    up.on("error", () => socket.destroy());
+    socket.on("error", () => up.destroy());
+  });
+  proxy.on("error", (err) => fail("manager http proxy " + err.message));
+  proxy.listen(managerHttpPort, host, () => {
+    log({ event: "manager_http_listening", host: host, port: managerHttpPort });
   });
 }
 
@@ -297,10 +340,19 @@ function startAuthProxy() {
   }
   const proxy = http2.createSecureServer({ cert: cert, key: key, ALPNProtocols: ["h2"] });
   proxy.on("error", (err) => fail("auth proxy " + err.message));
-  proxy.on("secureConnection", (socket) => { guard(socket); });
+  proxy.on("tlsClientError", (err, socket) => {
+    log({ event: "tls_client_error", service: "auth", message: err.message });
+    try { socket.destroy(); } catch (_e) {}
+  });
+  proxy.on("secureConnection", (socket) => {
+    socket.on("error", () => {});
+    guard(socket);
+  });
+  proxy.on("session", (httpSession) => {
+    httpSession.on("error", (err) => log({ event: "auth_session_error", message: err.message }));
+  });
   proxy.on("stream", (stream, headers) => {
     stream.on("error", () => {});
-    if (!guard(stream.session.socket)) return;
     const rpc = String(headers[":path"] || "");
     log({ event: "auth_stream", rpc: rpc });
     const out = {};
@@ -361,6 +413,7 @@ const probe = tls.connect({
     const addr = server.address();
     log({ event: "listening", host: addr.address, port: addr.port, tls: true });
     startManagerProxy();
+    startManagerHttpProxy();
     startAuthProxy();
   });
 });

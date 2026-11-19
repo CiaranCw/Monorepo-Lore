@@ -493,6 +493,28 @@ function buildReposView() {
   scopeSel.value = state.repoScopeFilter;
 
   const rightActions = el("div", { className: "toolbar-group" });
+  const syncBtn = el("button", {
+    type: "button",
+    className: "btn btn-sm",
+    text: "同步最新提交",
+    onClick: async () => {
+      syncBtn.disabled = true;
+      syncBtn.textContent = "正在同步...";
+      try {
+        const res = await api.syncProjectHistory(state.currentProject);
+        await loadCurrentTab(true);
+        const msg = res.changed > 0
+          ? `已同步 ${res.synced}/${res.changed} 个变动仓库（+${res.commits_upserted} 条提交）`
+          : `已是最新（已核对 ${res.checked} 个仓库）`;
+        toast(msg, res.failed > 0);
+      } catch (err) {
+        toast(err.message, true);
+        syncBtn.disabled = false;
+        syncBtn.textContent = "同步最新提交";
+      }
+    },
+  });
+  rightActions.appendChild(syncBtn);
   if (admin) {
     rightActions.appendChild(
       el("button", {
