@@ -155,6 +155,10 @@ func (a *App) projects(w http.ResponseWriter, r *http.Request, actor *user.User,
 			a.projectHistory(w, r, actor, p)
 			return
 		}
+		if len(rest) == 3 && rest[2] == "sync" && r.Method == http.MethodPost {
+			a.syncProjectHistory(w, r, actor, p)
+			return
+		}
 	case "imports":
 		a.projectImports(w, r, actor, p, rest[2:])
 		return

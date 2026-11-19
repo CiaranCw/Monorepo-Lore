@@ -83,6 +83,9 @@ export const api = {
     if (cursor) qs.set("cursor", cursor);
     return request("GET", `/api/v1/modules/${moduleId}/history?${qs.toString()}`);
   },
+  syncModuleHistory: (moduleId) => request("POST", `/api/v1/modules/${moduleId}/history/sync`, {}),
+  syncProjectHistory: (project) =>
+    request("POST", `/api/v1/projects/${encodeURIComponent(project)}/history/sync`, {}),
 
   members: (project) => request("GET", `/api/v1/projects/${encodeURIComponent(project)}/members`),
   createProjectUser: (project, payload) =>

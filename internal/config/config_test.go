@@ -128,3 +128,28 @@ func TestAuthStoreFallbackAllowed(t *testing.T) {
 		t.Fatalf("%+v", cfg)
 	}
 }
+
+func TestHistorySyncDefaultsAndOverrides(t *testing.T) {
+	p1 := writeConfig(t, "[lore]\nbinary = \"lore\"\n[auth]\nissuer = \"http://127.0.0.1:52010\"\naudience = [\"lore-host.internal\"]\n")
+	cfg1, err := Load(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg1.History.AutoSyncInterval != DefaultHistorySyncInterval || cfg1.History.Concurrency != DefaultHistorySyncConc {
+		t.Fatalf("unexpected history defaults: %+v", cfg1.History)
+	}
+
+	p2 := writeConfig(t, "[lore]\nbinary = \"lore\"\n[auth]\nissuer = \"http://127.0.0.1:52010\"\naudience = [\"lore-host.internal\"]\n[history]\nauto_sync_interval = \"0s\"\npush_notify_file = \"gateway/push.notify\"\nconcurrency = 8\n")
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.History.AutoSyncInterval != 0 || cfg2.History.Concurrency != 8 || !strings.HasSuffix(cfg2.History.PushNotifyFile, filepath.Join("gateway", "push.notify")) {
+		t.Fatalf("unexpected history overrides: %+v", cfg2.History)
+	}
+
+	pBad := writeConfig(t, "[lore]\nbinary = \"lore\"\n[auth]\nissuer = \"http://127.0.0.1:52010\"\naudience = [\"lore-host.internal\"]\n[history]\nauto_sync_interval = \"-5s\"\n")
+	if _, err := Load(pBad); err == nil {
+		t.Fatal("expected negative auto_sync_interval to fail")
+	}
+}

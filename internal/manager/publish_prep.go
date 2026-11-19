@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"lore-monorepo/internal/history"
 	"lore-monorepo/internal/loreadapter"
@@ -84,6 +85,23 @@ func (a *App) managedLocalRepoDir(ctx context.Context, moduleID int64) (string, 
 	return "", false
 }
 
+var (
+	moduleServerSyncMu    sync.Mutex
+	moduleServerSyncLocks = map[int64]*sync.Mutex{}
+)
+
+func lockServerModuleSync(moduleID int64) func() {
+	moduleServerSyncMu.Lock()
+	mu, ok := moduleServerSyncLocks[moduleID]
+	if !ok {
+		mu = &sync.Mutex{}
+		moduleServerSyncLocks[moduleID] = mu
+	}
+	moduleServerSyncMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
 func (a *App) syncModuleHistoryOnServer(ctx context.Context, m *project.Module, explicitDir string) (history.SyncStats, error) {
 	loreClient := a.PublishLore
 	if loreClient == nil {
@@ -94,10 +112,14 @@ func (a *App) syncModuleHistoryOnServer(ctx context.Context, m *project.Module, 
 	}
 
 	if explicitDir != "" {
+		unlock := lockServerModuleSync(m.ID)
+		defer unlock()
 		return history.SyncModuleFromLore(ctx, a.DB, loreClient, m.ID, explicitDir)
 	}
 
 	if strings.HasPrefix(m.RepositoryURL, "lore://local/") {
+		unlock := lockServerModuleSync(m.ID)
+		defer unlock()
 		if localDir, ok := a.managedLocalRepoDir(ctx, m.ID); ok {
 			return history.SyncModuleFromLore(ctx, a.DB, loreClient, m.ID, localDir)
 		}
@@ -109,6 +131,20 @@ func (a *App) syncModuleHistoryOnServer(ctx context.Context, m *project.Module, 
 		return history.SyncStats{}, err
 	}
 	defer cleanup()
+
+	return a.syncModuleHistoryWithClient(ctx, m, syncClient)
+}
+
+func (a *App) syncModuleHistoryWithClient(ctx context.Context, m *project.Module, syncClient *loreadapter.Client) (history.SyncStats, error) {
+	unlock := lockServerModuleSync(m.ID)
+	defer unlock()
+
+	if strings.HasPrefix(m.RepositoryURL, "lore://local/") {
+		if localDir, ok := a.managedLocalRepoDir(ctx, m.ID); ok {
+			return history.SyncModuleFromLore(ctx, a.DB, syncClient, m.ID, localDir)
+		}
+		return history.SyncStats{}, fmt.Errorf("local module repository workspace not found")
+	}
 
 	if localDir, ok := a.managedLocalRepoDir(ctx, m.ID); ok {
 		argv := []string{"--non-interactive"}

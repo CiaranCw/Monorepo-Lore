@@ -266,39 +266,76 @@ export async function openModuleDrawer({ mod, projectName, currentUser, isAdmin,
   refsWrap.appendChild(refsBody);
   contentSection.appendChild(refsWrap);
 
-  api.moduleRefs(mod.module_id).then((res) => {
+  const loadRefs = () => {
     clear(refsBody);
-    const refs = res.refs || [];
-    if (refs.length === 0) {
-      refsBody.textContent = "暂无记录分支或 Tag";
-      return;
-    }
-    const badges = el("div", { className: "action-row" });
-    for (const r of refs) {
-      const cls = r.type === "tag" ? "badge badge-warn" : r.is_default ? "badge badge-primary" : "badge badge-neutral";
-      const prefix = r.type === "tag" ? "tag:" : "";
-      const suffix = r.is_default ? " (默认)" : "";
-      badges.appendChild(
-        el("span", {
-          className: cls,
-          title: `Lore: ${r.lore_revision}${r.source_commit_id ? `\nGit: ${r.source_commit_id}` : ""}`,
-          text: `${prefix}${r.name}${suffix} · ${shortID(r.source_commit_id || r.lore_revision, 8)}`,
-        })
-      );
-    }
-    refsBody.appendChild(badges);
-  }).catch((err) => {
-    refsBody.textContent = `加载分支失败：${err.message}`;
-  });
+    refsBody.textContent = "正在加载分支与 Tag...";
+    api.moduleRefs(mod.module_id).then((res) => {
+      clear(refsBody);
+      const refs = res.refs || [];
+      if (refs.length === 0) {
+        refsBody.textContent = "暂无记录分支或 Tag";
+        return;
+      }
+      const badges = el("div", { className: "action-row" });
+      for (const r of refs) {
+        const cls = r.type === "tag" ? "badge badge-warn" : r.is_default ? "badge badge-primary" : "badge badge-neutral";
+        const prefix = r.type === "tag" ? "tag:" : "";
+        const suffix = r.is_default ? " (默认)" : "";
+        badges.appendChild(
+          el("span", {
+            className: cls,
+            title: `Lore: ${r.lore_revision}${r.source_commit_id ? `\nGit: ${r.source_commit_id}` : ""}`,
+            text: `${prefix}${r.name}${suffix} · ${shortID(r.source_commit_id || r.lore_revision, 8)}`,
+          })
+        );
+      }
+      refsBody.appendChild(badges);
+    }).catch((err) => {
+      refsBody.textContent = `加载分支失败：${err.message}`;
+    });
+  };
+  loadRefs();
 
   // Commits
-  const histWrap = el("div", { className: "drawer-section" }, el("h4", { className: "drawer-section-title", text: "最近提交记录" }));
   const commitList = el("div", { className: "commit-list" });
   const moreWrap = el("div", { className: "mt-12" });
+  let loadCommits;
+  const syncModBtn = el("button", {
+    type: "button",
+    className: "btn btn-xs",
+    text: "同步此模块",
+    onClick: async () => {
+      syncModBtn.disabled = true;
+      syncModBtn.textContent = "同步中...";
+      try {
+        const stats = await api.syncModuleHistory(mod.module_id);
+        clear(commitList);
+        loadRefs();
+        await loadCommits();
+        if (onChanged) await onChanged();
+        toast(stats.commits_upserted > 0 ? `已同步 +${stats.commits_upserted} 条提交` : "当前已是最新");
+      } catch (err) {
+        toast(err.message, true);
+      } finally {
+        syncModBtn.disabled = false;
+        syncModBtn.textContent = "同步此模块";
+      }
+    },
+  });
+  const histWrap = el(
+    "div",
+    { className: "drawer-section" },
+    el(
+      "div",
+      { className: "toolbar" },
+      el("h4", { className: "drawer-section-title", text: "最近提交记录" }),
+      syncModBtn
+    )
+  );
   histWrap.append(commitList, moreWrap);
   contentSection.appendChild(histWrap);
 
-  const loadCommits = async (cursor = "") => {
+  loadCommits = async (cursor = "") => {
     clear(moreWrap);
     moreWrap.appendChild(el("span", { className: "muted", text: "正在加载提交记录..." }));
     try {

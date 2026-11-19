@@ -27,9 +27,11 @@ const (
 	DefaultGRPCListen      = "127.0.0.1:52010"
 	DefaultIdentityTTL     = 12 * time.Hour
 	DefaultAccessTTL       = 5 * time.Minute
-	DefaultPrivateKey      = "data/keys/identity-active.pem"
-	DefaultPublicKey       = "data/keys/identity-active.pub.pem"
-	DefaultJWKS            = "data/keys/jwks.json"
+	DefaultPrivateKey           = "data/keys/identity-active.pem"
+	DefaultPublicKey            = "data/keys/identity-active.pub.pem"
+	DefaultJWKS                 = "data/keys/jwks.json"
+	DefaultHistorySyncInterval  = 30 * time.Second
+	DefaultHistorySyncConc      = 4
 )
 
 // Config is the validated Manager configuration.
@@ -48,6 +50,14 @@ type Config struct {
 	Publish         Publish
 	Import          Import
 	Client          ClientBootstrap
+	History         HistorySync
+}
+
+// HistorySync configures background and push-triggered commit history indexing.
+type HistorySync struct {
+	AutoSyncInterval time.Duration
+	PushNotifyFile   string
+	Concurrency      int
 }
 
 // ClientBootstrap holds optional public client discovery settings returned by
@@ -138,6 +148,11 @@ type fileConfig struct {
 		AuthURL string `toml:"auth_url"`
 		CAFile  string `toml:"ca_file"`
 	} `toml:"client"`
+	History struct {
+		AutoSyncInterval string `toml:"auto_sync_interval"`
+		PushNotifyFile   string `toml:"push_notify_file"`
+		Concurrency      int    `toml:"concurrency"`
+	} `toml:"history"`
 }
 
 // Load reads path and validates it. Missing files and malformed TOML are errors.
@@ -194,6 +209,13 @@ func Load(path string) (Config, error) {
 			AuthURL: strings.TrimSpace(raw.Client.AuthURL),
 			CAFile:  strings.TrimSpace(raw.Client.CAFile),
 		},
+		History: HistorySync{
+			PushNotifyFile: strings.TrimSpace(raw.History.PushNotifyFile),
+			Concurrency:    raw.History.Concurrency,
+		},
+	}
+	if cfg.History.Concurrency == 0 {
+		cfg.History.Concurrency = DefaultHistorySyncConc
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = DefaultListen
@@ -235,6 +257,10 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	cfg.History.AutoSyncInterval, err = parseNonNegativeDuration(raw.History.AutoSyncInterval, DefaultHistorySyncInterval, "history.auto_sync_interval")
+	if err != nil {
+		return Config{}, err
+	}
 	base := filepath.Dir(abs)
 	cfg.DatabasePath = resolve(base, cfg.DatabasePath)
 	cfg.LoreBinary = resolve(base, cfg.LoreBinary)
@@ -255,6 +281,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Client.CAFile != "" {
 		cfg.Client.CAFile = resolve(base, cfg.Client.CAFile)
+	}
+	if cfg.History.PushNotifyFile != "" {
+		cfg.History.PushNotifyFile = resolve(base, cfg.History.PushNotifyFile)
 	}
 	for i, d := range cfg.Import.AllowedLocalDirs {
 		cfg.Import.AllowedLocalDirs[i] = resolve(base, strings.TrimSpace(d))
@@ -301,7 +330,27 @@ func (c Config) Validate() error {
 	if c.LogFormat != "json" {
 		return fmt.Errorf("logging.format must be json")
 	}
+	if c.History.AutoSyncInterval < 0 {
+		return fmt.Errorf("history.auto_sync_interval must be non-negative")
+	}
+	if c.History.Concurrency < 0 {
+		return fmt.Errorf("history.concurrency must be non-negative")
+	}
 	return c.Auth.validate(c.Listen)
+}
+
+func parseNonNegativeDuration(raw string, fallback time.Duration, name string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", name)
+	}
+	return d, nil
 }
 
 func parseDuration(raw string, fallback time.Duration, name string) (time.Duration, error) {
